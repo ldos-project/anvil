@@ -1,0 +1,8 @@
+(library
+ (name anvil)
+ (libraries unix))
+
+(menhir
+ (modules parser))
+
+(ocamllex lexer)

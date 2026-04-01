@@ -1,0 +1,13 @@
+_build/
+
+# OCaml / Dune local files
+.merlin
+.utop-history
+
+# Editor backups
+*.swp
+*.swo
+*~
+
+# macOS metadata
+.DS_Store
