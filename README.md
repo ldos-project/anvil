@@ -76,9 +76,10 @@ Anvil:
 3. loads the same contract syntax from implemented functions in `.c` files;
 4. attaches any `@Invariant` comments to the following `while` loop;
 5. instruments contracts into `Assume` and `Assert` statements;
-6. computes weakest preconditions for each function;
-7. asks Z3 whether the negation of each VC is satisfiable; and
-8. reports success or a counterexample.
+6. lowers pointer operations and ghost-heap contract predicates into scalar ghost state when needed;
+7. computes weakest preconditions for each function;
+8. asks Z3 whether the negation of each VC is satisfiable; and
+9. reports success or a counterexample.
 
 If Z3 cannot find a model for the negated VC, the program is reported as verified.
 
@@ -164,6 +165,59 @@ Use `result` inside `@Guarantee` to refer to the returned value.
 Operationally, Anvil assumes it after a contracted call, and proves it inside a contracted implementation.
 In practice, `@Safety` should be written as a state invariant rather than as a property of `result`.
 
+## Ghost Heap Interface
+
+Memory reasoning in Anvil is contract-driven rather than automatic.
+Instead of treating every pointer operation as a built-in proof obligation, Anvil exposes a small ghost-heap interface that can be used inside `@Require`, `@Guarantee`, and `@Safety`.
+
+The recommended entry point is:
+
+```c
+int *p;
+
+/* @Require 1
+ * @Guarantee 1
+ * @Safety heap_ok()
+ */
+int main(void) {
+  p = malloc(16);
+  *(p + 1) = 7;
+  free(p);
+  return 0;
+}
+```
+
+Because `@Safety` is checked after every command inside a contracted implementation, `@Safety heap_ok()` means "no invalid memory action has happened so far on this path."
+At a call to a contracted function, that same `@Safety` fact is assumed afterward, just like a guarantee.
+
+When Anvil sees pointer syntax or ghost-heap predicates, it lowers memory into ghost state:
+
+- each pointer global is represented as a `(block, offset)` pair;
+- each `malloc` site gets ghost variables for allocation size and liveness;
+- loads become uninterpreted `__anvil_load(block, offset)` values; and
+- invalid read, write, or `free` operations flip a sticky ghost flag used by `heap_ok()`.
+
+That ghost flag is initialized to true at function entry and is never restored after it becomes false.
+This makes `heap_ok()` a convenient summary property for "memory safety has held so far."
+
+### Built-In Ghost Predicates
+
+Anvil currently recognizes these built-in predicate calls in contracts:
+
+- `heap_ok()`: no earlier memory operation on the current path has been marked invalid.
+- `valid_read(p, n)`: the range starting at pointer `p` with width `n` lies inside a readable live block.
+- `valid_write(p, n)`: currently the same check as `valid_read(p, n)`.
+- `allocated(p)`: pointer `p` designates at least one readable cell.
+- `live(p)`: the block named by `p` is live. Integer globals are always live.
+- `can_free(p)`: `p` is null or the base address of a live allocation.
+- `same_block(p, q)`: `p` and `q` refer to the same block.
+- `is_null(p)`: `p` is the null pointer.
+
+These predicates are lowered into ordinary scalar formulas before weakest-precondition generation, so they participate in verification just like any other contract formula.
+
+Today, this interface is intentionally simple.
+Rather than writing quantified event-style specifications such as `forall p. free.called_on(p) ==> allocated(p)`, you write state predicates over the ghost heap, typically with `@Safety heap_ok()`.
+
 ## Loop Invariants
 
 You can annotate a loop invariant with a comment immediately before a `while`:
@@ -187,7 +241,7 @@ The `@Invariant` comment must attach directly to the following `while`. If some 
 ## Assertions And Assumptions In Source Programs
 
 The surface language does not have dedicated `assert(...)` or `assume(...)` syntax.
-Instead, Anvil encodees these as the following C patterns:
+Instead, Anvil encodes these as the following C patterns:
 
 Assertion:
 
@@ -216,11 +270,16 @@ The accepted language is intentionally small.
 Supported today:
 
 - global `int` variables such as `int x;`
+- global `int*` variables such as `int *p;`
 - `int` and `void` functions
 - local helper function definitions before `main`
 - local header imports with `#include "file.h"`
 - integer literals
 - variables
+- address-of for integer globals such as `&x`
+- pointer dereference reads such as `*p`
+- pointer dereference writes such as `*(p + 1) = 7;`
+- `malloc(n)` and `free(p)`
 - function calls
 - arithmetic expressions such as `(x + 1)` and `(x - 1)`
 - comparisons such as `(x >= 0)` and `(x == y)`
@@ -233,6 +292,7 @@ Important syntax note:
 
 - source arithmetic and comparison expressions should be written in the parenthesized style that Anvil prints, for example `x = (x - 1);` and `while ((x > 0))`.
 - contract expressions inside comments use the contract parser, which accepts ordinary infix forms like `x >= 0`, `result > y`, and `p != 0 && x < 10`.
+- contracts may also use the built-in ghost-heap predicates directly, for example `heap_ok()`, `can_free(p)`, and `same_block(p, &x)`.
 
 ## Verification Output
 
@@ -295,8 +355,12 @@ For example, a contracted local function call becomes a sequence like:
 
 ## Current Limitations
 
-- Pointer operations are not supported by the parser today. Programs using `&`, `*`, pointer assignment, or pointer dereference are expected to fail.
-- Pointer globals are unsupported.
+- Pointer safety support is currently a proof-of-concept for global `int*` variables.
+- Pointer parameters and pointer return values in function definitions are currently unsupported.
+- Address-of is only supported for integer globals.
+- Memory safety is opt-in through contracts such as `@Safety heap_ok()`. Pointer operations alone do not add user-visible proof obligations.
+- Memory contents are not modeled precisely yet: loads become uninterpreted values, while the ghost-heap predicates cover bounds, liveness, null, and invalid free conditions.
+- `malloc` uses an allocation-site abstraction rather than a full heap model.
 - Instrumentation of contracted `void` calls is currently unsupported.
 - Instrumented calls inside `&&`, `||`, or `while` conditions are currently unsupported.
 - Verification models function calls in formulas as uninterpreted functions in Z3.
@@ -308,6 +372,8 @@ Useful examples live in `test/e2e_cases/`:
 
 - `contract_import_scalar.c`
 - `contract_local_scalar.c`
+- `memory_safe_malloc_store.c`
+- `memory_unsafe_dangling_store.c`
 - `scalar_loop.c`
 - `pointer_address_of_global.c`
 

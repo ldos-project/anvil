@@ -1,4 +1,4 @@
-/* EXPECT: FAIL */
+/* EXPECT: PASS */
 #include <stdlib.h>
 #include <stdio.h>
 

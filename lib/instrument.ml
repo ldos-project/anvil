@@ -42,6 +42,8 @@ let assoc_opt key bindings =
 let rec substitute_expr bindings = function
   | Int _ as expr -> expr
   | Var name -> Option.value (assoc_opt name bindings) ~default:(Var name)
+  | AddrOf _ as expr -> expr
+  | Deref inner -> Deref (substitute_expr bindings inner)
   | Add (left, right) ->
       Add (substitute_expr bindings left, substitute_expr bindings right)
   | Sub (left, right) ->
@@ -79,6 +81,8 @@ let rec substitute_bexpr bindings = function
 let rec expr_has_var target = function
   | Int _ -> false
   | Var name -> String.equal name target
+  | AddrOf _ -> false
+  | Deref inner -> expr_has_var target inner
   | Add (left, right)
   | Sub (left, right)
   | Mul (left, right)
@@ -166,7 +170,11 @@ let make_state (program : program) =
     next_temp = 0;
     fresh_globals_rev = [];
     used_names =
-      program.globals @ function_names @ [ program.main.name ] @ imported_names;
+      program.globals
+      @ program.pointer_globals
+      @ function_names
+      @ [ program.main.name ]
+      @ imported_names;
   }
 
 let fresh_name state =
@@ -229,6 +237,7 @@ let bind_definition_params
   loop contract_fn.params params []
 
 let instantiate_contract
+    (memory_env : Memory_safety.contract_env)
     (contract_fn : contracted_function)
     kind
     text
@@ -239,7 +248,9 @@ let instantiate_contract
       text
   with
   | Error msg -> Error msg
-  | Ok bexpr -> Ok (substitute_bexpr bindings bexpr)
+  | Ok bexpr ->
+      let bexpr = substitute_bexpr bindings bexpr in
+      Memory_safety.lower_contract_bexpr memory_env bexpr
 
 let ( let* ) result f =
   match result with
@@ -247,15 +258,17 @@ let ( let* ) result f =
   | Error _ as error -> error
 
 type current_contract = {
+  memory_env : Memory_safety.contract_env;
   contract_fn : contracted_function;
   param_bindings : (string * expr) list;
 }
 
 let build_current_contract
+    (memory_env : Memory_safety.contract_env)
     (contract_fn : contracted_function)
     (params : param list) =
   let* param_bindings = bind_definition_params contract_fn params in
-  Ok { contract_fn; param_bindings }
+  Ok { memory_env; contract_fn; param_bindings }
 
 let param_types params =
   List.map (fun param -> param.param_type) params
@@ -282,7 +295,7 @@ let effective_contract
 
 let instantiate_void_guarantee current =
   let* guarantee =
-    instantiate_contract current.contract_fn "@Guarantee"
+    instantiate_contract current.memory_env current.contract_fn "@Guarantee"
       current.contract_fn.contract.guarantee current.param_bindings
   in
   if bexpr_has_var "result" guarantee then
@@ -294,7 +307,7 @@ let instantiate_void_guarantee current =
     Ok guarantee
 
 let instantiate_current_safety current =
-  instantiate_contract current.contract_fn "@Safety"
+  instantiate_contract current.memory_env current.contract_fn "@Safety"
     current.contract_fn.contract.safety current.param_bindings
 
 let instantiate_step_safety current =
@@ -318,7 +331,7 @@ let instantiate_void_safety current =
     Ok safety
 
 let instantiate_current_safety_with_result current result =
-  instantiate_contract current.contract_fn "@Safety"
+  instantiate_contract current.memory_env current.contract_fn "@Safety"
     current.contract_fn.contract.safety
     (("result", result) :: current.param_bindings)
 
@@ -327,23 +340,26 @@ let append_safety_assert current stmts =
   Ok (seq_of_list (stmts @ [ Assert safety ]))
 
 let rec instrument_expr
+    (memory_env : Memory_safety.contract_env)
     (env : (string * contracted_function) list)
     state
     expr =
   match expr with
   | Int _ | Var _ -> Ok ([], expr, state)
+  | AddrOf _ | Deref _ ->
+      Error "pointer expressions should be lowered before contract instrumentation"
   | Add (left, right) ->
-      instrument_binary_expr env state left right (fun l r -> Add (l, r))
+      instrument_binary_expr memory_env env state left right (fun l r -> Add (l, r))
   | Sub (left, right) ->
-      instrument_binary_expr env state left right (fun l r -> Sub (l, r))
+      instrument_binary_expr memory_env env state left right (fun l r -> Sub (l, r))
   | Mul (left, right) ->
-      instrument_binary_expr env state left right (fun l r -> Mul (l, r))
+      instrument_binary_expr memory_env env state left right (fun l r -> Mul (l, r))
   | Div (left, right) ->
-      instrument_binary_expr env state left right (fun l r -> Div (l, r))
+      instrument_binary_expr memory_env env state left right (fun l r -> Div (l, r))
   | Mod (left, right) ->
-      instrument_binary_expr env state left right (fun l r -> Mod (l, r))
+      instrument_binary_expr memory_env env state left right (fun l r -> Mod (l, r))
   | FuncCall (name, args) ->
-      let* prefix, args, state = instrument_expr_list env state args in
+      let* prefix, args, state = instrument_expr_list memory_env env state args in
       (match assoc_opt name env with
       | None -> Ok (prefix, FuncCall (name, args), state)
       | Some contract_fn ->
@@ -358,16 +374,16 @@ let rec instrument_expr
               let result_name, state = fresh_name state in
               let result_expr = Var result_name in
               let* require =
-                instantiate_contract contract_fn "@Require"
+                instantiate_contract memory_env contract_fn "@Require"
                   contract_fn.contract.require bindings
               in
               let* safety =
-                instantiate_contract contract_fn "@Safety"
+                instantiate_contract memory_env contract_fn "@Safety"
                   contract_fn.contract.safety
                   (("result", result_expr) :: bindings)
               in
               let* guarantee =
-                instantiate_contract contract_fn "@Guarantee"
+                instantiate_contract memory_env contract_fn "@Guarantee"
                   contract_fn.contract.guarantee
                   (("result", result_expr) :: bindings)
               in
@@ -382,63 +398,67 @@ let rec instrument_expr
                 , state )))
 
 and instrument_binary_expr
+    (memory_env : Memory_safety.contract_env)
     (env : (string * contracted_function) list)
     state
     left
     right
     mk =
-  let* left_prefix, left, state = instrument_expr env state left in
-  let* right_prefix, right, state = instrument_expr env state right in
+  let* left_prefix, left, state = instrument_expr memory_env env state left in
+  let* right_prefix, right, state = instrument_expr memory_env env state right in
   Ok (left_prefix @ right_prefix, mk left right, state)
 
 and instrument_expr_list
+    (memory_env : Memory_safety.contract_env)
     (env : (string * contracted_function) list)
     state
     exprs =
   match exprs with
   | [] -> Ok ([], [], state)
   | expr :: rest ->
-      let* prefix, expr, state = instrument_expr env state expr in
-      let* rest_prefix, rest, state = instrument_expr_list env state rest in
+      let* prefix, expr, state = instrument_expr memory_env env state expr in
+      let* rest_prefix, rest, state = instrument_expr_list memory_env env state rest in
       Ok (prefix @ rest_prefix, expr :: rest, state)
 
 and instrument_bexpr
+    (memory_env : Memory_safety.contract_env)
     (env : (string * contracted_function) list)
     state
     bexpr =
   match bexpr with
   | True | False -> Ok ([], bexpr, state)
   | Eq (left, right) ->
-      instrument_expr_comparison env state left right (fun l r -> Eq (l, r))
+      instrument_expr_comparison memory_env env state left right (fun l r -> Eq (l, r))
   | Neq (left, right) ->
-      instrument_expr_comparison env state left right (fun l r -> Neq (l, r))
+      instrument_expr_comparison memory_env env state left right (fun l r -> Neq (l, r))
   | Lt (left, right) ->
-      instrument_expr_comparison env state left right (fun l r -> Lt (l, r))
+      instrument_expr_comparison memory_env env state left right (fun l r -> Lt (l, r))
   | Le (left, right) ->
-      instrument_expr_comparison env state left right (fun l r -> Le (l, r))
+      instrument_expr_comparison memory_env env state left right (fun l r -> Le (l, r))
   | Gt (left, right) ->
-      instrument_expr_comparison env state left right (fun l r -> Gt (l, r))
+      instrument_expr_comparison memory_env env state left right (fun l r -> Gt (l, r))
   | Ge (left, right) ->
-      instrument_expr_comparison env state left right (fun l r -> Ge (l, r))
+      instrument_expr_comparison memory_env env state left right (fun l r -> Ge (l, r))
   | Not inner ->
-      let* prefix, inner, state = instrument_bexpr env state inner in
+      let* prefix, inner, state = instrument_bexpr memory_env env state inner in
       Ok (prefix, Not inner, state)
   | And (left, right) ->
-      let* left_prefix, left, state = instrument_bexpr env state left in
-      let* right_prefix, right, state = instrument_bexpr env state right in
+      let* left_prefix, left, state = instrument_bexpr memory_env env state left in
+      let* right_prefix, right, state = instrument_bexpr memory_env env state right in
       if left_prefix <> [] || right_prefix <> [] then
         Error "instrumented calls inside `&&` conditions are unsupported"
       else
         Ok ([], And (left, right), state)
   | Or (left, right) ->
-      let* left_prefix, left, state = instrument_bexpr env state left in
-      let* right_prefix, right, state = instrument_bexpr env state right in
+      let* left_prefix, left, state = instrument_bexpr memory_env env state left in
+      let* right_prefix, right, state = instrument_bexpr memory_env env state right in
       if left_prefix <> [] || right_prefix <> [] then
         Error "instrumented calls inside `||` conditions are unsupported"
       else
         Ok ([], Or (left, right), state)
 
 and instrument_stmt
+    (memory_env : Memory_safety.contract_env)
     (env : (string * contracted_function) list)
     (current_contract : current_contract option)
     state
@@ -451,21 +471,23 @@ and instrument_stmt
           let* stmt = append_safety_assert current [ Skip ] in
           Ok (stmt, state))
   | Assign (name, expr) ->
-      let* prefix, expr, state = instrument_expr env state expr in
+      let* prefix, expr, state = instrument_expr memory_env env state expr in
       (match current_contract with
       | None -> Ok (seq_of_list (prefix @ [ Assign (name, expr) ]), state)
       | Some current ->
           let* stmt = append_safety_assert current (prefix @ [ Assign (name, expr) ]) in
           Ok (stmt, state))
+  | Store _ | Free _ ->
+      Error "pointer statements should be lowered before contract instrumentation"
   | Assume cond ->
-      let* prefix, cond, state = instrument_bexpr env state cond in
+      let* prefix, cond, state = instrument_bexpr memory_env env state cond in
       (match current_contract with
       | None -> Ok (seq_of_list (prefix @ [ Assume cond ]), state)
       | Some current ->
           let* stmt = append_safety_assert current (prefix @ [ Assume cond ]) in
           Ok (stmt, state))
   | Assert cond ->
-      let* prefix, cond, state = instrument_bexpr env state cond in
+      let* prefix, cond, state = instrument_bexpr memory_env env state cond in
       (match current_contract with
       | None -> Ok (seq_of_list (prefix @ [ Assert cond ]), state)
       | Some current ->
@@ -476,7 +498,7 @@ and instrument_stmt
         match value with
         | None -> Ok ([], None, state)
         | Some expr ->
-            let* prefix, expr, state = instrument_expr env state expr in
+            let* prefix, expr, state = instrument_expr memory_env env state expr in
             Ok (prefix, Some expr, state)
       in
       (match current_contract with
@@ -490,7 +512,7 @@ and instrument_stmt
           let* guarantee =
             match value with
             | Some result ->
-                instantiate_contract current.contract_fn "@Guarantee"
+                instantiate_contract current.memory_env current.contract_fn "@Guarantee"
                   current.contract_fn.contract.guarantee
                   (("result", result) :: current.param_bindings)
             | None -> instantiate_void_guarantee current
@@ -500,15 +522,17 @@ and instrument_stmt
                 (prefix @ [ Assert safety; Assert guarantee; Return value ])
             , state ))
   | Seq stmts ->
-      let* stmts, state = instrument_stmt_list env current_contract state stmts in
+      let* stmts, state =
+        instrument_stmt_list memory_env env current_contract state stmts
+      in
       Ok (seq_of_list stmts, state)
   | If (cond, then_branch, else_branch) ->
-      let* prefix, cond, state = instrument_bexpr env state cond in
+      let* prefix, cond, state = instrument_bexpr memory_env env state cond in
       let* then_branch, state =
-        instrument_stmt env current_contract state then_branch
+        instrument_stmt memory_env env current_contract state then_branch
       in
       let* else_branch, state =
-        instrument_stmt env current_contract state else_branch
+        instrument_stmt memory_env env current_contract state else_branch
       in
       (match current_contract with
       | None ->
@@ -519,11 +543,11 @@ and instrument_stmt
           in
           Ok (stmt, state))
   | While (invariant, cond, body) ->
-      let* prefix, cond, state = instrument_bexpr env state cond in
+      let* prefix, cond, state = instrument_bexpr memory_env env state cond in
       if prefix <> [] then
         Error "instrumented calls inside `while` conditions are unsupported"
       else
-        let* body, state = instrument_stmt env current_contract state body in
+        let* body, state = instrument_stmt memory_env env current_contract state body in
         (match current_contract with
         | None -> Ok (While (invariant, cond, body), state)
         | Some current ->
@@ -531,16 +555,18 @@ and instrument_stmt
             Ok (stmt, state))
 
 and instrument_expr_comparison
+    (memory_env : Memory_safety.contract_env)
     (env : (string * contracted_function) list)
     state
     left
     right
     mk =
-  let* left_prefix, left, state = instrument_expr env state left in
-  let* right_prefix, right, state = instrument_expr env state right in
+  let* left_prefix, left, state = instrument_expr memory_env env state left in
+  let* right_prefix, right, state = instrument_expr memory_env env state right in
   Ok (left_prefix @ right_prefix, mk left right, state)
 
 and instrument_stmt_list
+    (memory_env : Memory_safety.contract_env)
     (env : (string * contracted_function) list)
     (current_contract : current_contract option)
     state
@@ -548,24 +574,29 @@ and instrument_stmt_list
   match stmts with
   | [] -> Ok ([], state)
   | stmt :: rest ->
-      let* stmt, state = instrument_stmt env current_contract state stmt in
-      let* rest, state = instrument_stmt_list env current_contract state rest in
+      let* stmt, state = instrument_stmt memory_env env current_contract state stmt in
+      let* rest, state =
+        instrument_stmt_list memory_env env current_contract state rest
+      in
       Ok (stmt :: rest, state)
 
 let instrument_function
+    (memory_env : Memory_safety.contract_env)
     (env : (string * contracted_function) list)
     state
     (fn : function_def) =
   let* contract = effective_contract env fn in
   match contract with
   | None ->
-      let* body, state = instrument_stmt env None state fn.body in
+      let* body, state = instrument_stmt memory_env env None state fn.body in
       Ok ({ fn with body }, state)
   | Some contract_fn ->
-      let* current = build_current_contract contract_fn fn.params in
-      let* body, state = instrument_stmt env (Some current) state fn.body in
+      let* current = build_current_contract memory_env contract_fn fn.params in
+      let* body, state =
+        instrument_stmt memory_env env (Some current) state fn.body
+      in
       let* require =
-        instantiate_contract contract_fn "@Require" contract_fn.contract.require
+        instantiate_contract memory_env contract_fn "@Require" contract_fn.contract.require
           current.param_bindings
       in
       let body = seq_of_list [ Assume require; body ] in
@@ -579,18 +610,24 @@ let instrument_function
       in
       Ok ({ fn with body }, state)
 
-let rec instrument_functions env state functions =
+let rec instrument_functions memory_env env state functions =
   match functions with
   | [] -> Ok ([], state)
   | fn :: rest ->
-      let* fn, state = instrument_function env state fn in
-      let* rest, state = instrument_functions env state rest in
+      let* fn, state = instrument_function memory_env env state fn in
+      let* rest, state = instrument_functions memory_env env state rest in
       Ok (fn :: rest, state)
 
 let instrument_program program =
-  let* env = build_contract_env program.imports program.functions in
-  let* functions, state = instrument_functions env (make_state program) program.functions in
-  let* main, state = instrument_function env state program.main in
+  let memory_env = Memory_safety.contract_env_of_program program in
+  let* program = Memory_safety.lower_program program in
+  let* env =
+    build_contract_env program.imports (program.functions @ [ program.main ])
+  in
+  let* functions, state =
+    instrument_functions memory_env env (make_state program) program.functions
+  in
+  let* main, state = instrument_function memory_env env state program.main in
   Ok
     {
       program with

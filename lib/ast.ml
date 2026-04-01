@@ -35,6 +35,8 @@ type header_import = {
 type expr =
   | Int of int
   | Var of var
+  | AddrOf of var
+  | Deref of expr
   | Add of expr * expr
   | Sub of expr * expr
   | Mul of expr * expr
@@ -58,11 +60,13 @@ type bexpr =
 type stmt =
   | Skip
   | Assign of var * expr
+  | Store of expr * expr
   | Seq of stmt list
   | If of bexpr * stmt * stmt
   | While of bexpr option * bexpr * stmt
   | Assume of bexpr
   | Assert of bexpr
+  | Free of expr
   | Return of expr option
 
 type function_def = {
@@ -76,6 +80,7 @@ type function_def = {
 type program = {
   imports : header_import list;
   globals : var list;
+  pointer_globals : var list;
   functions : function_def list;
   main : function_def;
 }
@@ -83,6 +88,8 @@ type program = {
 let rec expr_to_c = function
   | Int i -> string_of_int i
   | Var x -> x
+  | AddrOf x -> "&" ^ x
+  | Deref e -> "*" ^ expr_to_c e
   | Add (a, b) -> "(" ^ expr_to_c a ^ " + " ^ expr_to_c b ^ ")"
   | Sub (a, b) -> "(" ^ expr_to_c a ^ " - " ^ expr_to_c b ^ ")"
   | Mul (a, b) -> "(" ^ expr_to_c a ^ " * " ^ expr_to_c b ^ ")"
@@ -153,6 +160,8 @@ let negate_bexpr bexpr =
 let rec stmt_to_c ~indent_level ~return_type = function
   | Skip -> indent indent_level ^ ";\n"
   | Assign (x, e) -> indent indent_level ^ x ^ " = " ^ expr_to_c e ^ ";\n"
+  | Store (ptr, value) ->
+      indent indent_level ^ "*" ^ expr_to_c ptr ^ " = " ^ expr_to_c value ^ ";\n"
   | Seq ss ->
       String.concat ""
         (List.map (stmt_to_c ~indent_level ~return_type) ss)
@@ -186,6 +195,8 @@ let rec stmt_to_c ~indent_level ~return_type = function
   | Assert c ->
       indent indent_level ^ "if (!" ^ bexpr_to_c c
       ^ ") { abort(); } /* assert */\n"
+  | Free ptr ->
+      indent indent_level ^ "free(" ^ expr_to_c ptr ^ ");\n"
   | Return None -> indent indent_level ^ "return;\n"
   | Return (Some value) ->
       indent indent_level ^ "return " ^ expr_to_c value ^ ";\n"
@@ -201,8 +212,81 @@ let function_def_to_c fn =
   ^ body
   ^ "}\n"
 
+let helper_prototypes p =
+  let rec helpers_in_expr acc = function
+    | Int _ | Var _ | AddrOf _ -> acc
+    | Deref inner -> helpers_in_expr acc inner
+    | Add (left, right)
+    | Sub (left, right)
+    | Mul (left, right)
+    | Div (left, right)
+    | Mod (left, right) ->
+        helpers_in_expr (helpers_in_expr acc left) right
+    | FuncCall (name, args) ->
+        let acc =
+          if String.equal name "__anvil_load" then name :: acc else acc
+        in
+        List.fold_left helpers_in_expr acc args
+  in
+  let rec helpers_in_bexpr acc = function
+    | True | False -> acc
+    | Eq (left, right)
+    | Neq (left, right)
+    | Lt (left, right)
+    | Le (left, right)
+    | Gt (left, right)
+    | Ge (left, right) ->
+        helpers_in_expr (helpers_in_expr acc left) right
+    | Not inner -> helpers_in_bexpr acc inner
+    | And (left, right)
+    | Or (left, right) ->
+        helpers_in_bexpr (helpers_in_bexpr acc left) right
+  in
+  let rec helpers_in_stmt acc = function
+    | Skip -> acc
+    | Assign (_, expr) -> helpers_in_expr acc expr
+    | Store (ptr, value) -> helpers_in_expr (helpers_in_expr acc ptr) value
+    | Seq stmts ->
+        List.fold_left helpers_in_stmt acc stmts
+    | If (cond, then_branch, else_branch) ->
+        helpers_in_stmt
+          (helpers_in_stmt (helpers_in_bexpr acc cond) then_branch)
+          else_branch
+    | While (invariant, cond, body) ->
+        let acc =
+          match invariant with
+          | None -> acc
+          | Some invariant -> helpers_in_bexpr acc invariant
+        in
+        helpers_in_stmt (helpers_in_bexpr acc cond) body
+    | Assume cond | Assert cond -> helpers_in_bexpr acc cond
+    | Free ptr -> helpers_in_expr acc ptr
+    | Return None -> acc
+    | Return (Some value) -> helpers_in_expr acc value
+  in
+  let helper_names =
+    List.fold_left
+      (fun acc fn -> helpers_in_stmt acc fn.body)
+      (helpers_in_stmt [] p.main.body)
+      p.functions
+  in
+  let helper_names =
+    List.sort_uniq String.compare helper_names
+  in
+  String.concat ""
+    (List.map
+       (function
+         | "__anvil_load" -> "int __anvil_load(int block, int offset);\n"
+         | name -> failwith ("unknown helper function " ^ name))
+       helper_names)
+
 let program_to_c p =
   let header = "#include <stdlib.h>\n#include <stdio.h>\n" in
+  let helpers =
+    match helper_prototypes p with
+    | "" -> ""
+    | prototypes -> prototypes ^ "\n"
+  in
   let imports =
     match p.imports with
     | [] -> "\n"
@@ -215,10 +299,13 @@ let program_to_c p =
         ^ "\n"
   in
   let globals =
-    match p.globals with
+    List.map (fun v -> "int " ^ v ^ ";") p.globals
+    @ List.map (fun v -> "int* " ^ v ^ ";") p.pointer_globals
+  in
+  let globals =
+    match globals with
     | [] -> ""
-    | vars ->
-        String.concat "\n" (List.map (fun v -> "int " ^ v ^ ";") vars) ^ "\n\n"
+    | decls -> String.concat "\n" decls ^ "\n\n"
   in
   let functions =
     match p.functions with
@@ -227,4 +314,4 @@ let program_to_c p =
         String.concat "\n" (List.map function_def_to_c functions) ^ "\n"
   in
   let main = function_def_to_c p.main in
-  header ^ imports ^ globals ^ functions ^ main
+  header ^ helpers ^ imports ^ globals ^ functions ^ main

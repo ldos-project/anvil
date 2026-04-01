@@ -61,6 +61,8 @@ let read_all in_channel =
 let rec expr_to_ir = function
   | Int n -> Ir.Int_lit n
   | Var name -> Ir.Var name
+  | AddrOf _ | Deref _ ->
+      failwith "pointer expressions should be lowered before verification"
   | Add (left, right) -> Ir.Add [expr_to_ir left; expr_to_ir right]
   | Sub (left, right) -> Ir.Sub (expr_to_ir left, expr_to_ir right)
   | Mul (left, right) -> Ir.Mul [expr_to_ir left; expr_to_ir right]
@@ -106,6 +108,8 @@ let rec wp_stmt state stmt post =
   | Skip -> post, state
   | Assign (name, expr) ->
       Ir.subst_formula name (expr_to_ir expr) post, state
+  | Store _ | Free _ ->
+      failwith "pointer statements should be lowered before verification"
   | Seq stmts ->
       List.fold_right
         (fun stmt (post, state) -> wp_stmt state stmt post)

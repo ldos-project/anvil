@@ -19,6 +19,7 @@ rule read = parse
   | "else"              { ELSE_KW }
   | "while"             { WHILE_KW }
   | "return"            { RETURN_KW }
+  | "free"              { FREE_KW }
   | "&&"                { AND }
   | "||"                { OR }
   | "=="                { EQEQ }
@@ -31,6 +32,7 @@ rule read = parse
   | '}'                 { RBRACE }
   | ';'                 { SEMI }
   | ','                 { COMMA }
+  | '&'                 { AMP }
   | '+'                 { PLUS }
   | '-'                 { MINUS }
   | '*'                 { STAR }

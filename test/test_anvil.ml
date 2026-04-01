@@ -78,6 +78,7 @@ let gen_program size =
           {
             imports = [];
             globals;
+            pointer_globals = [];
             functions = [];
             main =
               {
@@ -328,6 +329,60 @@ let assert_loop_invariant_roundtrip_and_verification () =
             ("Expected annotated loop example to verify, got:\n"
             ^ Verify.format_outcome outcome))
 
+let assert_memory_safe_program_verifies () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n\n"
+    ^ "int *p;\n\n"
+    ^ "/* @Require 1\n"
+    ^ " * @Guarantee 1\n"
+    ^ " * @Safety heap_ok()\n"
+    ^ " */\n"
+    ^ "int main(void) {\n"
+    ^ "  p = malloc(16);\n"
+    ^ "  *(p + 1) = 7;\n"
+    ^ "  free(p);\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Memory-safe parse failed: " ^ e)
+  | Ok program ->
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Memory-safe verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected safe memory example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_memory_unsafe_program_reports_counterexample () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n\n"
+    ^ "int *p;\n\n"
+    ^ "/* @Require 1\n"
+    ^ " * @Guarantee 1\n"
+    ^ " * @Safety heap_ok()\n"
+    ^ " */\n"
+    ^ "int main(void) {\n"
+    ^ "  p = malloc(4);\n"
+    ^ "  free(p);\n"
+    ^ "  *p = 1;\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Memory-unsafe parse failed: " ^ e)
+  | Ok program ->
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Memory-unsafe verification failed: " ^ e)
+      | Ok (Verify.Counterexample _) -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected unsafe memory example to fail verification, got:\n"
+            ^ Verify.format_outcome outcome))
+
 let () =
   assert_header_import_roundtrip ();
   assert_contract_instrumentation ();
@@ -335,6 +390,8 @@ let () =
   assert_verifier_reports_counterexample ();
   assert_verifier_accepts_loop_post_invariant ();
   assert_loop_invariant_roundtrip_and_verification ();
+  assert_memory_safe_program_verifies ();
+  assert_memory_unsafe_program_reports_counterexample ();
   Quickcheck.test
     ~trials:300
     ~sexp_of:(fun _ -> Sexp.Atom "program")

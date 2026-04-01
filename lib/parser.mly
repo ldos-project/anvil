@@ -27,6 +27,9 @@ let expect_abort name =
   if String.equal name "abort" then ()
   else fail "expected `abort()`, got `%s()`" name
 
+let predicate_bexpr name args =
+  Neq (FuncCall (name, args), Int 0)
+
 let rec pointer_type base = function
   | 0 -> base
   | depth -> TPointer (pointer_type base (depth - 1))
@@ -36,11 +39,12 @@ let make_function ?contract ~name ~return_type ~params body =
 
 type top_item =
   | Top_global of var
+  | Top_pointer_global of var
   | Top_function of function_def
   | Top_main of function_def
 
 let build_program items =
-  let rec loop globals_rev functions_rev main = function
+  let rec loop globals_rev pointer_globals_rev functions_rev main = function
     | [] ->
         let main =
           match main with
@@ -50,25 +54,29 @@ let build_program items =
         {
           imports = [];
           globals = List.rev globals_rev;
+          pointer_globals = List.rev pointer_globals_rev;
           functions = List.rev functions_rev;
           main;
         }
     | Top_global name :: rest ->
-        loop (name :: globals_rev) functions_rev main rest
+        loop (name :: globals_rev) pointer_globals_rev functions_rev main rest
+    | Top_pointer_global name :: rest ->
+        loop globals_rev (name :: pointer_globals_rev) functions_rev main rest
     | Top_function fn :: rest ->
-        loop globals_rev (fn :: functions_rev) main rest
+        loop globals_rev pointer_globals_rev (fn :: functions_rev) main rest
     | Top_main fn :: rest ->
         (match main with
         | Some _ -> fail "multiple `main` definitions"
-        | None -> loop globals_rev functions_rev (Some fn) rest)
+        | None ->
+            loop globals_rev pointer_globals_rev functions_rev (Some fn) rest)
   in
-  loop [] [] None items
+  loop [] [] [] None items
 %}
 
 %token <int> INT_LIT
 %token <string> IDENT
-%token INT_KW MAIN_KW VOID_KW IF_KW ELSE_KW WHILE_KW RETURN_KW
-%token LPAREN RPAREN LBRACE RBRACE SEMI COMMA
+%token INT_KW MAIN_KW VOID_KW IF_KW ELSE_KW WHILE_KW RETURN_KW FREE_KW
+%token LPAREN RPAREN LBRACE RBRACE SEMI COMMA AMP
 %token PLUS MINUS STAR SLASH PERCENT
 %token ASSIGN EQEQ NEQ LT LE GT GE NOT AND OR
 %token EOF
@@ -105,6 +113,10 @@ contract_expr:
       { Int n }
   | MINUS value = contract_expr %prec UMINUS
       { match value with Int n -> Int (-n) | _ -> Sub (Int 0, value) }
+  | AMP name = IDENT
+      { AddrOf name }
+  | STAR value = contract_expr %prec UMINUS
+      { Deref value }
   | name = IDENT LPAREN args = separated_list(COMMA, contract_expr) RPAREN
       { FuncCall (name, args) }
   | name = IDENT
@@ -125,6 +137,8 @@ contract_expr:
 contract_bexpr:
   | n = INT_LIT
       { bool_of_int n }
+  | name = IDENT LPAREN args = separated_list(COMMA, contract_expr) RPAREN
+      { predicate_bexpr name args }
   | LPAREN value = contract_bexpr RPAREN
       { value }
   | NOT value = contract_bexpr %prec NOT
@@ -168,7 +182,8 @@ int_top_tail:
       {
         fun stars name ->
           if stars = 0 then Top_global name
-          else fail "pointer globals are unsupported"
+          else if stars = 1 then Top_pointer_global name
+          else fail "only `int*` globals are supported"
       }
   | LPAREN params = param_list RPAREN body = block
       {
@@ -214,8 +229,12 @@ stmt:
       { Skip }
   | name = IDENT ASSIGN rhs = expr SEMI
       { Assign (name, rhs) }
+  | STAR lhs = expr ASSIGN rhs = expr SEMI
+      { Store (lhs, rhs) }
   | RETURN_KW value = option(expr) SEMI
       { Return value }
+  | FREE_KW LPAREN ptr = expr RPAREN SEMI
+      { Free ptr }
   | IF_KW LPAREN cond = bexpr RPAREN then_branch = block ELSE_KW else_branch = block
       { If (cond, then_branch, else_branch) }
   | IF_KW LPAREN NOT cond = bexpr RPAREN LBRACE RETURN_KW SEMI RBRACE
@@ -254,6 +273,10 @@ expr:
       { Int n }
   | MINUS n = INT_LIT
       { Int (-n) }
+  | AMP name = IDENT
+      { AddrOf name }
+  | STAR value = expr %prec UMINUS
+      { Deref value }
   | name = IDENT LPAREN args = separated_list(COMMA, expr) RPAREN
       { FuncCall (name, args) }
   | name = IDENT
