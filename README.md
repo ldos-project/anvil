@@ -215,9 +215,6 @@ Anvil currently recognizes these built-in predicate calls in contracts:
 
 These predicates are lowered into ordinary scalar formulas before weakest-precondition generation, so they participate in verification just like any other contract formula.
 
-Today, this interface is intentionally simple.
-Rather than writing quantified event-style specifications such as `forall p. free.called_on(p) ==> allocated(p)`, you write state predicates over the ghost heap, typically with `@Safety heap_ok()`.
-
 ## Loop Invariants
 
 You can annotate a loop invariant with a comment immediately before a `while`:
