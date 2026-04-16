@@ -369,6 +369,8 @@ Useful examples live in `test/e2e_cases/`:
 
 - `contract_import_scalar.c`
 - `contract_local_scalar.c`
+- `modular_composition_scalar.c`
+- `modular_composition_memory.c`
 - `memory_safe_malloc_store.c`
 - `memory_unsafe_dangling_store.c`
 - `scalar_loop.c`

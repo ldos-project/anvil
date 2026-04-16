@@ -60,6 +60,7 @@ let rec int_expr_to_smt = function
       parens "div" [int_expr_to_smt left; int_expr_to_smt right]
   | Mod (left, right) ->
       parens "mod" [int_expr_to_smt left; int_expr_to_smt right]
+  | App (name, []) -> name
   | App (name, args) ->
       parens name (List.map int_expr_to_smt args)
 
