@@ -70,6 +70,8 @@ rule read = parse
   | ')'                 { RPAREN }
   | '{'                 { LBRACE }
   | '}'                 { RBRACE }
+  | '['                 { LBRACKET }
+  | ']'                 { RBRACKET }
   | ';'                 { SEMI }
   | ','                 { COMMA }
   | '&'                 { AMP }

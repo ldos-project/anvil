@@ -57,9 +57,21 @@ let scalar_byte_size = function
   | TBool -> 1
   | TVoid -> failwith "void has no byte size"
   | TPointer _ -> failwith "pointer byte size is not modeled directly"
+  | TArray _ -> failwith "array is not a scalar byte-sized type"
 
 let scalar_byte_size_expr c_type =
   Int (scalar_byte_size c_type)
+
+let rec object_byte_size = function
+  | TInt | TFloat | TDouble | TChar | TBool as c_type ->
+      scalar_byte_size c_type
+  | TArray (element_type, length) ->
+      length * scalar_byte_size element_type
+  | TVoid -> failwith "void has no object byte size"
+  | TPointer _ -> failwith "pointer object byte size is not modeled directly"
+
+let object_byte_size_expr c_type =
+  Int (object_byte_size c_type)
 
 let ptr_block_name name = "__anvil_ptr_block_" ^ name
 
@@ -85,8 +97,11 @@ let ghost_heap_predicates =
   ]
 
 let rec count_malloc_expr = function
-  | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ | Var _ | AddrOf _ ->
+  | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ | Var _ ->
       0
+  | AddrOf inner -> count_malloc_expr inner
+  | Index (base, index) ->
+      count_malloc_expr base + count_malloc_expr index
   | Deref inner -> count_malloc_expr inner
   | Add (left, right)
   | Sub (left, right)
@@ -102,7 +117,7 @@ let rec count_malloc_expr = function
 
 let rec uses_memory_expr = function
   | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ | Var _ -> false
-  | AddrOf _ | Deref _ -> true
+  | AddrOf _ | Index _ | Deref _ -> true
   | Add (left, right)
   | Sub (left, right)
   | Mul (left, right)
@@ -130,6 +145,8 @@ let rec count_malloc_stmt = function
   | Skip -> 0
   | Assign (_, expr) -> count_malloc_expr expr
   | Store (ptr, value) -> count_malloc_expr ptr + count_malloc_expr value
+  | ArrayAssign (base, index, value) ->
+      count_malloc_expr base + count_malloc_expr index + count_malloc_expr value
   | Seq stmts ->
       List.fold_left (fun acc stmt -> acc + count_malloc_stmt stmt) 0 stmts
   | If (cond, then_branch, else_branch) ->
@@ -153,7 +170,7 @@ let rec count_malloc_stmt = function
 let rec uses_memory_stmt = function
   | Skip -> false
   | Assign (_, expr) -> uses_memory_expr expr
-  | Store _ | Free _ -> true
+  | Store _ | ArrayAssign _ | Free _ -> true
   | Seq stmts -> List.exists uses_memory_stmt stmts
   | If (cond, then_branch, else_branch) ->
       uses_memory_bexpr cond
@@ -217,6 +234,7 @@ let imported_function_mentions_memory_contract (fn : contracted_function) =
 
 let uses_memory_program program =
   pointer_globals program.globals <> []
+  || List.exists (fun global -> is_array_type global.global_type) program.globals
   || List.exists uses_memory_stmt (program.main.body :: List.map (fun fn -> fn.body) program.functions)
   || List.exists function_mentions_memory_contract (program.main :: program.functions)
   || List.exists
@@ -264,12 +282,18 @@ let global_scalar_type env name =
       if String.equal global.global_name name then Some global.global_type else None)
     env.scalar_globals
 
+let global_decay_pointee_type env name =
+  match global_scalar_type env name with
+  | Some (TArray (element_type, _)) -> Some element_type
+  | Some c_type -> Some c_type
+  | None -> None
+
 let pointer_globals_of_program program =
   List.filter_map
     (fun global ->
       match global.global_type with
       | TPointer inner -> Some (global.global_name, inner)
-      | TInt | TFloat | TDouble | TChar | TBool | TVoid -> None)
+      | TInt | TFloat | TDouble | TChar | TBool | TVoid | TArray _ -> None)
     (pointer_globals program.globals)
 
 let rec expr_kind env = function
@@ -282,11 +306,23 @@ let rec expr_kind env = function
   | Var name ->
       (match pointer_pointee_type env name with
       | Some pointee -> Pointer_kind pointee
-      | None -> Scalar_kind)
-  | AddrOf name ->
-      (match global_scalar_type env name with
-      | Some global_type -> Pointer_kind global_type
-      | None -> Scalar_kind)
+      | None ->
+          (match global_scalar_type env name with
+          | Some (TArray (element_type, _)) -> Pointer_kind element_type
+          | Some _ | None -> Scalar_kind))
+  | AddrOf expr ->
+      (match expr with
+      | Var name ->
+          (match global_decay_pointee_type env name with
+          | Some pointee -> Pointer_kind pointee
+          | None -> Scalar_kind)
+      | Index (base, _) ->
+          (match expr_kind env base with
+          | Pointer_kind pointee -> Pointer_kind pointee
+          | Scalar_kind -> Scalar_kind)
+      | _ -> Scalar_kind)
+  | Index _ ->
+      Scalar_kind
   | Deref _ -> Scalar_kind
   | Add (left, right) ->
       (match expr_kind env left, expr_kind env right with
@@ -313,7 +349,7 @@ let valid_access_formula env block offset width =
               ; int_ge offset (Int 0)
               ; int_le
                   (Add (offset, width))
-                  (scalar_byte_size_expr global.global_type)
+                  (object_byte_size_expr global.global_type)
               ])
           (global_block_id env global.global_name))
       env.scalar_globals
@@ -384,12 +420,41 @@ let rec lower_scalar_expr env state expr =
   match expr with
   | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ as expr ->
       Ok ([], expr, state)
-  | Var name when not (is_pointer_name env name) ->
-      Ok ([], Var name, state)
   | Var name ->
-      fail "pointer variable `%s` used where a scalar was expected" name
+      if is_pointer_name env name then
+        fail "pointer variable `%s` used where a scalar was expected" name
+      else
+        (match global_scalar_type env name with
+        | Some (TArray _) ->
+            fail "array `%s` used where a scalar was expected" name
+        | Some _ | None ->
+            Ok ([], Var name, state))
   | AddrOf _ ->
       fail "address-of expression used where a scalar was expected"
+  | Index (base, index) ->
+      let* prefix, block, offset, pointee_opt, state =
+        lower_ptr_expr env state (Add (base, index))
+      in
+      let* pointee =
+        match pointee_opt with
+        | Some (TInt | TFloat | TDouble | TChar | TBool as pointee) ->
+            Ok pointee
+        | Some TVoid ->
+            fail "cannot index into `void*` in this proof-of-concept"
+        | Some (TPointer _) ->
+            fail "pointer-to-pointer indexing is unsupported in this proof-of-concept"
+        | Some (TArray _) ->
+            fail "nested array indexing is unsupported in this proof-of-concept"
+        | None ->
+            fail "could not infer the element type for indexed access"
+      in
+      Ok
+        ( prefix
+          @ [ heap_guard_stmt
+                (valid_access_formula env block offset (scalar_byte_size_expr pointee))
+                [] ]
+        , FuncCall (load_helper_name pointee, [ block; offset ])
+        , state )
   | Deref ptr ->
       let* prefix, block, offset, pointee_opt, state =
         lower_ptr_expr env state ptr
@@ -402,6 +467,8 @@ let rec lower_scalar_expr env state expr =
             fail "cannot dereference `void*` in this proof-of-concept"
         | Some (TPointer _) ->
             fail "pointer-to-pointer operations are unsupported in this proof-of-concept"
+        | Some (TArray _) ->
+            fail "nested array operations are unsupported in this proof-of-concept"
         | None ->
             fail "could not infer the pointee type for dereference"
       in
@@ -460,7 +527,13 @@ and lower_ptr_expr ?expected env state expr =
         , pointer_pointee_type env name
         , state )
   | Var name ->
-      Ok ([], Var name, Int 0, None, state)
+      (match global_scalar_type env name with
+      | Some (TArray (element_type, _)) ->
+          (match global_block_id env name with
+          | Some block_id -> Ok ([], Int block_id, Int 0, Some element_type, state)
+          | None -> fail "missing array global `%s` in memory environment" name)
+      | Some _ | None ->
+          Ok ([], Var name, Int 0, None, state))
   | Int n ->
       Ok ([], Int n, Int 0, None, state)
   | CharLit value ->
@@ -469,14 +542,20 @@ and lower_ptr_expr ?expected env state expr =
       Ok ([], int_expr_of_bool value, Int 0, None, state)
   | FloatLit _ | DoubleLit _ ->
       fail "floating-point values cannot be used as pointer expressions"
-  | AddrOf name ->
-      (match global_block_id env name, global_scalar_type env name with
+  | AddrOf (Var name) ->
+      (match global_block_id env name, global_decay_pointee_type env name with
       | Some block_id, Some global_type ->
           Ok ([], Int block_id, Int 0, Some global_type, state)
       | None, _ ->
-          fail "only address-of for scalar globals is supported, got `&%s`" name
+          fail "only address-of for globals is supported, got `&%s`" name
       | _, None ->
-          fail "only address-of for scalar globals is supported, got `&%s`" name)
+          fail "only address-of for globals is supported, got `&%s`" name)
+  | AddrOf (Index (base, index)) ->
+      lower_ptr_expr env state (Add (base, index))
+  | AddrOf _ ->
+      fail "only address-of for globals and indexed locations is supported"
+  | Index _ ->
+      fail "indexed value used where a pointer was expected"
   | Add (left, right) ->
       (match expr_kind env left, expr_kind env right with
       | Pointer_kind pointee, Scalar_kind ->
@@ -645,8 +724,34 @@ and lower_stmt env state stmt =
             fail "cannot write through `void*` in this proof-of-concept"
         | Some (TPointer _) ->
             fail "pointer-to-pointer stores are unsupported in this proof-of-concept"
+        | Some (TArray _) ->
+            fail "nested array stores are unsupported in this proof-of-concept"
         | None ->
             fail "could not infer the pointee type for store"
+      in
+      Ok
+        ( seq_of_list
+            (ptr_prefix
+            @ value_prefix
+            @ [ heap_guard_stmt (valid_access_formula env block offset width) [] ])
+        , state )
+  | ArrayAssign (base, index, value) ->
+      let* ptr_prefix, block, offset, pointee_opt, state =
+        lower_ptr_expr env state (Add (base, index))
+      in
+      let* value_prefix, _value, state = lower_scalar_expr env state value in
+      let* width =
+        match pointee_opt with
+        | Some (TInt | TFloat | TDouble | TChar | TBool as pointee) ->
+            Ok (scalar_byte_size_expr pointee)
+        | Some TVoid ->
+            fail "cannot write through `void*` in this proof-of-concept"
+        | Some (TPointer _) ->
+            fail "pointer-to-pointer indexed stores are unsupported in this proof-of-concept"
+        | Some (TArray _) ->
+            fail "nested array stores are unsupported in this proof-of-concept"
+        | None ->
+            fail "could not infer the element type for indexed store"
       in
       Ok
         ( seq_of_list
@@ -719,18 +824,34 @@ let lower_function env state fn =
       (fun param ->
         match param.param_type with
         | TPointer _ -> true
-        | TInt | TFloat | TDouble | TChar | TBool | TVoid -> false)
+        | TInt | TFloat | TDouble | TChar | TBool | TVoid | TArray _ -> false)
+      fn.params
+  in
+  let has_array_param =
+    List.exists
+      (fun param ->
+        match param.param_type with
+        | TArray _ -> true
+        | TInt | TFloat | TDouble | TChar | TBool | TVoid | TPointer _ -> false)
       fn.params
   in
   if has_pointer_param then
     fail
       "pointer parameters in function `%s` are unsupported in this proof-of-concept"
       fn.name
+  else if has_array_param then
+    fail
+      "array parameters in function `%s` are unsupported in this proof-of-concept"
+      fn.name
   else
     match fn.return_type with
     | TPointer _ ->
         fail
           "pointer return type in function `%s` is unsupported in this proof-of-concept"
+          fn.name
+    | TArray _ ->
+        fail
+          "array return type in function `%s` is unsupported in this proof-of-concept"
           fn.name
     | TInt | TFloat | TDouble | TChar | TBool | TVoid ->
         let init = alloc_init_stmts env.malloc_sites in
@@ -787,11 +908,19 @@ let contract_env_of_program program =
 let rec lower_contract_scalar_expr env expr =
   match expr with
   | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ as expr -> Ok expr
-  | Var name when not (is_pointer_name env name) -> Ok (Var name)
   | Var name ->
-      fail "pointer variable `%s` used where a scalar contract expression was expected" name
+      if is_pointer_name env name then
+        fail "pointer variable `%s` used where a scalar contract expression was expected" name
+      else
+        (match global_scalar_type env name with
+        | Some (TArray _) ->
+            fail "array `%s` used where a scalar contract expression was expected" name
+        | Some _ | None ->
+            Ok (Var name))
   | AddrOf _ ->
       fail "address-of expression used where a scalar contract expression was expected"
+  | Index _ ->
+      fail "indexed reads are unsupported inside contract expressions"
   | Deref _ ->
       fail "dereference is unsupported inside contract expressions"
   | Add (left, right) ->
@@ -834,18 +963,32 @@ and lower_contract_ptr_expr ?expected env expr =
   match expr with
   | Var name when is_pointer_name env name ->
       Ok (Var (ptr_block_name name), Var (ptr_offset_name name), pointer_pointee_type env name)
+  | Var name ->
+      (match global_scalar_type env name with
+      | Some (TArray (element_type, _)) ->
+          (match global_block_id env name with
+          | Some block_id -> Ok (Int block_id, Int 0, Some element_type)
+          | None -> fail "missing array global `%s` in contract environment" name)
+      | Some _ | None ->
+          fail "scalar variable `%s` used where a pointer contract expression was expected" name)
   | Int n -> Ok (Int n, Int 0, None)
   | CharLit value -> Ok (int_expr_of_char value, Int 0, None)
   | BoolLit value -> Ok (int_expr_of_bool value, Int 0, None)
   | FloatLit _ | DoubleLit _ ->
       fail "floating-point values cannot be used as pointer contract expressions"
-  | AddrOf name ->
-      (match global_block_id env name, global_scalar_type env name with
+  | AddrOf (Var name) ->
+      (match global_block_id env name, global_decay_pointee_type env name with
       | Some block_id, Some global_type -> Ok (Int block_id, Int 0, Some global_type)
       | None, _ ->
-          fail "only address-of for scalar globals is supported in contracts, got `&%s`" name
+          fail "only address-of for globals is supported in contracts, got `&%s`" name
       | _, None ->
-          fail "only address-of for scalar globals is supported in contracts, got `&%s`" name)
+          fail "only address-of for globals is supported in contracts, got `&%s`" name)
+  | AddrOf (Index (base, index)) ->
+      lower_contract_ptr_expr env (Add (base, index))
+  | AddrOf _ ->
+      fail "only address-of for globals and indexed locations is supported in contracts"
+  | Index _ ->
+      fail "indexed value used where a pointer contract expression was expected"
   | Add (left, right) ->
       (match expr_kind env left, expr_kind env right with
       | Pointer_kind pointee, Scalar_kind ->
@@ -858,8 +1001,6 @@ and lower_contract_ptr_expr ?expected env expr =
           Ok (block, Add (offset, scale_pointer_delta pointee delta), Some pointee)
       | _ ->
           fail "unsupported pointer arithmetic expression in contract")
-  | Var name ->
-      fail "scalar variable `%s` used where a pointer contract expression was expected" name
   | Deref _ ->
       fail "dereference is unsupported inside contract pointer expressions"
   | FuncCall _ ->
@@ -878,7 +1019,7 @@ let allocated_formula env block offset pointee_opt =
     match pointee_opt with
     | Some (TInt | TFloat | TDouble | TChar | TBool as pointee) ->
         scalar_byte_size_expr pointee
-    | Some TVoid | Some (TPointer _) | None ->
+    | Some TVoid | Some (TPointer _) | Some (TArray _) | None ->
         Int 1
   in
   valid_access_formula env block offset width

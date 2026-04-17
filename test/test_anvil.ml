@@ -488,6 +488,69 @@ let assert_memory_too_small_allocation_reports_counterexample () =
             ("Expected too-small allocation example to fail verification, got:\n"
             ^ Verify.format_outcome outcome))
 
+let assert_array_roundtrip_and_verification () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n"
+    ^ "#include <stdbool.h>\n\n"
+    ^ "int xs[4];\n"
+    ^ "int *p;\n"
+    ^ "int y;\n\n"
+    ^ "/* @Require 1\n"
+    ^ " * @Guarantee 1\n"
+    ^ " * @Safety heap_ok()\n"
+    ^ " */\n"
+    ^ "int main(void) {\n"
+    ^ "  p = &xs[1];\n"
+    ^ "  xs[0] = 3;\n"
+    ^ "  xs[1] = (xs[0] + 4);\n"
+    ^ "  p[1] = (xs[1] + 1);\n"
+    ^ "  y = p[1];\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Array parse failed: " ^ e)
+  | Ok program ->
+      (match parse_program (program_to_c program) with
+      | Error e -> failwith ("Array roundtrip failed: " ^ e)
+      | Ok roundtripped ->
+          if not (equal_program program roundtripped) then
+            failwith "Array roundtrip mismatch");
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Array verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected array example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_array_out_of_bounds_reports_counterexample () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n"
+    ^ "#include <stdbool.h>\n\n"
+    ^ "int xs[2];\n\n"
+    ^ "/* @Require 1\n"
+    ^ " * @Guarantee 1\n"
+    ^ " * @Safety heap_ok()\n"
+    ^ " */\n"
+    ^ "int main(void) {\n"
+    ^ "  xs[2] = 7;\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Array OOB parse failed: " ^ e)
+  | Ok program ->
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Array OOB verification failed: " ^ e)
+      | Ok (Verify.Counterexample _) -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected array bounds example to fail verification, got:\n"
+            ^ Verify.format_outcome outcome))
+
 let assert_example_file_verifies file_name =
   let path = "test/e2e_cases/" ^ file_name in
   let source = In_channel.read_all path in
@@ -527,6 +590,7 @@ let assert_typed_memory_examples_verify () =
     ; "memory_safe_double_expression.c"
     ; "memory_safe_char_expression.c"
     ; "memory_safe_bool_expression.c"
+    ; "memory_safe_array_expression.c"
     ]
     ~f:assert_example_file_verifies
 
@@ -537,6 +601,7 @@ let assert_typed_memory_negative_examples_fail () =
     ; "memory_unsafe_double_too_small.c"
     ; "memory_unsafe_char_out_of_bounds.c"
     ; "memory_unsafe_bool_out_of_bounds.c"
+    ; "memory_unsafe_array_out_of_bounds.c"
     ]
     ~f:assert_example_file_reports_counterexample
 
@@ -552,6 +617,8 @@ let () =
   assert_memory_safe_program_verifies ();
   assert_memory_unsafe_program_reports_counterexample ();
   assert_memory_too_small_allocation_reports_counterexample ();
+  assert_array_roundtrip_and_verification ();
+  assert_array_out_of_bounds_reports_counterexample ();
   assert_typed_memory_examples_verify ();
   assert_typed_memory_negative_examples_fail ();
   Quickcheck.test

@@ -97,6 +97,7 @@ let strip_float_suffix text =
 let sort_of_c_type = function
   | TFloat | TDouble -> Ir.Real
   | TInt | TChar | TBool | TPointer _ -> Ir.Int
+  | TArray _ -> failwith "array values should be lowered before SMT translation"
   | TVoid -> failwith "void cannot appear in SMT expressions"
 
 let helper_signature = function
@@ -151,7 +152,7 @@ let rec expr_type env = function
   | BoolLit _ -> TBool
   | Var name ->
       Option.value (lookup_var_type env name) ~default:TInt
-  | AddrOf _ | Deref _ ->
+  | AddrOf _ | Index _ | Deref _ ->
       failwith "pointer expressions should be lowered before verification"
   | Add (left, right)
   | Sub (left, right)
@@ -175,7 +176,7 @@ let rec expr_to_ir env = function
   | BoolLit true -> Ir.Int_lit 1
   | BoolLit false -> Ir.Int_lit 0
   | Var name -> Ir.Var name
-  | AddrOf _ | Deref _ ->
+  | AddrOf _ | Index _ | Deref _ ->
       failwith "pointer expressions should be lowered before verification"
   | Add (left, right) -> Ir.Add [expr_to_ir env left; expr_to_ir env right]
   | Sub (left, right) -> Ir.Sub (expr_to_ir env left, expr_to_ir env right)
@@ -237,7 +238,7 @@ let rec wp_stmt env state stmt post =
   | Skip -> post, state
   | Assign (name, expr) ->
       Ir.subst_formula name (expr_to_ir env expr) post, state
-  | Store _ | Free _ ->
+  | Store _ | ArrayAssign _ | Free _ ->
       failwith "pointer statements should be lowered before verification"
   | Seq stmts ->
       List.fold_right
@@ -608,8 +609,11 @@ let param_names params =
 
 let rec apps_in_expr env acc = function
   | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ | Var _ -> acc
-  | AddrOf _ | Deref _ ->
-      acc
+  | AddrOf inner -> apps_in_expr env acc inner
+  | Index (base, index) ->
+      apps_in_expr env (apps_in_expr env acc base) index
+  | Deref inner ->
+      apps_in_expr env acc inner
   | Add (left, right)
   | Sub (left, right)
   | Mul (left, right)
@@ -641,6 +645,8 @@ let rec apps_in_stmt env acc = function
   | Skip -> acc
   | Assign (_, expr) -> apps_in_expr env acc expr
   | Store (ptr, value) -> apps_in_expr env (apps_in_expr env acc ptr) value
+  | ArrayAssign (base, index, value) ->
+      apps_in_expr env (apps_in_expr env (apps_in_expr env acc base) index) value
   | Seq stmts ->
       List.fold_left (apps_in_stmt env) acc stmts
   | If (cond, then_branch, else_branch) ->
@@ -665,10 +671,17 @@ let queries_for_vc (program : program) (vc : verification_condition) =
   | None -> vc.queries
   | Some fn ->
       let env = expr_env_for_function program fn in
+      let queryable_globals =
+        List.filter_map
+          (fun global ->
+            if is_array_type global.global_type then None
+            else Some global.global_name)
+          program.globals
+      in
       let extra_var_queries =
         List.map
           (fun name -> { label = name; term = Ir.Var name })
-          (global_names program.globals @ param_names fn.params)
+          (queryable_globals @ param_names fn.params)
       in
       let extra_app_queries =
         apps_in_stmt env String_map.empty fn.body
@@ -705,7 +718,7 @@ let rec symbolic_expr env = function
       (match lookup_env env name with
       | Some value -> value
       | None -> Ir.Var name)
-  | AddrOf _ | Deref _ ->
+  | AddrOf _ | Index _ | Deref _ ->
       failwith "pointer expressions should be lowered before replay"
   | Add (left, right) ->
       Ir.Add [ symbolic_expr env left; symbolic_expr env right ]
@@ -853,7 +866,7 @@ let rec replay_stmt model env fuel stmt =
     | Skip -> Replay_continue env
     | Assign (name, expr) ->
         Replay_continue (bind_env env name (symbolic_expr env expr))
-    | Store _ | Free _ ->
+    | Store _ | ArrayAssign _ | Free _ ->
         Replay_blocked
     | Seq stmts ->
         replay_stmt_list model env fuel stmts
@@ -941,6 +954,8 @@ let string_of_runtime_scalar env model c_type name =
     match String_map.find_opt name model with
     | Some value -> value
     | None -> "<unknown>"
+  else if is_array_type c_type then
+    Printf.sprintf "&%s[0]" name
   else
     string_of_runtime_int env model name
 
@@ -954,11 +969,22 @@ let pointer_value_string original_program env model name =
   | Some block, Some offset ->
       let scalar_globals = scalar_globals original_program.globals in
       if block >= 1 && block <= List.length scalar_globals then
-        let global_name = (List.nth scalar_globals (block - 1)).global_name in
-        if offset = 0 then
-          "&" ^ global_name
-        else
-          Printf.sprintf "&%s + %d" global_name offset
+        let global = List.nth scalar_globals (block - 1) in
+        let global_name = global.global_name in
+        (match global.global_type with
+        | TArray (element_type, _) ->
+            let element_size = Memory_safety.scalar_byte_size element_type in
+            if offset = 0 then
+              Printf.sprintf "&%s[0]" global_name
+            else if offset mod element_size = 0 then
+              Printf.sprintf "&%s[%d]" global_name (offset / element_size)
+            else
+              Printf.sprintf "&%s[0] + %d" global_name offset
+        | _ ->
+            if offset = 0 then
+              "&" ^ global_name
+            else
+              Printf.sprintf "&%s + %d" global_name offset)
       else
         let site = block - List.length scalar_globals in
         let malloc_sites =

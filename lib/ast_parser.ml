@@ -24,6 +24,7 @@ let rec normalize_stmt = function
       | Some loop_invariant when loop_invariant = c && body = Skip ->
           Assume (negate_bexpr c)
       | _ -> While (invariant, c, body))
+  | ArrayAssign (base, index, value) -> ArrayAssign (base, index, value)
   | Store (ptr, value) -> Store (ptr, value)
   | Assume _ as stmt -> stmt
   | Assert _ as stmt -> stmt
@@ -134,7 +135,7 @@ let parse_loop_invariant source_name annotation =
 
 let rec attach_loop_invariants_stmt source_name invariants stmt =
   match stmt with
-  | Skip | Assign _ | Store _ | Assume _ | Assert _ | Free _ | Return _ ->
+  | Skip | Assign _ | Store _ | ArrayAssign _ | Assume _ | Assert _ | Free _ | Return _ ->
       stmt, invariants
   | Seq stmts ->
       let stmts, invariants =

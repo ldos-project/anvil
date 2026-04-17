@@ -10,6 +10,7 @@ type c_type =
   | TBool
   | TVoid
   | TPointer of c_type
+  | TArray of c_type * int
 
 type global_def = {
   global_type : c_type;
@@ -48,7 +49,8 @@ type expr =
   | CharLit of int
   | BoolLit of bool
   | Var of var
-  | AddrOf of var
+  | AddrOf of expr
+  | Index of expr * expr
   | Deref of expr
   | Add of expr * expr
   | Sub of expr * expr
@@ -74,6 +76,7 @@ type stmt =
   | Skip
   | Assign of var * expr
   | Store of expr * expr
+  | ArrayAssign of expr * expr * expr
   | Seq of stmt list
   | If of bexpr * stmt * stmt
   | While of bexpr option * bexpr * stmt
@@ -111,32 +114,50 @@ let rec c_type_to_c = function
   | TBool -> "bool"
   | TVoid -> "void"
   | TPointer inner -> c_type_to_c inner ^ "*"
+  | TArray (inner, size) ->
+      Printf.sprintf "%s[%d]" (c_type_to_c inner) size
 
 let type_with_name_to_c c_type name =
-  c_type_to_c c_type ^ " " ^ name
+  match c_type with
+  | TArray (inner, size) ->
+      Printf.sprintf "%s %s[%d]" (c_type_to_c inner) name size
+  | _ ->
+      c_type_to_c c_type ^ " " ^ name
 
 let global_names globals =
   List.map (fun global -> global.global_name) globals
 
 let is_pointer_type = function
   | TPointer _ -> true
-  | TInt | TFloat | TDouble | TChar | TBool | TVoid -> false
+  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TArray _ -> false
 
 let pointer_base_type = function
   | TPointer inner -> Some inner
-  | TInt | TFloat | TDouble | TChar | TBool | TVoid -> None
+  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TArray _ -> None
+
+let is_array_type = function
+  | TArray _ -> true
+  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TPointer _ -> false
+
+let array_element_type = function
+  | TArray (inner, _) -> Some inner
+  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TPointer _ -> None
+
+let array_length = function
+  | TArray (_, length) -> Some length
+  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TPointer _ -> None
 
 let is_real_type = function
   | TFloat | TDouble -> true
-  | TInt | TChar | TBool | TVoid | TPointer _ -> false
+  | TInt | TChar | TBool | TVoid | TPointer _ | TArray _ -> false
 
 let is_integer_like_type = function
   | TInt | TChar | TBool -> true
-  | TFloat | TDouble | TVoid | TPointer _ -> false
+  | TFloat | TDouble | TVoid | TPointer _ | TArray _ -> false
 
 let is_scalar_type = function
   | TInt | TFloat | TDouble | TChar | TBool -> true
-  | TVoid | TPointer _ -> false
+  | TVoid | TPointer _ | TArray _ -> false
 
 let lookup_global globals name =
   List.find_opt (fun global -> String.equal global.global_name name) globals
@@ -156,7 +177,7 @@ let load_helper_name = function
   | TDouble -> "__anvil_load_double"
   | TChar -> "__anvil_load_char"
   | TBool -> "__anvil_load_bool"
-  | TVoid | TPointer _ -> failwith "unsupported helper load type"
+  | TVoid | TPointer _ | TArray _ -> failwith "unsupported helper load type"
 
 let escape_char_code = function
   | 0 -> "'\\0'"
@@ -184,7 +205,8 @@ let rec expr_to_c = function
   | BoolLit true -> "true"
   | BoolLit false -> "false"
   | Var x -> x
-  | AddrOf x -> "&" ^ x
+  | AddrOf value -> "&" ^ expr_to_c value
+  | Index (base, index) -> expr_to_c base ^ "[" ^ expr_to_c index ^ "]"
   | Deref e -> "*" ^ expr_to_c e
   | Add (a, b) -> "(" ^ expr_to_c a ^ " + " ^ expr_to_c b ^ ")"
   | Sub (a, b) -> "(" ^ expr_to_c a ^ " - " ^ expr_to_c b ^ ")"
@@ -238,6 +260,7 @@ let zero_literal_for_type = function
   | TBool -> "false"
   | TVoid -> failwith "void does not have a zero literal"
   | TPointer _ -> "0"
+  | TArray _ -> failwith "array does not have a zero literal"
 
 let assume_fallback_to_c = function
   | TVoid -> "return;"
@@ -259,6 +282,9 @@ let rec stmt_to_c ~indent_level ~return_type = function
   | Assign (x, e) -> indent indent_level ^ x ^ " = " ^ expr_to_c e ^ ";\n"
   | Store (ptr, value) ->
       indent indent_level ^ "*" ^ expr_to_c ptr ^ " = " ^ expr_to_c value ^ ";\n"
+  | ArrayAssign (base, index, value) ->
+      indent indent_level ^ expr_to_c base ^ "[" ^ expr_to_c index ^ "] = "
+      ^ expr_to_c value ^ ";\n"
   | Seq ss ->
       String.concat ""
         (List.map (stmt_to_c ~indent_level ~return_type) ss)
@@ -320,8 +346,11 @@ let helper_prototype name =
 
 let helper_prototypes p =
   let rec helpers_in_expr acc = function
-    | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ | Var _ | AddrOf _ ->
+    | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ | Var _ ->
         acc
+    | AddrOf inner -> helpers_in_expr acc inner
+    | Index (base, index) ->
+        helpers_in_expr (helpers_in_expr acc base) index
     | Deref inner -> helpers_in_expr acc inner
     | Add (left, right)
     | Sub (left, right)
@@ -358,6 +387,10 @@ let helper_prototypes p =
     | Skip -> acc
     | Assign (_, expr) -> helpers_in_expr acc expr
     | Store (ptr, value) -> helpers_in_expr (helpers_in_expr acc ptr) value
+    | ArrayAssign (base, index, value) ->
+        helpers_in_expr
+          (helpers_in_expr (helpers_in_expr acc base) index)
+          value
     | Seq stmts ->
         List.fold_left helpers_in_stmt acc stmts
     | If (cond, then_branch, else_branch) ->

@@ -218,6 +218,50 @@ Anvil currently recognizes these built-in predicate calls in contracts:
 
 These predicates are lowered into ordinary scalar formulas before weakest-precondition generation, so they participate in verification just like any other contract formula.
 
+## Arrays
+
+Anvil now supports fixed-size global arrays of scalar element types:
+
+- `int`
+- `float`
+- `double`
+- `char`
+- `bool`
+
+The surface syntax includes:
+
+- declarations like `int xs[4];`
+- indexed reads like `xs[i]` and `p[i]`
+- indexed writes like `xs[i] = e;`
+- indexed addresses like `&xs[i]`
+
+Example:
+
+```c
+int xs[4];
+int *p;
+
+/* @Require 1
+ * @Guarantee 1
+ * @Safety heap_ok()
+ */
+int main(void) {
+  p = &xs[1];
+  xs[0] = 3;
+  xs[1] = (xs[0] + 4);
+  p[1] = (xs[1] + 1);
+  return 0;
+}
+```
+
+Array accesses are lowered into the same ghost-heap model as pointer arithmetic, so `@Safety heap_ok()` can be used to prove array bounds safety.
+
+Current limitations:
+
+- arrays must be global, fixed-size declarations
+- array elements must be scalar (no arrays of pointers or nested arrays yet)
+- array parameters and array return types are not supported yet
+
 ## Loop Invariants
 
 You can annotate a loop invariant with a comment immediately before a `while`:

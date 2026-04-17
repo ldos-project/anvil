@@ -60,6 +60,19 @@ let rec pointer_type base = function
   | 0 -> base
   | depth -> TPointer (pointer_type base (depth - 1))
 
+let array_type element_type size =
+  if size <= 0 then
+    fail "array size must be positive, got %d" size;
+  match element_type with
+  | TInt | TFloat | TDouble | TChar | TBool ->
+      TArray (element_type, size)
+  | TVoid ->
+      fail "arrays of `void` are unsupported"
+  | TPointer _ ->
+      fail "arrays of pointer type are unsupported in this proof-of-concept"
+  | TArray _ ->
+      fail "nested arrays are unsupported in this proof-of-concept"
+
 let make_function ?contract ~name ~return_type ~params body =
   { name; return_type; params; contract; body }
 
@@ -104,7 +117,7 @@ let build_program items =
 %token <int> CHAR_LIT
 %token <string> IDENT
 %token INT_KW FLOAT_KW DOUBLE_KW CHAR_KW BOOL_KW MAIN_KW VOID_KW IF_KW ELSE_KW WHILE_KW RETURN_KW FREE_KW TRUE_KW FALSE_KW
-%token LPAREN RPAREN LBRACE RBRACE SEMI COMMA AMP
+%token LPAREN RPAREN LBRACE RBRACE LBRACKET RBRACKET SEMI COMMA AMP
 %token PLUS MINUS STAR SLASH PERCENT
 %token ASSIGN EQEQ NEQ LT LE GT GE NOT AND OR
 %token EOF
@@ -113,14 +126,6 @@ let build_program items =
 %start <Ast.expr> contract_expr_eof
 %start <Ast.bexpr> contract_bexpr_eof
 %start <Ast.bexpr> bexpr_eof
-
-%left OR
-%left AND
-%nonassoc EQEQ NEQ LT LE GT GE
-%left PLUS MINUS
-%left STAR SLASH PERCENT
-%right UMINUS
-%right NOT
 
 %%
 
@@ -149,6 +154,44 @@ scalar_type:
       { TBool }
 
 contract_expr:
+  | value = contract_add_expr
+      { value }
+
+contract_add_expr:
+  | value = contract_mul_expr
+      { value }
+  | left = contract_add_expr PLUS right = contract_mul_expr
+      { Add (left, right) }
+  | left = contract_add_expr MINUS right = contract_mul_expr
+      { Sub (left, right) }
+
+contract_mul_expr:
+  | value = contract_unary_expr
+      { value }
+  | left = contract_mul_expr STAR right = contract_unary_expr
+      { Mul (left, right) }
+  | left = contract_mul_expr SLASH right = contract_unary_expr
+      { Div (left, right) }
+  | left = contract_mul_expr PERCENT right = contract_unary_expr
+      { Mod (left, right) }
+
+contract_unary_expr:
+  | value = contract_postfix_expr
+      { value }
+  | AMP value = contract_postfix_expr
+      { AddrOf value }
+  | STAR value = contract_unary_expr
+      { Deref value }
+  | MINUS value = contract_unary_expr
+      { negate_expr value }
+
+contract_postfix_expr:
+  | value = contract_primary_expr
+      { value }
+  | base = contract_postfix_expr LBRACKET index = contract_expr RBRACKET
+      { Index (base, index) }
+
+contract_primary_expr:
   | n = INT_LIT
       { Int n }
   | value = FLOAT_LIT
@@ -161,30 +204,36 @@ contract_expr:
       { BoolLit true }
   | FALSE_KW
       { BoolLit false }
-  | MINUS value = contract_expr %prec UMINUS
-      { negate_expr value }
-  | AMP name = IDENT
-      { AddrOf name }
-  | STAR value = contract_expr %prec UMINUS
-      { Deref value }
   | name = IDENT LPAREN args = separated_list(COMMA, contract_expr) RPAREN
       { FuncCall (name, args) }
   | name = IDENT
       { Var name }
   | LPAREN value = contract_expr RPAREN
       { value }
-  | left = contract_expr PLUS right = contract_expr
-      { Add (left, right) }
-  | left = contract_expr MINUS right = contract_expr
-      { Sub (left, right) }
-  | left = contract_expr STAR right = contract_expr
-      { Mul (left, right) }
-  | left = contract_expr SLASH right = contract_expr
-      { Div (left, right) }
-  | left = contract_expr PERCENT right = contract_expr
-      { Mod (left, right) }
 
 contract_bexpr:
+  | value = contract_or_bexpr
+      { value }
+
+contract_or_bexpr:
+  | value = contract_and_bexpr
+      { value }
+  | left = contract_or_bexpr OR right = contract_and_bexpr
+      { Or (left, right) }
+
+contract_and_bexpr:
+  | value = contract_not_bexpr
+      { value }
+  | left = contract_and_bexpr AND right = contract_not_bexpr
+      { And (left, right) }
+
+contract_not_bexpr:
+  | value = contract_atom_bexpr
+      { value }
+  | NOT value = contract_not_bexpr
+      { Not value }
+
+contract_atom_bexpr:
   | n = INT_LIT
       { bool_of_int n }
   | TRUE_KW
@@ -195,12 +244,6 @@ contract_bexpr:
       { predicate_bexpr name args }
   | LPAREN value = contract_bexpr RPAREN
       { value }
-  | NOT value = contract_bexpr %prec NOT
-      { Not value }
-  | left = contract_bexpr AND right = contract_bexpr
-      { And (left, right) }
-  | left = contract_bexpr OR right = contract_bexpr
-      { Or (left, right) }
   | left = contract_expr EQEQ right = contract_expr
       { Eq (left, right) }
   | left = contract_expr NEQ right = contract_expr
@@ -236,6 +279,13 @@ scalar_top_tail:
       {
         fun base stars name ->
           Top_global (make_global (pointer_type base stars) name)
+      }
+  | LBRACKET size = INT_LIT RBRACKET SEMI
+      {
+        fun base stars name ->
+          if stars <> 0 then
+            fail "array globals with pointer element types are unsupported";
+          Top_global (make_global (array_type base size) name)
       }
   | LPAREN params = param_list RPAREN body = block
       {
@@ -279,6 +329,8 @@ block:
 stmt:
   | SEMI
       { Skip }
+  | base = postfix_expr LBRACKET index = expr RBRACKET ASSIGN rhs = expr SEMI
+      { ArrayAssign (base, index, rhs) }
   | name = IDENT ASSIGN rhs = expr SEMI
       { Assign (name, rhs) }
   | STAR lhs = expr ASSIGN rhs = expr SEMI
@@ -299,32 +351,88 @@ stmt:
       { While (None, cond, body) }
 
 bexpr:
+  | value = or_bexpr
+      { value }
+
+or_bexpr:
+  | value = and_bexpr
+      { value }
+  | left = or_bexpr OR right = and_bexpr
+      { Or (left, right) }
+
+and_bexpr:
+  | value = not_bexpr
+      { value }
+  | left = and_bexpr AND right = not_bexpr
+      { And (left, right) }
+
+not_bexpr:
+  | value = atom_bexpr
+      { value }
+  | NOT inner = not_bexpr
+      { Not inner }
+
+atom_bexpr:
+  | LPAREN value = bexpr RPAREN
+      { value }
   | n = INT_LIT
       { bool_of_int n }
   | TRUE_KW
       { True }
   | FALSE_KW
       { False }
-  | LPAREN NOT inner = bexpr RPAREN
-      { Not inner }
-  | LPAREN left = bexpr AND right = bexpr RPAREN
-      { And (left, right) }
-  | LPAREN left = bexpr OR right = bexpr RPAREN
-      { Or (left, right) }
-  | LPAREN left = expr EQEQ right = expr RPAREN
+  | left = expr EQEQ right = expr
       { Eq (left, right) }
-  | LPAREN left = expr NEQ right = expr RPAREN
+  | left = expr NEQ right = expr
       { Neq (left, right) }
-  | LPAREN left = expr LT right = expr RPAREN
+  | left = expr LT right = expr
       { Lt (left, right) }
-  | LPAREN left = expr LE right = expr RPAREN
+  | left = expr LE right = expr
       { Le (left, right) }
-  | LPAREN left = expr GT right = expr RPAREN
+  | left = expr GT right = expr
       { Gt (left, right) }
-  | LPAREN left = expr GE right = expr RPAREN
+  | left = expr GE right = expr
       { Ge (left, right) }
 
 expr:
+  | value = add_expr
+      { value }
+
+add_expr:
+  | value = mul_expr
+      { value }
+  | left = add_expr PLUS right = mul_expr
+      { Add (left, right) }
+  | left = add_expr MINUS right = mul_expr
+      { Sub (left, right) }
+
+mul_expr:
+  | value = unary_expr
+      { value }
+  | left = mul_expr STAR right = unary_expr
+      { Mul (left, right) }
+  | left = mul_expr SLASH right = unary_expr
+      { Div (left, right) }
+  | left = mul_expr PERCENT right = unary_expr
+      { Mod (left, right) }
+
+unary_expr:
+  | value = postfix_expr
+      { value }
+  | MINUS value = unary_expr
+      { negate_expr value }
+  | AMP value = postfix_expr
+      { AddrOf value }
+  | STAR value = unary_expr
+      { Deref value }
+
+postfix_expr:
+  | value = primary_expr
+      { value }
+  | base = postfix_expr LBRACKET index = expr RBRACKET
+      { Index (base, index) }
+
+primary_expr:
   | n = INT_LIT
       { Int n }
   | value = FLOAT_LIT
@@ -337,27 +445,9 @@ expr:
       { BoolLit true }
   | FALSE_KW
       { BoolLit false }
-  | MINUS n = INT_LIT
-      { Int (-n) }
-  | MINUS value = FLOAT_LIT
-      { FloatLit ("-" ^ value) }
-  | MINUS value = DOUBLE_LIT
-      { DoubleLit ("-" ^ value) }
-  | AMP name = IDENT
-      { AddrOf name }
-  | STAR value = expr %prec UMINUS
-      { Deref value }
   | name = IDENT LPAREN args = separated_list(COMMA, expr) RPAREN
       { FuncCall (name, args) }
   | name = IDENT
       { Var name }
-  | LPAREN left = expr PLUS right = expr RPAREN
-      { Add (left, right) }
-  | LPAREN left = expr MINUS right = expr RPAREN
-      { Sub (left, right) }
-  | LPAREN left = expr STAR right = expr RPAREN
-      { Mul (left, right) }
-  | LPAREN left = expr SLASH right = expr RPAREN
-      { Div (left, right) }
-  | LPAREN left = expr PERCENT right = expr RPAREN
-      { Mod (left, right) }
+  | LPAREN value = expr RPAREN
+      { value }

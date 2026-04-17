@@ -42,7 +42,9 @@ let assoc_opt key bindings =
 let rec substitute_expr bindings = function
   | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ as expr -> expr
   | Var name -> Option.value (assoc_opt name bindings) ~default:(Var name)
-  | AddrOf _ as expr -> expr
+  | AddrOf inner -> AddrOf (substitute_expr bindings inner)
+  | Index (base, index) ->
+      Index (substitute_expr bindings base, substitute_expr bindings index)
   | Deref inner -> Deref (substitute_expr bindings inner)
   | Add (left, right) ->
       Add (substitute_expr bindings left, substitute_expr bindings right)
@@ -81,7 +83,9 @@ let rec substitute_bexpr bindings = function
 let rec expr_has_var target = function
   | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ -> false
   | Var name -> String.equal name target
-  | AddrOf _ -> false
+  | AddrOf inner -> expr_has_var target inner
+  | Index (base, index) ->
+      expr_has_var target base || expr_has_var target index
   | Deref inner -> expr_has_var target inner
   | Add (left, right)
   | Sub (left, right)
@@ -349,7 +353,7 @@ let rec instrument_expr
   match expr with
   | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ | Var _ ->
       Ok ([], expr, state)
-  | AddrOf _ | Deref _ ->
+  | AddrOf _ | Index _ | Deref _ ->
       Error "pointer expressions should be lowered before contract instrumentation"
   | Add (left, right) ->
       instrument_binary_expr memory_env env state left right (fun l r -> Add (l, r))
@@ -480,7 +484,7 @@ and instrument_stmt
       | Some current ->
           let* stmt = append_safety_assert current (prefix @ [ Assign (name, expr) ]) in
           Ok (stmt, state))
-  | Store _ | Free _ ->
+  | Store _ | ArrayAssign _ | Free _ ->
       Error "pointer statements should be lowered before contract instrumentation"
   | Assume cond ->
       let* prefix, cond, state = instrument_bexpr memory_env env state cond in
