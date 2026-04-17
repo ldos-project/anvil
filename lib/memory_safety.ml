@@ -143,6 +143,12 @@ let rec count_malloc_bexpr = function
 
 let rec count_malloc_stmt = function
   | Skip -> 0
+  | Block stmts ->
+      List.fold_left (fun acc stmt -> acc + count_malloc_stmt stmt) 0 stmts
+  | LocalDecl (_, init) ->
+      (match init with
+      | None -> 0
+      | Some expr -> count_malloc_expr expr)
   | Assign (_, expr) -> count_malloc_expr expr
   | Store (ptr, value) -> count_malloc_expr ptr + count_malloc_expr value
   | ArrayAssign (base, index, value) ->
@@ -169,6 +175,12 @@ let rec count_malloc_stmt = function
 
 let rec uses_memory_stmt = function
   | Skip -> false
+  | Block stmts ->
+      List.exists uses_memory_stmt stmts
+  | LocalDecl (_, init) ->
+      (match init with
+      | None -> false
+      | Some expr -> uses_memory_expr expr)
   | Assign (_, expr) -> uses_memory_expr expr
   | Store _ | ArrayAssign _ | Free _ -> true
   | Seq stmts -> List.exists uses_memory_stmt stmts
@@ -232,9 +244,16 @@ let function_mentions_memory_contract fn =
 let imported_function_mentions_memory_contract (fn : contracted_function) =
   contract_mentions_memory_predicates fn.contract
 
+let locals_need_memory locals =
+  List.exists
+    (fun local ->
+      is_pointer_type local.global_type || is_array_type local.global_type)
+    locals
+
 let uses_memory_program program =
   pointer_globals program.globals <> []
   || List.exists (fun global -> is_array_type global.global_type) program.globals
+  || List.exists (fun fn -> locals_need_memory fn.locals) (program.main :: program.functions)
   || List.exists uses_memory_stmt (program.main.body :: List.map (fun fn -> fn.body) program.functions)
   || List.exists function_mentions_memory_contract (program.main :: program.functions)
   || List.exists
@@ -288,13 +307,27 @@ let global_decay_pointee_type env name =
   | Some c_type -> Some c_type
   | None -> None
 
-let pointer_globals_of_program program =
+let pointer_bindings_of_defs defs =
   List.filter_map
-    (fun global ->
-      match global.global_type with
-      | TPointer inner -> Some (global.global_name, inner)
+    (fun def ->
+      match def.global_type with
+      | TPointer inner -> Some (def.global_name, inner)
       | TInt | TFloat | TDouble | TChar | TBool | TVoid | TArray _ -> None)
-    (pointer_globals program.globals)
+    defs
+
+let pointer_globals_of_program program =
+  pointer_bindings_of_defs (pointer_globals program.globals)
+
+let function_env_of_program program fn malloc_sites =
+  {
+    scalar_globals =
+      scalar_globals program.globals
+      @ List.filter (fun local -> not (is_pointer_type local.global_type)) fn.locals;
+    pointer_globals =
+      pointer_globals_of_program program
+      @ pointer_bindings_of_defs (pointer_globals fn.locals);
+    malloc_sites;
+  }
 
 let rec expr_kind env = function
   | Int _
@@ -694,6 +727,8 @@ and lower_equality_like env state ~negated left right =
 and lower_stmt env state stmt =
   match stmt with
   | Skip -> Ok (Skip, state)
+  | Block _ | LocalDecl _ ->
+      fail "unresolved local syntax reached memory lowering"
   | Assign (name, rhs) ->
       (match pointer_pointee_type env name with
       | Some pointee ->
@@ -859,10 +894,11 @@ let lower_function env state fn =
         let body = seq_of_list (Assign (heap_ok_name, Int 1) :: init @ [ body ]) in
         Ok ({ fn with body }, state)
 
-let lower_functions env state functions =
+let lower_functions program state malloc_sites functions =
   let rec loop acc state = function
     | [] -> Ok (List.rev acc, state)
     | fn :: rest ->
+        let env = function_env_of_program program fn malloc_sites in
         let* fn, state = lower_function env state fn in
         loop (fn :: acc) state rest
   in
@@ -873,18 +909,20 @@ let lower_program program =
     Ok program
   else
   let malloc_sites = count_malloc_program program in
-  let env =
-    {
-      scalar_globals = scalar_globals program.globals;
-      pointer_globals = pointer_globals_of_program program;
-      malloc_sites;
-    }
-  in
   let state = { next_malloc_site = 1 } in
-  let* functions, state = lower_functions env state program.functions in
-  let* main, _ = lower_function env state program.main in
+  let* functions = lower_functions program state malloc_sites program.functions in
+  let functions, state = functions in
+  let main_env = function_env_of_program program program.main malloc_sites in
+  let* main, _ = lower_function main_env state program.main in
+  let pointer_names =
+    List.concat_map
+      (fun fn ->
+        pointer_bindings_of_defs fn.locals
+        |> List.map fst)
+      (program.main :: program.functions)
+  in
   let extra_globals =
-    pointer_shadow_globals (List.map fst (pointer_globals_of_program program))
+    pointer_shadow_globals (List.sort_uniq String.compare (List.map fst (pointer_globals_of_program program) @ pointer_names))
     @ alloc_globals malloc_sites
     @ [ heap_ok_name ]
   in

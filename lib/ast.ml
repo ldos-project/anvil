@@ -74,6 +74,8 @@ type bexpr =
 
 type stmt =
   | Skip
+  | Block of stmt list
+  | LocalDecl of global_def * expr option
   | Assign of var * expr
   | Store of expr * expr
   | ArrayAssign of expr * expr * expr
@@ -95,6 +97,7 @@ type function_def = {
   name : func_name;
   return_type : c_type;
   params : param list;
+  locals : global_def list;
   contract : contract option;
   body : stmt;
 }
@@ -244,6 +247,14 @@ let params_to_c params =
   | [] -> "void"
   | params -> String.concat ", " (List.map param_to_c params)
 
+let local_decl_to_c ~indent_level local =
+  indent indent_level
+  ^ type_with_name_to_c local.global_type local.global_name
+  ^ ";\n"
+
+let sort_uniq_strings names =
+  List.sort_uniq String.compare names
+
 let contract_to_c = function
   | None -> ""
   | Some contract ->
@@ -279,6 +290,19 @@ let negate_bexpr bexpr =
 
 let rec stmt_to_c ~indent_level ~return_type = function
   | Skip -> indent indent_level ^ ";\n"
+  | Block stmts ->
+      indent indent_level ^ "{\n"
+      ^ String.concat ""
+          (List.map (stmt_to_c ~indent_level:(indent_level + 1) ~return_type) stmts)
+      ^ indent indent_level ^ "}\n"
+  | LocalDecl (local, init) ->
+      let decl =
+        indent indent_level
+        ^ type_with_name_to_c local.global_type local.global_name
+      in
+      (match init with
+      | None -> decl ^ ";\n"
+      | Some expr -> decl ^ " = " ^ expr_to_c expr ^ ";\n")
   | Assign (x, e) -> indent indent_level ^ x ^ " = " ^ expr_to_c e ^ ";\n"
   | Store (ptr, value) ->
       indent indent_level ^ "*" ^ expr_to_c ptr ^ " = " ^ expr_to_c value ^ ";\n"
@@ -324,14 +348,90 @@ let rec stmt_to_c ~indent_level ~return_type = function
   | Return (Some value) ->
       indent indent_level ^ "return " ^ expr_to_c value ^ ";\n"
 
+let rec vars_in_expr = function
+  | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ -> []
+  | Var name -> [ name ]
+  | AddrOf inner -> vars_in_expr inner
+  | Index (base, index) ->
+      vars_in_expr base @ vars_in_expr index
+  | Deref inner -> vars_in_expr inner
+  | Add (left, right)
+  | Sub (left, right)
+  | Mul (left, right)
+  | Div (left, right)
+  | Mod (left, right) ->
+      vars_in_expr left @ vars_in_expr right
+  | FuncCall (_, args) ->
+      List.concat_map vars_in_expr args
+
+let rec vars_in_bexpr = function
+  | True | False -> []
+  | Eq (left, right)
+  | Neq (left, right)
+  | Lt (left, right)
+  | Le (left, right)
+  | Gt (left, right)
+  | Ge (left, right) ->
+      vars_in_expr left @ vars_in_expr right
+  | Not inner -> vars_in_bexpr inner
+  | And (left, right)
+  | Or (left, right) ->
+      vars_in_bexpr left @ vars_in_bexpr right
+
+let rec vars_in_stmt = function
+  | Skip -> []
+  | Block stmts | Seq stmts ->
+      List.concat_map vars_in_stmt stmts
+  | LocalDecl (_, init) ->
+      (match init with
+      | None -> []
+      | Some expr -> vars_in_expr expr)
+  | Assign (name, expr) ->
+      name :: vars_in_expr expr
+  | Store (ptr, value) ->
+      vars_in_expr ptr @ vars_in_expr value
+  | ArrayAssign (base, index, value) ->
+      vars_in_expr base @ vars_in_expr index @ vars_in_expr value
+  | If (cond, then_branch, else_branch) ->
+      vars_in_bexpr cond @ vars_in_stmt then_branch @ vars_in_stmt else_branch
+  | While (invariant, cond, body) ->
+      (match invariant with
+      | None -> []
+      | Some invariant -> vars_in_bexpr invariant)
+      @ vars_in_bexpr cond
+      @ vars_in_stmt body
+  | Assume cond | Assert (_, cond) ->
+      vars_in_bexpr cond
+  | Free ptr ->
+      vars_in_expr ptr
+  | Return None -> []
+  | Return (Some value) ->
+      vars_in_expr value
+
 let function_def_to_c fn =
   let signature =
     type_with_name_to_c fn.return_type fn.name
     ^ "(" ^ params_to_c fn.params ^ ")"
   in
+  let referenced_vars =
+    sort_uniq_strings (vars_in_stmt fn.body)
+  in
+  let local_decls =
+    String.concat "" (List.map (local_decl_to_c ~indent_level:1) fn.locals)
+  in
+  let unused_locals =
+    fn.locals
+    |> List.filter (fun local ->
+           not (List.mem local.global_name referenced_vars))
+    |> List.map (fun local ->
+           indent 1 ^ "(void) " ^ local.global_name ^ ";\n")
+    |> String.concat ""
+  in
   let body = stmt_to_c ~indent_level:1 ~return_type:fn.return_type fn.body in
   contract_to_c fn.contract
   ^ signature ^ " {\n"
+  ^ local_decls
+  ^ unused_locals
   ^ body
   ^ "}\n"
 
@@ -385,6 +485,12 @@ let helper_prototypes p =
   in
   let rec helpers_in_stmt acc = function
     | Skip -> acc
+    | Block stmts ->
+        List.fold_left helpers_in_stmt acc stmts
+    | LocalDecl (_, init) ->
+        (match init with
+        | None -> acc
+        | Some expr -> helpers_in_expr acc expr)
     | Assign (_, expr) -> helpers_in_expr acc expr
     | Store (ptr, value) -> helpers_in_expr (helpers_in_expr acc ptr) value
     | ArrayAssign (base, index, value) ->

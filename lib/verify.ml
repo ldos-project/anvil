@@ -128,6 +128,7 @@ let expr_env_for_function (program : program) (fn : function_def) =
   {
     var_types =
       (List.map (fun global -> global.global_name, global.global_type) program.globals)
+      @ List.map (fun local -> local.global_name, local.global_type) fn.locals
       @ List.filter_map
           (fun param ->
             Option.map (fun name -> name, param.param_type) param.param_name)
@@ -236,6 +237,8 @@ let add_vc state kind name formula =
 let rec wp_stmt env state stmt post =
   match stmt with
   | Skip -> post, state
+  | Block _ | LocalDecl _ ->
+      failwith "unresolved local syntax reached weakest-precondition generation"
   | Assign (name, expr) ->
       Ir.subst_formula name (expr_to_ir env expr) post, state
   | Store _ | ArrayAssign _ | Free _ ->
@@ -643,6 +646,12 @@ let rec apps_in_bexpr env acc = function
 
 let rec apps_in_stmt env acc = function
   | Skip -> acc
+  | Block stmts ->
+      List.fold_left (apps_in_stmt env) acc stmts
+  | LocalDecl (_, init) ->
+      (match init with
+      | None -> acc
+      | Some expr -> apps_in_expr env acc expr)
   | Assign (_, expr) -> apps_in_expr env acc expr
   | Store (ptr, value) -> apps_in_expr env (apps_in_expr env acc ptr) value
   | ArrayAssign (base, index, value) ->
@@ -678,10 +687,17 @@ let queries_for_vc (program : program) (vc : verification_condition) =
             else Some global.global_name)
           program.globals
       in
+      let queryable_locals =
+        List.filter_map
+          (fun local ->
+            if is_array_type local.global_type then None
+            else Some local.global_name)
+          fn.locals
+      in
       let extra_var_queries =
         List.map
           (fun name -> { label = name; term = Ir.Var name })
-          (queryable_globals @ param_names fn.params)
+          (queryable_globals @ queryable_locals @ param_names fn.params)
       in
       let extra_app_queries =
         apps_in_stmt env String_map.empty fn.body
@@ -864,6 +880,8 @@ let rec replay_stmt model env fuel stmt =
   else
     match stmt with
     | Skip -> Replay_continue env
+    | Block _ | LocalDecl _ ->
+        Replay_blocked
     | Assign (name, expr) ->
         Replay_continue (bind_env env name (symbolic_expr env expr))
     | Store _ | ArrayAssign _ | Free _ ->
@@ -1017,6 +1035,20 @@ let program_bindings_for_counterexample
               param.param_name)
           fn.params
       in
+      let scalar_locals =
+        List.map
+          (fun local ->
+            ( local.global_name
+            , string_of_runtime_scalar env model local.global_type local.global_name ))
+          (List.filter (fun local -> not (is_pointer_type local.global_type)) fn.locals)
+      in
+      let pointer_locals =
+        List.map
+          (fun local ->
+            local.global_name,
+            pointer_value_string original_program env model local.global_name)
+          (List.filter (fun local -> is_pointer_type local.global_type) fn.locals)
+      in
       let scalar_globals =
         List.map
           (fun global ->
@@ -1031,7 +1063,7 @@ let program_bindings_for_counterexample
             pointer_value_string original_program env model global.global_name)
           (pointer_globals original_program.globals)
       in
-      params @ scalar_globals @ pointer_globals
+      params @ scalar_locals @ pointer_locals @ scalar_globals @ pointer_globals
       (*
        Keep pointer snapshots separate because the source-level pointer value is reconstructed
        from its shadow block/offset variables rather than read directly from the model.

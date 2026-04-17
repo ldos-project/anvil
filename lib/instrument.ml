@@ -170,11 +170,18 @@ let make_state (program : program) =
   let function_names =
     List.map (fun (fn : function_def) -> fn.name) program.functions
   in
+  let local_names =
+    List.concat_map
+      (fun (fn : function_def) ->
+        List.map (fun local -> local.global_name) fn.locals)
+      (program.main :: program.functions)
+  in
   {
     next_temp = 0;
     fresh_globals_rev = [];
     used_names =
       global_names program.globals
+      @ local_names
       @ function_names
       @ [ program.main.name ]
       @ imported_names;
@@ -477,6 +484,8 @@ and instrument_stmt
       | Some current ->
           let* stmt = append_safety_assert current [ Skip ] in
           Ok (stmt, state))
+  | Block _ | LocalDecl _ ->
+      Error "unresolved local syntax reached contract instrumentation"
   | Assign (name, expr) ->
       let* prefix, expr, state = instrument_expr memory_env env state expr in
       (match current_contract with

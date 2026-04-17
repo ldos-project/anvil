@@ -86,6 +86,7 @@ let gen_program size =
                 name = "main";
                 return_type = TInt;
                 params = [];
+                locals = [];
                 contract = None;
                 body = Seq [ body; Return (Some (Int 0)) ];
               };
@@ -488,6 +489,99 @@ let assert_memory_too_small_allocation_reports_counterexample () =
             ("Expected too-small allocation example to fail verification, got:\n"
             ^ Verify.format_outcome outcome))
 
+let assert_local_scope_shadowing_roundtrip_and_verification () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n\n"
+    ^ "int x;\n\n"
+    ^ "int main(void) {\n"
+    ^ "  int y;\n"
+    ^ "  y = 1;\n"
+    ^ "  {\n"
+    ^ "    int y;\n"
+    ^ "    y = 2;\n"
+    ^ "    x = y;\n"
+    ^ "    if (!(x == 2)) { abort(); }\n"
+    ^ "  }\n"
+    ^ "  x = y;\n"
+    ^ "  if (!(x == 1)) { abort(); }\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Local scope parse failed: " ^ e)
+  | Ok program ->
+      if List.length program.main.locals <> 2 then
+        failwith "Expected two resolved locals from scoped shadowing";
+      (match parse_program (program_to_c program) with
+      | Error e -> failwith ("Local scope roundtrip failed: " ^ e)
+      | Ok roundtripped ->
+          if not (equal_program program roundtripped) then
+            failwith "Local scope roundtrip mismatch");
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Local scope verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected local scope example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_local_array_memory_examples () =
+  let safe_source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n"
+    ^ "#include <stdbool.h>\n\n"
+    ^ "int out;\n\n"
+    ^ "/* @Require 1\n"
+    ^ " * @Guarantee 1\n"
+    ^ " * @Safety heap_ok()\n"
+    ^ " */\n"
+    ^ "int main(void) {\n"
+    ^ "  int xs[2];\n"
+    ^ "  int *p;\n"
+    ^ "  p = &xs[0];\n"
+    ^ "  p[1] = 7;\n"
+    ^ "  out = xs[1];\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  let unsafe_source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n"
+    ^ "#include <stdbool.h>\n\n"
+    ^ "/* @Require 1\n"
+    ^ " * @Guarantee 1\n"
+    ^ " * @Safety heap_ok()\n"
+    ^ " */\n"
+    ^ "int main(void) {\n"
+    ^ "  int xs[2];\n"
+    ^ "  int i;\n"
+    ^ "  i = 2;\n"
+    ^ "  xs[i] = 7;\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  (match parse_program safe_source with
+  | Error e -> failwith ("Local array safe parse failed: " ^ e)
+  | Ok program ->
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Local array safe verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected local array safe example to verify, got:\n"
+            ^ Verify.format_outcome outcome)));
+  match parse_program unsafe_source with
+  | Error e -> failwith ("Local array unsafe parse failed: " ^ e)
+  | Ok program ->
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Local array unsafe verification failed: " ^ e)
+      | Ok (Verify.Counterexample _) -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected local array unsafe example to fail verification, got:\n"
+            ^ Verify.format_outcome outcome))
+
 let assert_array_roundtrip_and_verification () =
   let source =
     "#include <stdlib.h>\n"
@@ -617,6 +711,8 @@ let () =
   assert_memory_safe_program_verifies ();
   assert_memory_unsafe_program_reports_counterexample ();
   assert_memory_too_small_allocation_reports_counterexample ();
+  assert_local_scope_shadowing_roundtrip_and_verification ();
+  assert_local_array_memory_examples ();
   assert_array_roundtrip_and_verification ();
   assert_array_out_of_bounds_reports_counterexample ();
   assert_typed_memory_examples_verify ();

@@ -315,14 +315,17 @@ Supported today:
 
 - global scalar variables of type `int`, `float`, `double`, `char`, and `bool`
 - global pointer variables to those scalar types, such as `int *p;` and `double *q;`
+- function-local scalar, pointer, and fixed-size array declarations
+- nested block scopes with local-variable shadowing
 - scalar-valued functions over `int`, `float`, `double`, `char`, `bool`, plus `void`
 - local helper function definitions before `main`
 - local header imports with `#include "file.h"`
 - integer, float, double, char, and bool literals
 - variables
-- address-of for scalar globals such as `&x`
+- address-of for scalar globals and local array elements such as `&x` and `&xs[0]`
 - pointer dereference reads such as `*p`
 - pointer dereference writes such as `*(p + 1) = 7;`
+- array reads and writes such as `xs[i]` and `xs[i] = 7;`
 - `malloc(n)` and `free(p)`
 - function calls
 - arithmetic expressions such as `(x + 1)` and `(x - 1)`

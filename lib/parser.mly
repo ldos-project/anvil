@@ -74,10 +74,13 @@ let array_type element_type size =
       fail "nested arrays are unsupported in this proof-of-concept"
 
 let make_function ?contract ~name ~return_type ~params body =
-  { name; return_type; params; contract; body }
+  { name; return_type; params; locals = []; contract; body }
 
 let make_global global_type global_name =
   { global_type; global_name }
+
+let make_local_decl local_type local_name init =
+  LocalDecl (make_global local_type local_name, init)
 
 type top_item =
   | Top_global of global_def
@@ -324,11 +327,48 @@ stmt_list:
 
 block:
   | LBRACE stmts = stmt_list RBRACE
-      { seq_of_list stmts }
+      { Block stmts }
+
+local_scalar_decl_tail:
+  | SEMI
+      {
+        fun base stars name ->
+          make_local_decl (pointer_type base stars) name None
+      }
+  | ASSIGN init = expr SEMI
+      {
+        fun base stars name ->
+          make_local_decl (pointer_type base stars) name (Some init)
+      }
+  | LBRACKET size = INT_LIT RBRACKET SEMI
+      {
+        fun base stars name ->
+          if stars <> 0 then
+            fail "array locals with pointer element types are unsupported";
+          make_local_decl (array_type base size) name None
+      }
+
+local_void_decl_tail:
+  | SEMI
+      {
+        fun stars name ->
+          make_local_decl (pointer_type TVoid (stars + 1)) name None
+      }
+  | ASSIGN init = expr SEMI
+      {
+        fun stars name ->
+          make_local_decl (pointer_type TVoid (stars + 1)) name (Some init)
+      }
 
 stmt:
   | SEMI
       { Skip }
+  | body = block
+      { body }
+  | base = scalar_type stars = pointer_stars name = IDENT tail = local_scalar_decl_tail
+      { tail base stars name }
+  | VOID_KW STAR stars = pointer_stars name = IDENT tail = local_void_decl_tail
+      { tail stars name }
   | base = postfix_expr LBRACKET index = expr RBRACKET ASSIGN rhs = expr SEMI
       { ArrayAssign (base, index, rhs) }
   | name = IDENT ASSIGN rhs = expr SEMI
