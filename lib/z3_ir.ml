@@ -1,9 +1,11 @@
 type sort =
   | Int
+  | Real
   | Bool
 
 type int_expr =
   | Int_lit of int
+  | Real_lit of string
   | Var of string
   | Add of int_expr list
   | Sub of int_expr * int_expr
@@ -39,6 +41,7 @@ module String_map = Map.Make (String)
 
 let sort_to_smt = function
   | Int -> "Int"
+  | Real -> "Real"
   | Bool -> "Bool"
 
 let parens head args =
@@ -47,6 +50,7 @@ let parens head args =
 let rec int_expr_to_smt = function
   | Int_lit n when n < 0 -> parens "-" [string_of_int (-n)]
   | Int_lit n -> string_of_int n
+  | Real_lit text -> text
   | Var name -> name
   | Add [] -> "0"
   | Add [expr] -> int_expr_to_smt expr
@@ -157,6 +161,7 @@ let mk_implies left right =
 
 let rec subst_int_expr var replacement = function
   | Int_lit _ as expr -> expr
+  | Real_lit _ as expr -> expr
   | Var name ->
       if String.equal name var then replacement else Var name
   | Add exprs -> Add (List.map (subst_int_expr var replacement) exprs)
@@ -197,7 +202,7 @@ let rec subst_formula var replacement = function
       Ge (subst_int_expr var replacement left, subst_int_expr var replacement right)
 
 let rec vars_in_int_expr acc = function
-  | Int_lit _ -> acc
+  | Int_lit _ | Real_lit _ -> acc
   | Var name -> String_set.add name acc
   | Add exprs | Mul exprs ->
       List.fold_left vars_in_int_expr acc exprs
@@ -225,7 +230,7 @@ let collect_vars formula =
   vars_in_formula String_set.empty formula |> String_set.elements
 
 let rec apps_in_int_expr acc = function
-  | Int_lit _ | Var _ -> acc
+  | Int_lit _ | Real_lit _ | Var _ -> acc
   | Add exprs | Mul exprs ->
       List.fold_left apps_in_int_expr acc exprs
   | Sub (left, right) | Div (left, right) | Mod (left, right) ->
@@ -288,6 +293,7 @@ let declare_funs decls =
 
 let rec int_expr_to_pretty = function
   | Int_lit n -> string_of_int n
+  | Real_lit text -> text
   | Var name -> name
   | Add [left; right] ->
       "(" ^ int_expr_to_pretty left ^ " + " ^ int_expr_to_pretty right ^ ")"

@@ -4,8 +4,17 @@ type func_name = string
 
 type c_type =
   | TInt
+  | TFloat
+  | TDouble
+  | TChar
+  | TBool
   | TVoid
   | TPointer of c_type
+
+type global_def = {
+  global_type : c_type;
+  global_name : var;
+}
 
 type param = {
   param_type : c_type;
@@ -34,6 +43,10 @@ type header_import = {
 
 type expr =
   | Int of int
+  | FloatLit of string
+  | DoubleLit of string
+  | CharLit of int
+  | BoolLit of bool
   | Var of var
   | AddrOf of var
   | Deref of expr
@@ -65,9 +78,15 @@ type stmt =
   | If of bexpr * stmt * stmt
   | While of bexpr option * bexpr * stmt
   | Assume of bexpr
-  | Assert of bexpr
+  | Assert of assert_origin * bexpr
   | Free of expr
   | Return of expr option
+
+and assert_origin =
+  | Source_assert
+  | Call_require of func_name
+  | Function_guarantee of func_name
+  | Function_safety of func_name
 
 type function_def = {
   name : func_name;
@@ -79,14 +98,91 @@ type function_def = {
 
 type program = {
   imports : header_import list;
-  globals : var list;
-  pointer_globals : var list;
+  globals : global_def list;
   functions : function_def list;
   main : function_def;
 }
 
+let rec c_type_to_c = function
+  | TInt -> "int"
+  | TFloat -> "float"
+  | TDouble -> "double"
+  | TChar -> "char"
+  | TBool -> "bool"
+  | TVoid -> "void"
+  | TPointer inner -> c_type_to_c inner ^ "*"
+
+let type_with_name_to_c c_type name =
+  c_type_to_c c_type ^ " " ^ name
+
+let global_names globals =
+  List.map (fun global -> global.global_name) globals
+
+let is_pointer_type = function
+  | TPointer _ -> true
+  | TInt | TFloat | TDouble | TChar | TBool | TVoid -> false
+
+let pointer_base_type = function
+  | TPointer inner -> Some inner
+  | TInt | TFloat | TDouble | TChar | TBool | TVoid -> None
+
+let is_real_type = function
+  | TFloat | TDouble -> true
+  | TInt | TChar | TBool | TVoid | TPointer _ -> false
+
+let is_integer_like_type = function
+  | TInt | TChar | TBool -> true
+  | TFloat | TDouble | TVoid | TPointer _ -> false
+
+let is_scalar_type = function
+  | TInt | TFloat | TDouble | TChar | TBool -> true
+  | TVoid | TPointer _ -> false
+
+let lookup_global globals name =
+  List.find_opt (fun global -> String.equal global.global_name name) globals
+
+let lookup_global_type globals name =
+  Option.map (fun global -> global.global_type) (lookup_global globals name)
+
+let pointer_globals globals =
+  List.filter (fun global -> is_pointer_type global.global_type) globals
+
+let scalar_globals globals =
+  List.filter (fun global -> not (is_pointer_type global.global_type)) globals
+
+let load_helper_name = function
+  | TInt -> "__anvil_load_int"
+  | TFloat -> "__anvil_load_float"
+  | TDouble -> "__anvil_load_double"
+  | TChar -> "__anvil_load_char"
+  | TBool -> "__anvil_load_bool"
+  | TVoid | TPointer _ -> failwith "unsupported helper load type"
+
+let escape_char_code = function
+  | 0 -> "'\\0'"
+  | 7 -> "'\\a'"
+  | 8 -> "'\\b'"
+  | 9 -> "'\\t'"
+  | 10 -> "'\\n'"
+  | 11 -> "'\\v'"
+  | 12 -> "'\\f'"
+  | 13 -> "'\\r'"
+  | 34 -> "'\\\"'"
+  | 39 -> "'\\''"
+  | 92 -> "'\\\\'"
+  | n when n >= 32 && n <= 126 ->
+      Printf.sprintf "'%c'" (Char.chr n)
+  | n ->
+      Printf.sprintf "'\\x%02x'" n
+
 let rec expr_to_c = function
   | Int i -> string_of_int i
+  | FloatLit text
+  | DoubleLit text ->
+      text
+  | CharLit value -> escape_char_code value
+  | BoolLit true -> "true"
+  | BoolLit false -> "false"
   | Var x -> x
   | AddrOf x -> "&" ^ x
   | Deref e -> "*" ^ expr_to_c e
@@ -116,14 +212,6 @@ let bexpr_to_annotation = function
 
 let indent n = String.make (n * 2) ' '
 
-let rec c_type_to_c = function
-  | TInt -> "int"
-  | TVoid -> "void"
-  | TPointer inner -> c_type_to_c inner ^ "*"
-
-let type_with_name_to_c c_type name =
-  c_type_to_c c_type ^ " " ^ name
-
 let param_to_c param =
   match param.param_name with
   | None -> c_type_to_c param.param_type
@@ -142,9 +230,18 @@ let contract_to_c = function
       ^ " * @Safety " ^ contract.safety ^ "\n"
       ^ " */\n"
 
+let zero_literal_for_type = function
+  | TInt -> "0"
+  | TFloat -> "0.0f"
+  | TDouble -> "0.0"
+  | TChar -> "'\\0'"
+  | TBool -> "false"
+  | TVoid -> failwith "void does not have a zero literal"
+  | TPointer _ -> "0"
+
 let assume_fallback_to_c = function
   | TVoid -> "return;"
-  | TInt | TPointer _ -> "return 0;"
+  | return_type -> "return " ^ zero_literal_for_type return_type ^ ";"
 
 let loop_invariant_to_c ~indent_level = function
   | None -> ""
@@ -192,7 +289,7 @@ let rec stmt_to_c ~indent_level ~return_type = function
       ^ indent indent_level ^ "while (" ^ bexpr_to_c wait_cond ^ ") {\n"
       ^ body
       ^ indent indent_level ^ "} /* assume */\n"
-  | Assert c ->
+  | Assert (_, c) ->
       indent indent_level ^ "if (!" ^ bexpr_to_c c
       ^ ") { abort(); } /* assert */\n"
   | Free ptr ->
@@ -212,9 +309,19 @@ let function_def_to_c fn =
   ^ body
   ^ "}\n"
 
+let helper_prototype name =
+  match name with
+  | "__anvil_load_int" -> "int __anvil_load_int(int block, int offset);\n"
+  | "__anvil_load_float" -> "float __anvil_load_float(int block, int offset);\n"
+  | "__anvil_load_double" -> "double __anvil_load_double(int block, int offset);\n"
+  | "__anvil_load_char" -> "char __anvil_load_char(int block, int offset);\n"
+  | "__anvil_load_bool" -> "bool __anvil_load_bool(int block, int offset);\n"
+  | _ -> failwith ("unknown helper function " ^ name)
+
 let helper_prototypes p =
   let rec helpers_in_expr acc = function
-    | Int _ | Var _ | AddrOf _ -> acc
+    | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ | Var _ | AddrOf _ ->
+        acc
     | Deref inner -> helpers_in_expr acc inner
     | Add (left, right)
     | Sub (left, right)
@@ -224,7 +331,12 @@ let helper_prototypes p =
         helpers_in_expr (helpers_in_expr acc left) right
     | FuncCall (name, args) ->
         let acc =
-          if String.equal name "__anvil_load" then name :: acc else acc
+          if String.length name >= 13
+             && String.sub name 0 13 = "__anvil_load_"
+          then
+            name :: acc
+          else
+            acc
         in
         List.fold_left helpers_in_expr acc args
   in
@@ -259,7 +371,7 @@ let helper_prototypes p =
           | Some invariant -> helpers_in_bexpr acc invariant
         in
         helpers_in_stmt (helpers_in_bexpr acc cond) body
-    | Assume cond | Assert cond -> helpers_in_bexpr acc cond
+    | Assume cond | Assert (_, cond) -> helpers_in_bexpr acc cond
     | Free ptr -> helpers_in_expr acc ptr
     | Return None -> acc
     | Return (Some value) -> helpers_in_expr acc value
@@ -273,15 +385,12 @@ let helper_prototypes p =
   let helper_names =
     List.sort_uniq String.compare helper_names
   in
-  String.concat ""
-    (List.map
-       (function
-         | "__anvil_load" -> "int __anvil_load(int block, int offset);\n"
-         | name -> failwith ("unknown helper function " ^ name))
-       helper_names)
+  String.concat "" (List.map helper_prototype helper_names)
 
 let program_to_c p =
-  let header = "#include <stdlib.h>\n#include <stdio.h>\n" in
+  let header =
+    "#include <stdlib.h>\n#include <stdio.h>\n#include <stdbool.h>\n"
+  in
   let helpers =
     match helper_prototypes p with
     | "" -> ""
@@ -299,13 +408,15 @@ let program_to_c p =
         ^ "\n"
   in
   let globals =
-    List.map (fun v -> "int " ^ v ^ ";") p.globals
-    @ List.map (fun v -> "int* " ^ v ^ ";") p.pointer_globals
-  in
-  let globals =
-    match globals with
+    match p.globals with
     | [] -> ""
-    | decls -> String.concat "\n" decls ^ "\n\n"
+    | decls ->
+        String.concat "\n"
+          (List.map
+             (fun global ->
+               type_with_name_to_c global.global_type global.global_name ^ ";")
+             decls)
+        ^ "\n\n"
   in
   let functions =
     match p.functions with

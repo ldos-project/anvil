@@ -190,6 +190,9 @@ int main(void) {
 Because `@Safety` is checked after every command inside a contracted implementation, `@Safety heap_ok()` means "no invalid memory action has happened so far on this path."
 At a call to a contracted function, that same `@Safety` fact is assumed afterward, just like a guarantee.
 
+Anvil currently uses a fixed `sizeof(int) = 4` byte model for memory.
+So `malloc(n)` is interpreted in bytes, `*p` and `*p = v` require 4 readable bytes, and `p + 1` advances by 4 bytes.
+
 When Anvil sees pointer syntax or ghost-heap predicates, it lowers memory into ghost state:
 
 - each pointer global is represented as a `(block, offset)` pair;
@@ -205,9 +208,9 @@ This makes `heap_ok()` a convenient summary property for "memory safety has held
 Anvil currently recognizes these built-in predicate calls in contracts:
 
 - `heap_ok()`: no earlier memory operation on the current path has been marked invalid.
-- `valid_read(p, n)`: the range starting at pointer `p` with width `n` lies inside a readable live block.
+- `valid_read(p, n)`: the range starting at pointer `p` with width `n` bytes lies inside a readable live block.
 - `valid_write(p, n)`: currently the same check as `valid_read(p, n)`.
-- `allocated(p)`: pointer `p` designates at least one readable cell.
+- `allocated(p)`: pointer `p` designates at least one readable `int` cell, currently 4 bytes.
 - `live(p)`: the block named by `p` is live. Integer globals are always live.
 - `can_free(p)`: `p` is null or the base address of a live allocation.
 - `same_block(p, q)`: `p` and `q` refer to the same block.
@@ -266,14 +269,14 @@ The accepted language is intentionally small.
 
 Supported today:
 
-- global `int` variables such as `int x;`
-- global `int*` variables such as `int *p;`
-- `int` and `void` functions
+- global scalar variables of type `int`, `float`, `double`, `char`, and `bool`
+- global pointer variables to those scalar types, such as `int *p;` and `double *q;`
+- scalar-valued functions over `int`, `float`, `double`, `char`, `bool`, plus `void`
 - local helper function definitions before `main`
 - local header imports with `#include "file.h"`
-- integer literals
+- integer, float, double, char, and bool literals
 - variables
-- address-of for integer globals such as `&x`
+- address-of for scalar globals such as `&x`
 - pointer dereference reads such as `*p`
 - pointer dereference writes such as `*(p + 1) = 7;`
 - `malloc(n)` and `free(p)`
@@ -352,12 +355,13 @@ For example, a contracted local function call becomes a sequence like:
 
 ## Current Limitations
 
-- Pointer safety support is currently a proof-of-concept for global `int*` variables.
+- Pointer safety support is currently a proof-of-concept for global scalar pointers.
 - Pointer parameters and pointer return values in function definitions are currently unsupported.
-- Address-of is only supported for integer globals.
+- Address-of is only supported for scalar globals.
 - Memory safety is opt-in through contracts such as `@Safety heap_ok()`. Pointer operations alone do not add user-visible proof obligations.
 - Memory contents are not modeled precisely yet: loads become uninterpreted values, while the ghost-heap predicates cover bounds, liveness, null, and invalid free conditions.
 - `malloc` uses an allocation-site abstraction rather than a full heap model.
+- `float` and `double` are verified with an idealized real-valued encoding rather than IEEE-754 semantics.
 - Instrumentation of contracted `void` calls is currently unsupported.
 - Instrumented calls inside `&&`, `||`, or `while` conditions are currently unsupported.
 - Verification models function calls in formulas as uninterpreted functions in Z3.
@@ -371,6 +375,16 @@ Useful examples live in `test/e2e_cases/`:
 - `contract_local_scalar.c`
 - `modular_composition_scalar.c`
 - `modular_composition_memory.c`
+- `memory_safe_int_expression.c`
+- `memory_safe_float_expression.c`
+- `memory_safe_double_expression.c`
+- `memory_safe_char_expression.c`
+- `memory_safe_bool_expression.c`
+- `memory_unsafe_int_too_small.c`
+- `memory_unsafe_float_too_small.c`
+- `memory_unsafe_double_too_small.c`
+- `memory_unsafe_char_out_of_bounds.c`
+- `memory_unsafe_bool_out_of_bounds.c`
 - `memory_safe_malloc_store.c`
 - `memory_unsafe_dangling_store.c`
 - `scalar_loop.c`

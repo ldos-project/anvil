@@ -77,9 +77,21 @@ let parse_c_type text =
   match parse_base "int" TInt with
   | Some t -> t
   | None ->
-      (match parse_base "void" TVoid with
+      (match parse_base "float" TFloat with
       | Some t -> t
-      | None -> fail "unsupported C type `%s`" text)
+      | None ->
+          (match parse_base "double" TDouble with
+          | Some t -> t
+          | None ->
+              (match parse_base "char" TChar with
+              | Some t -> t
+              | None ->
+                  (match parse_base "bool" TBool with
+                  | Some t -> t
+                  | None ->
+                      (match parse_base "void" TVoid with
+                      | Some t -> t
+                      | None -> fail "unsupported C type `%s`" text)))))
 
 let split_last_identifier text =
   let trimmed = String.trim text in

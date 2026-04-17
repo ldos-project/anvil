@@ -40,7 +40,7 @@ let assoc_opt key bindings =
     bindings
 
 let rec substitute_expr bindings = function
-  | Int _ as expr -> expr
+  | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ as expr -> expr
   | Var name -> Option.value (assoc_opt name bindings) ~default:(Var name)
   | AddrOf _ as expr -> expr
   | Deref inner -> Deref (substitute_expr bindings inner)
@@ -79,7 +79,7 @@ let rec substitute_bexpr bindings = function
       Or (substitute_bexpr bindings left, substitute_bexpr bindings right)
 
 let rec expr_has_var target = function
-  | Int _ -> false
+  | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ -> false
   | Var name -> String.equal name target
   | AddrOf _ -> false
   | Deref inner -> expr_has_var target inner
@@ -154,7 +154,7 @@ let build_contract_env
 
 type state = {
   next_temp : int;
-  fresh_globals_rev : var list;
+  fresh_globals_rev : global_def list;
   used_names : var list;
 }
 
@@ -170,14 +170,13 @@ let make_state (program : program) =
     next_temp = 0;
     fresh_globals_rev = [];
     used_names =
-      program.globals
-      @ program.pointer_globals
+      global_names program.globals
       @ function_names
       @ [ program.main.name ]
       @ imported_names;
   }
 
-let fresh_name state =
+let fresh_name global_type state =
   let rec pick next_temp =
     let candidate = Printf.sprintf "__anvil_contract_result_%d" next_temp in
     if List.exists (String.equal candidate) state.used_names then
@@ -189,7 +188,8 @@ let fresh_name state =
   name,
   {
     next_temp;
-    fresh_globals_rev = name :: state.fresh_globals_rev;
+    fresh_globals_rev =
+      { global_type; global_name = name } :: state.fresh_globals_rev;
     used_names = name :: state.used_names;
   }
 
@@ -337,7 +337,9 @@ let instantiate_current_safety_with_result current result =
 
 let append_safety_assert current stmts =
   let* safety = instantiate_step_safety current in
-  Ok (seq_of_list (stmts @ [ Assert safety ]))
+  Ok
+    (seq_of_list
+       (stmts @ [ Assert (Function_safety current.contract_fn.name, safety) ]))
 
 let rec instrument_expr
     (memory_env : Memory_safety.contract_env)
@@ -345,7 +347,8 @@ let rec instrument_expr
     state
     expr =
   match expr with
-  | Int _ | Var _ -> Ok ([], expr, state)
+  | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ | Var _ ->
+      Ok ([], expr, state)
   | AddrOf _ | Deref _ ->
       Error "pointer expressions should be lowered before contract instrumentation"
   | Add (left, right) ->
@@ -371,7 +374,7 @@ let rec instrument_expr
                    contract_fn.name)
           | _ ->
               let* bindings = bind_params contract_fn args in
-              let result_name, state = fresh_name state in
+              let result_name, state = fresh_name contract_fn.return_type state in
               let result_expr = Var result_name in
               let* require =
                 instantiate_contract memory_env contract_fn "@Require"
@@ -389,7 +392,7 @@ let rec instrument_expr
               in
               Ok
                 ( prefix
-                  @ [ Assert require
+                  @ [ Assert (Call_require contract_fn.name, require)
                     ; Assign (result_name, FuncCall (name, args))
                     ; Assume guarantee
                     ; Assume safety
@@ -486,12 +489,14 @@ and instrument_stmt
       | Some current ->
           let* stmt = append_safety_assert current (prefix @ [ Assume cond ]) in
           Ok (stmt, state))
-  | Assert cond ->
+  | Assert (origin, cond) ->
       let* prefix, cond, state = instrument_bexpr memory_env env state cond in
       (match current_contract with
-      | None -> Ok (seq_of_list (prefix @ [ Assert cond ]), state)
+      | None -> Ok (seq_of_list (prefix @ [ Assert (origin, cond) ]), state)
       | Some current ->
-          let* stmt = append_safety_assert current (prefix @ [ Assert cond ]) in
+          let* stmt =
+            append_safety_assert current (prefix @ [ Assert (origin, cond) ])
+          in
           Ok (stmt, state))
   | Return value ->
       let* prefix, value, state =
@@ -519,7 +524,11 @@ and instrument_stmt
           in
           Ok
             ( seq_of_list
-                (prefix @ [ Assert safety; Assert guarantee; Return value ])
+                ( prefix
+                @ [ Assert (Function_safety current.contract_fn.name, safety)
+                  ; Assert (Function_guarantee current.contract_fn.name, guarantee)
+                  ; Return value
+                  ] )
             , state ))
   | Seq stmts ->
       let* stmts, state =
@@ -605,7 +614,12 @@ let instrument_function
         | TVoid ->
             let* safety = instantiate_void_safety current in
             let* guarantee = instantiate_void_guarantee current in
-            Ok (seq_of_list [ body; Assert safety; Assert guarantee ])
+            Ok
+              (seq_of_list
+                 [ body
+                 ; Assert (Function_safety current.contract_fn.name, safety)
+                 ; Assert (Function_guarantee current.contract_fn.name, guarantee)
+                 ])
         | _ -> Ok body
       in
       Ok ({ fn with body }, state)

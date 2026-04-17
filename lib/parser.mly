@@ -20,12 +20,38 @@ let bool_of_int = function
   | 0 -> False
   | _ -> True
 
-let expect_zero n =
-  if n <> 0 then fail "expected `return 0;`, got `return %d;`" n
+let is_zero_float text =
+  let stripped =
+    if String.length text > 0
+       && (text.[String.length text - 1] = 'f' || text.[String.length text - 1] = 'F')
+    then
+      String.sub text 0 (String.length text - 1)
+    else
+      text
+  in
+  try float_of_string stripped = 0.0 with
+  | Failure _ -> false
+
+let expect_zero_literal = function
+  | Int 0
+  | CharLit 0
+  | BoolLit false ->
+      ()
+  | FloatLit text
+  | DoubleLit text when is_zero_float text ->
+      ()
+  | expr ->
+      fail "expected a zero literal in assumption form, got `%s`" (expr_to_c expr)
 
 let expect_abort name =
   if String.equal name "abort" then ()
   else fail "expected `abort()`, got `%s()`" name
+
+let negate_expr = function
+  | Int n -> Int (-n)
+  | FloatLit value -> FloatLit ("-" ^ value)
+  | DoubleLit value -> DoubleLit ("-" ^ value)
+  | value -> Sub (Int 0, value)
 
 let predicate_bexpr name args =
   Neq (FuncCall (name, args), Int 0)
@@ -37,14 +63,16 @@ let rec pointer_type base = function
 let make_function ?contract ~name ~return_type ~params body =
   { name; return_type; params; contract; body }
 
+let make_global global_type global_name =
+  { global_type; global_name }
+
 type top_item =
-  | Top_global of var
-  | Top_pointer_global of var
+  | Top_global of global_def
   | Top_function of function_def
   | Top_main of function_def
 
 let build_program items =
-  let rec loop globals_rev pointer_globals_rev functions_rev main = function
+  let rec loop globals_rev functions_rev main = function
     | [] ->
         let main =
           match main with
@@ -54,28 +82,28 @@ let build_program items =
         {
           imports = [];
           globals = List.rev globals_rev;
-          pointer_globals = List.rev pointer_globals_rev;
           functions = List.rev functions_rev;
           main;
         }
-    | Top_global name :: rest ->
-        loop (name :: globals_rev) pointer_globals_rev functions_rev main rest
-    | Top_pointer_global name :: rest ->
-        loop globals_rev (name :: pointer_globals_rev) functions_rev main rest
+    | Top_global global :: rest ->
+        loop (global :: globals_rev) functions_rev main rest
     | Top_function fn :: rest ->
-        loop globals_rev pointer_globals_rev (fn :: functions_rev) main rest
+        loop globals_rev (fn :: functions_rev) main rest
     | Top_main fn :: rest ->
         (match main with
         | Some _ -> fail "multiple `main` definitions"
         | None ->
-            loop globals_rev pointer_globals_rev functions_rev (Some fn) rest)
+            loop globals_rev functions_rev (Some fn) rest)
   in
-  loop [] [] [] None items
+  loop [] [] None items
 %}
 
 %token <int> INT_LIT
+%token <string> FLOAT_LIT
+%token <string> DOUBLE_LIT
+%token <int> CHAR_LIT
 %token <string> IDENT
-%token INT_KW MAIN_KW VOID_KW IF_KW ELSE_KW WHILE_KW RETURN_KW FREE_KW
+%token INT_KW FLOAT_KW DOUBLE_KW CHAR_KW BOOL_KW MAIN_KW VOID_KW IF_KW ELSE_KW WHILE_KW RETURN_KW FREE_KW TRUE_KW FALSE_KW
 %token LPAREN RPAREN LBRACE RBRACE SEMI COMMA AMP
 %token PLUS MINUS STAR SLASH PERCENT
 %token ASSIGN EQEQ NEQ LT LE GT GE NOT AND OR
@@ -108,11 +136,33 @@ bexpr_eof:
   | value = bexpr EOF
       { value }
 
+scalar_type:
+  | INT_KW
+      { TInt }
+  | FLOAT_KW
+      { TFloat }
+  | DOUBLE_KW
+      { TDouble }
+  | CHAR_KW
+      { TChar }
+  | BOOL_KW
+      { TBool }
+
 contract_expr:
   | n = INT_LIT
       { Int n }
+  | value = FLOAT_LIT
+      { FloatLit value }
+  | value = DOUBLE_LIT
+      { DoubleLit value }
+  | value = CHAR_LIT
+      { CharLit value }
+  | TRUE_KW
+      { BoolLit true }
+  | FALSE_KW
+      { BoolLit false }
   | MINUS value = contract_expr %prec UMINUS
-      { match value with Int n -> Int (-n) | _ -> Sub (Int 0, value) }
+      { negate_expr value }
   | AMP name = IDENT
       { AddrOf name }
   | STAR value = contract_expr %prec UMINUS
@@ -137,6 +187,10 @@ contract_expr:
 contract_bexpr:
   | n = INT_LIT
       { bool_of_int n }
+  | TRUE_KW
+      { True }
+  | FALSE_KW
+      { False }
   | name = IDENT LPAREN args = separated_list(COMMA, contract_expr) RPAREN
       { predicate_bexpr name args }
   | LPAREN value = contract_bexpr RPAREN
@@ -169,27 +223,25 @@ top_item:
       { Top_main (make_function ~name:"main" ~return_type:TInt ~params:[] body) }
   | INT_KW MAIN_KW LPAREN RPAREN body = block
       { Top_main (make_function ~name:"main" ~return_type:TInt ~params:[] body) }
-  | INT_KW stars = pointer_stars name = IDENT tail = int_top_tail
-      { tail stars name }
+  | base = scalar_type stars = pointer_stars name = IDENT tail = scalar_top_tail
+      { tail base stars name }
   | VOID_KW stars = pointer_stars name = IDENT LPAREN params = param_list RPAREN body = block
       {
         Top_function
           (make_function ~name ~return_type:(pointer_type TVoid stars) ~params body)
       }
 
-int_top_tail:
+scalar_top_tail:
   | SEMI
       {
-        fun stars name ->
-          if stars = 0 then Top_global name
-          else if stars = 1 then Top_pointer_global name
-          else fail "only `int*` globals are supported"
+        fun base stars name ->
+          Top_global (make_global (pointer_type base stars) name)
       }
   | LPAREN params = param_list RPAREN body = block
       {
-        fun stars name ->
+        fun base stars name ->
           Top_function
-            (make_function ~name ~return_type:(pointer_type TInt stars) ~params body)
+            (make_function ~name ~return_type:(pointer_type base stars) ~params body)
       }
 
 pointer_stars:
@@ -210,8 +262,8 @@ param_tail:
       { next :: rest }
 
 named_param:
-  | INT_KW stars = pointer_stars name = IDENT
-      { { param_type = pointer_type TInt stars; param_name = Some name } }
+  | base = scalar_type stars = pointer_stars name = IDENT
+      { { param_type = pointer_type base stars; param_name = Some name } }
   | VOID_KW STAR stars = pointer_stars name = IDENT
       { { param_type = pointer_type TVoid (stars + 1); param_name = Some name } }
 
@@ -239,16 +291,20 @@ stmt:
       { If (cond, then_branch, else_branch) }
   | IF_KW LPAREN NOT cond = bexpr RPAREN LBRACE RETURN_KW SEMI RBRACE
       { Assume cond }
-  | IF_KW LPAREN NOT cond = bexpr RPAREN LBRACE RETURN_KW n = INT_LIT SEMI RBRACE
-      { expect_zero n; Assume cond }
+  | IF_KW LPAREN NOT cond = bexpr RPAREN LBRACE RETURN_KW value = expr SEMI RBRACE
+      { expect_zero_literal value; Assume cond }
   | IF_KW LPAREN NOT cond = bexpr RPAREN LBRACE name = IDENT LPAREN RPAREN SEMI RBRACE
-      { expect_abort name; Assert cond }
+      { expect_abort name; Assert (Source_assert, cond) }
   | WHILE_KW LPAREN cond = bexpr RPAREN body = block
       { While (None, cond, body) }
 
 bexpr:
   | n = INT_LIT
       { bool_of_int n }
+  | TRUE_KW
+      { True }
+  | FALSE_KW
+      { False }
   | LPAREN NOT inner = bexpr RPAREN
       { Not inner }
   | LPAREN left = bexpr AND right = bexpr RPAREN
@@ -271,8 +327,22 @@ bexpr:
 expr:
   | n = INT_LIT
       { Int n }
+  | value = FLOAT_LIT
+      { FloatLit value }
+  | value = DOUBLE_LIT
+      { DoubleLit value }
+  | value = CHAR_LIT
+      { CharLit value }
+  | TRUE_KW
+      { BoolLit true }
+  | FALSE_KW
+      { BoolLit false }
   | MINUS n = INT_LIT
       { Int (-n) }
+  | MINUS value = FLOAT_LIT
+      { FloatLit ("-" ^ value) }
+  | MINUS value = DOUBLE_LIT
+      { DoubleLit ("-" ^ value) }
   | AMP name = IDENT
       { AddrOf name }
   | STAR value = expr %prec UMINUS

@@ -4,6 +4,28 @@ open Parser
 exception Syntax_error of string
 
 let raise_syntax msg = raise (Syntax_error msg)
+
+let char_of_escape = function
+  | '0' -> 0
+  | 'a' -> 7
+  | 'b' -> 8
+  | 't' -> 9
+  | 'n' -> 10
+  | 'v' -> 11
+  | 'f' -> 12
+  | 'r' -> 13
+  | '"' -> 34
+  | '\'' -> 39
+  | '\\' -> 92
+  | c -> Char.code c
+
+let parse_char_lit lit =
+  if String.length lit = 3 then
+    Char.code lit.[1]
+  else if String.length lit = 4 && lit.[1] = '\\' then
+    char_of_escape lit.[2]
+  else
+    raise_syntax ("unsupported character literal `" ^ lit ^ "`")
 }
 
 rule read = parse
@@ -13,6 +35,12 @@ rule read = parse
   | "/*"                { block_comment lexbuf; read lexbuf }
   | "//"                { skip_line lexbuf; read lexbuf }
   | "int"               { INT_KW }
+  | "float"             { FLOAT_KW }
+  | "double"            { DOUBLE_KW }
+  | "char"              { CHAR_KW }
+  | "bool"              { BOOL_KW }
+  | "true"              { TRUE_KW }
+  | "false"             { FALSE_KW }
   | "main"              { MAIN_KW }
   | "void"              { VOID_KW }
   | "if"                { IF_KW }
@@ -26,6 +54,18 @@ rule read = parse
   | "!="                { NEQ }
   | "<="                { LE }
   | ">="                { GE }
+  | ['0'-'9']+ '.' ['0'-'9']* (['e' 'E'] ['+' '-']? ['0'-'9']+)? ['f' 'F'] as lit
+                        { FLOAT_LIT lit }
+  | ['0'-'9']+ ['e' 'E'] ['+' '-']? ['0'-'9']+ ['f' 'F'] as lit
+                        { FLOAT_LIT lit }
+  | ['0'-'9']+ '.' ['0'-'9']* (['e' 'E'] ['+' '-']? ['0'-'9']+)? as lit
+                        { DOUBLE_LIT lit }
+  | ['0'-'9']+ ['e' 'E'] ['+' '-']? ['0'-'9']+ as lit
+                        { DOUBLE_LIT lit }
+  | '\'' '\\' ['0' 'a' 'b' 't' 'n' 'v' 'f' 'r' '"' '\'' '\\'] '\'' as lit
+                        { CHAR_LIT (parse_char_lit lit) }
+  | '\'' [^ '\\' '\''] '\'' as lit
+                        { CHAR_LIT (parse_char_lit lit) }
   | '('                 { LPAREN }
   | ')'                 { RPAREN }
   | '{'                 { LBRACE }

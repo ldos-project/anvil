@@ -66,7 +66,7 @@ let rec gen_stmt size =
       ; G.map3 smaller_b smaller smaller ~f:(fun c t e -> If (c, t, e))
       ; G.map2 smaller_b smaller ~f:(fun c b -> While (None, c, b))
       ; G.map smaller_b ~f:(fun c -> Assume c)
-      ; G.map smaller_b ~f:(fun c -> Assert c)
+      ; G.map smaller_b ~f:(fun c -> Assert (Source_assert, c))
       ]
 
 let gen_program size =
@@ -77,8 +77,9 @@ let gen_program size =
         ~f:(fun globals body ->
           {
             imports = [];
-            globals;
-            pointer_globals = [];
+            globals =
+              List.map globals ~f:(fun global_name ->
+                  { global_type = TInt; global_name });
             functions = [];
             main =
               {
@@ -159,10 +160,15 @@ let assert_contract_instrumentation () =
           (match Instrument.instrument_program program with
           | Error e -> failwith ("Instrumentation failed: " ^ e)
           | Ok instrumented ->
-              if not (List.exists instrumented.globals ~f:(String.is_prefix ~prefix:"__anvil_contract_result_")) then
+              if
+                not
+                  (List.exists instrumented.globals ~f:(fun global ->
+                       String.is_prefix global.global_name
+                         ~prefix:"__anvil_contract_result_"))
+              then
                 failwith "Expected an instrumentation temp global";
               (match instrumented.main.body with
-              | Seq [ Assert (Ge (Int 1, Int 0))
+              | Seq [ Assert (_, Ge (Int 1, Int 0))
                     ; Assign (tmp, FuncCall ("inc", [ Int 1 ]))
                     ; Assume (Ge (Var result_var, Int 1))
                     ; Assume (Le (Int 1, Int 10))
@@ -209,8 +215,8 @@ let assert_local_contract_roundtrip_and_instrumentation () =
           (match instrumented.functions with
           | [ { body =
                   Seq [ Assume (Ge (Var "y", Int 0))
-                      ; Assert (Ge (Var "y", Int 0))
-                      ; Assert (Gt (Add (Var "y", Int 1), Var "y"))
+                      ; Assert (_, Ge (Var "y", Int 0))
+                      ; Assert (_, Gt (Add (Var "y", Int 1), Var "y"))
                       ; Return (Some (Add (Var "y", Int 1)))
                       ]
               ; _ } ] ->
@@ -219,7 +225,7 @@ let assert_local_contract_roundtrip_and_instrumentation () =
               failwith
                 ("Unexpected instrumented helper body:\n" ^ program_to_c instrumented));
           match instrumented.main.body with
-          | Seq [ Assert (Ge (Int 1, Int 0))
+          | Seq [ Assert (_, Ge (Int 1, Int 0))
                 ; Assign (tmp, FuncCall ("inc", [ Int 1 ]))
                 ; Assume (Gt (Var result_var, Int 1))
                 ; Assume (Ge (Int 1, Int 0))
@@ -262,6 +268,79 @@ let assert_verifier_reports_counterexample () =
       | Ok outcome ->
           failwith
             ("Expected a counterexample, got:\n" ^ Verify.format_outcome outcome))
+
+let assert_counterexample_reports_require_location () =
+  let header_path = Stdlib.Filename.temp_file "anvil_require_report" ".h" in
+  Fun.protect
+    ~finally:(fun () ->
+      try Stdlib.Sys.remove header_path with
+      | _ -> ())
+    (fun () ->
+      Out_channel.write_all header_path
+        ~data:
+          "/* @Require x >= 0\n\
+           * @Guarantee result >= x\n\
+           * @Safety 1\n\
+           */\n\
+           int inc(int x);\n";
+      let base_dir = Stdlib.Filename.dirname header_path in
+      let include_name = Stdlib.Filename.basename header_path in
+      let source =
+        "#include \"" ^ include_name ^ "\"\n"
+        ^ "#include <stdlib.h>\n"
+        ^ "#include <stdio.h>\n\n"
+        ^ "int x;\n\n"
+        ^ "int main(void) {\n"
+        ^ "  x = inc(-1);\n"
+        ^ "  return 0;\n"
+        ^ "}\n"
+      in
+      match parse_program ~base_dir source with
+      | Error e -> failwith ("Require-report parse failed: " ^ e)
+      | Ok program ->
+          (match Verify.verify_program program with
+          | Error e -> failwith ("Require-report verification failed: " ^ e)
+          | Ok (Verify.Counterexample { location; program_bindings; _ }) ->
+              if not (Option.value_map location ~default:false ~f:(String.equal "`inc`'s @Require was violated")) then
+                failwith "Expected @Require violation location";
+              if not (List.exists program_bindings ~f:(fun (name, value) -> String.equal name "x" && String.equal value "0")) then
+                failwith "Expected program variable snapshot for x"
+          | Ok outcome ->
+              failwith
+                ("Expected @Require counterexample, got:\n"
+                ^ Verify.format_outcome outcome)))
+
+let assert_counterexample_reports_guarantee_location () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n\n"
+    ^ "int x;\n\n"
+    ^ "/* @Require y >= 0\n"
+    ^ " * @Guarantee result > y\n"
+    ^ " * @Safety y >= 0\n"
+    ^ " */\n"
+    ^ "int bad(int y) {\n"
+    ^ "  return y;\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  x = bad(1);\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Guarantee-report parse failed: " ^ e)
+  | Ok program ->
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Guarantee-report verification failed: " ^ e)
+      | Ok (Verify.Counterexample { location; program_bindings; _ }) ->
+          if not (Option.value_map location ~default:false ~f:(String.equal "`bad` could not prove its @Guarantee")) then
+            failwith "Expected @Guarantee violation location";
+          if not (List.exists program_bindings ~f:(fun (name, value) -> String.equal name "y" && String.equal value "0")) then
+            failwith "Expected program variable snapshot for y"
+      | Ok outcome ->
+          failwith
+            ("Expected @Guarantee counterexample, got:\n"
+            ^ Verify.format_outcome outcome))
 
 let assert_verifier_accepts_loop_post_invariant () =
   let source =
@@ -309,7 +388,7 @@ let assert_loop_invariant_roundtrip_and_verification () =
       (match program.main.body with
       | Seq [ Assume _
             ; While (Some (Ge (Var "x", Int 0)), Gt (Var "x", Int 0), _)
-            ; Assert (Eq (Var "x", Int 0))
+            ; Assert (_, Eq (Var "x", Int 0))
             ; Return (Some (Int 0))
             ] ->
           ()
@@ -383,15 +462,98 @@ let assert_memory_unsafe_program_reports_counterexample () =
             ("Expected unsafe memory example to fail verification, got:\n"
             ^ Verify.format_outcome outcome))
 
+let assert_memory_too_small_allocation_reports_counterexample () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n\n"
+    ^ "int *p;\n\n"
+    ^ "/* @Require 1\n"
+    ^ " * @Guarantee 1\n"
+    ^ " * @Safety heap_ok()\n"
+    ^ " */\n"
+    ^ "int main(void) {\n"
+    ^ "  p = malloc(1);\n"
+    ^ "  *p = 1;\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Too-small allocation parse failed: " ^ e)
+  | Ok program ->
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Too-small allocation verification failed: " ^ e)
+      | Ok (Verify.Counterexample _) -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected too-small allocation example to fail verification, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_example_file_verifies file_name =
+  let path = "test/e2e_cases/" ^ file_name in
+  let source = In_channel.read_all path in
+  match parse_program ~base_dir:"test/e2e_cases" ~source_name:path source with
+  | Error e -> failwith ("Example parse failed for " ^ file_name ^ ": " ^ e)
+  | Ok program ->
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Example verification failed for " ^ file_name ^ ": " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected example to verify for "
+            ^ file_name
+            ^ ", got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_example_file_reports_counterexample file_name =
+  let path = "test/e2e_cases/" ^ file_name in
+  let source = In_channel.read_all path in
+  match parse_program ~base_dir:"test/e2e_cases" ~source_name:path source with
+  | Error e -> failwith ("Example parse failed for " ^ file_name ^ ": " ^ e)
+  | Ok program ->
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Example verification failed for " ^ file_name ^ ": " ^ e)
+      | Ok (Verify.Counterexample _) -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected example to report a counterexample for "
+            ^ file_name
+            ^ ", got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_typed_memory_examples_verify () =
+  List.iter
+    [ "memory_safe_int_expression.c"
+    ; "memory_safe_float_expression.c"
+    ; "memory_safe_double_expression.c"
+    ; "memory_safe_char_expression.c"
+    ; "memory_safe_bool_expression.c"
+    ]
+    ~f:assert_example_file_verifies
+
+let assert_typed_memory_negative_examples_fail () =
+  List.iter
+    [ "memory_unsafe_int_too_small.c"
+    ; "memory_unsafe_float_too_small.c"
+    ; "memory_unsafe_double_too_small.c"
+    ; "memory_unsafe_char_out_of_bounds.c"
+    ; "memory_unsafe_bool_out_of_bounds.c"
+    ]
+    ~f:assert_example_file_reports_counterexample
+
 let () =
   assert_header_import_roundtrip ();
   assert_contract_instrumentation ();
   assert_local_contract_roundtrip_and_instrumentation ();
   assert_verifier_reports_counterexample ();
+  assert_counterexample_reports_require_location ();
+  assert_counterexample_reports_guarantee_location ();
   assert_verifier_accepts_loop_post_invariant ();
   assert_loop_invariant_roundtrip_and_verification ();
   assert_memory_safe_program_verifies ();
   assert_memory_unsafe_program_reports_counterexample ();
+  assert_memory_too_small_allocation_reports_counterexample ();
+  assert_typed_memory_examples_verify ();
+  assert_typed_memory_negative_examples_fail ();
   Quickcheck.test
     ~trials:300
     ~sexp_of:(fun _ -> Sexp.Atom "program")

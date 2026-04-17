@@ -7,7 +7,7 @@ int *p;
 int x;
 
 /* @Require heap_ok()
- * @Guarantee can_free(p) && valid_read(p, 1)
+ * @Guarantee can_free(p) && valid_read(p, 4)
  * @Safety heap_ok()
  */
 int init_cell(void) {
