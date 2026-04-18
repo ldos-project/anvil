@@ -369,6 +369,33 @@ let assert_verifier_accepts_loop_post_invariant () =
             ("Expected loop example to verify, got:\n"
             ^ Verify.format_outcome outcome))
 
+let assert_generated_c_compiles source =
+  if Stdlib.Sys.command "command -v gcc >/dev/null 2>&1" <> 0 then ()
+  else
+    let c_path = Stdlib.Filename.temp_file "anvil-generated" ".c" in
+    let o_path = Stdlib.Filename.temp_file "anvil-generated" ".o" in
+    let stderr_path = Stdlib.Filename.temp_file "anvil-generated" ".stderr" in
+    Fun.protect
+      ~finally:(fun () ->
+        List.iter [ c_path; o_path; stderr_path ] ~f:(fun path ->
+          try Stdlib.Sys.remove path with
+          | _ -> ()))
+      (fun () ->
+        Out_channel.write_all c_path ~data:source;
+        let command =
+          Printf.sprintf
+            "gcc -std=c11 -Wall -Wextra -Werror -c %s -o %s 2>%s"
+            (Stdlib.Filename.quote c_path)
+            (Stdlib.Filename.quote o_path)
+            (Stdlib.Filename.quote stderr_path)
+        in
+        if Stdlib.Sys.command command <> 0 then
+          failwith
+            ("Generated C did not compile:\n"
+            ^ In_channel.read_all stderr_path
+            ^ "\nGenerated source:\n"
+            ^ source))
+
 let assert_loop_invariant_roundtrip_and_verification () =
   let source =
     "#include <stdlib.h>\n"
@@ -700,6 +727,67 @@ let assert_record_roundtrip_and_verification () =
             ("Expected record example to verify, got:\n"
             ^ Verify.format_outcome outcome))
 
+let assert_class_desugaring_roundtrip_and_verification () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n"
+    ^ "#include <stdbool.h>\n\n"
+    ^ "class Counter {\n"
+    ^ "  int value;\n"
+    ^ "  int put(int next) {\n"
+    ^ "    value = next;\n"
+    ^ "    return get();\n"
+    ^ "  }\n"
+    ^ "  int get() {\n"
+    ^ "    return value;\n"
+    ^ "  }\n"
+    ^ "};\n\n"
+    ^ "Counter c;\n"
+    ^ "Counter *cp;\n"
+    ^ "int out;\n\n"
+    ^ "int main(void) {\n"
+    ^ "  out = c.put(7);\n"
+    ^ "  cp = &c;\n"
+    ^ "  out = cp->get();\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Class parse failed: " ^ e)
+  | Ok program ->
+      if not (List.exists program.records ~f:(fun record -> String.equal record.record_name "Counter")) then
+        failwith "Expected class desugaring to introduce `struct Counter`";
+      let method_names = List.map program.functions ~f:(fun fn -> fn.name) in
+      if not (List.mem method_names "Counter__put" ~equal:String.equal) then
+        failwith "Expected `Counter__put` in desugared methods";
+      if not (List.mem method_names "Counter__get" ~equal:String.equal) then
+        failwith "Expected `Counter__get` in desugared methods";
+      let desugared = program_to_c program in
+      if String.is_substring desugared ~substring:"class Counter" then
+        failwith "Expected pretty-printer to emit desugared C, not class syntax";
+      if not (String.is_substring desugared ~substring:"Counter__put(&c, 7)") then
+        failwith "Expected dot-call desugaring to pass `&c` to `Counter__put`";
+      if not (String.is_substring desugared ~substring:"Counter__get(cp)") then
+        failwith "Expected arrow-call desugaring to pass `cp` to `Counter__get`";
+      if not (String.is_substring desugared ~substring:"return Counter__get(this);") then
+        failwith "Expected implicit method call to desugar through `this`";
+      (match parse_program desugared with
+      | Error e -> failwith ("Class desugared roundtrip failed: " ^ e)
+      | Ok roundtripped ->
+          if not (equal_program program roundtripped) then
+            failwith "Class desugared roundtrip mismatch");
+      (match Instrument.instrument_program program with
+      | Error e -> failwith ("Class instrumentation failed: " ^ e)
+      | Ok instrumented ->
+          assert_generated_c_compiles (program_to_c instrumented));
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Class verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected class example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
 let assert_example_file_verifies file_name =
   let path = "test/e2e_cases/" ^ file_name in
   let source = In_channel.read_all path in
@@ -773,6 +861,7 @@ let () =
   assert_array_roundtrip_and_verification ();
   assert_array_out_of_bounds_reports_counterexample ();
   assert_record_roundtrip_and_verification ();
+  assert_class_desugaring_roundtrip_and_verification ();
   assert_typed_memory_examples_verify ();
   assert_typed_memory_negative_examples_fail ();
   Quickcheck.test

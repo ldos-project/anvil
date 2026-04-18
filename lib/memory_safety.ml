@@ -300,6 +300,7 @@ type env = {
   records : record_def list;
   scalar_globals : global_def list;
   pointer_globals : (var * c_type) list;
+  function_sigs : (string * (c_type list * c_type)) list;
   malloc_sites : int;
 }
 
@@ -525,6 +526,12 @@ let global_decay_pointee_type env name =
   | Some c_type -> Some c_type
   | None -> None
 
+let param_as_global (param : param) =
+  match param.param_type, param.param_name with
+  | TPointer _, _ | _, None -> None
+  | global_type, Some global_name ->
+      Some { global_type; global_name }
+
 let pointer_bindings_of_defs defs =
   List.filter_map
     (fun def ->
@@ -533,18 +540,47 @@ let pointer_bindings_of_defs defs =
       | TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TArray _ -> None)
     defs
 
+let pointer_bindings_of_params params =
+  List.filter_map
+    (fun (param : param) ->
+      match param.param_type, param.param_name with
+      | TPointer inner, Some name -> Some (name, inner)
+      | TPointer _, None -> None
+      | (TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TArray _), _ ->
+          None)
+    params
+
 let pointer_globals_of_program (program : program) =
   pointer_bindings_of_defs (pointer_globals program.globals)
+
+let build_function_sigs (program : program) =
+  let imported =
+    List.concat_map
+      (fun (header : header_import) -> header.functions)
+      program.imports
+    |> List.map (fun (fn : contracted_function) ->
+           fn.name, (List.map (fun param -> param.param_type) fn.params, fn.return_type))
+  in
+  let locals =
+    List.map
+      (fun (fn : function_def) ->
+        fn.name, (List.map (fun param -> param.param_type) fn.params, fn.return_type))
+      (program.functions @ [ program.main ])
+  in
+  imported @ locals
 
 let function_env_of_program (program : program) fn malloc_sites =
   {
     records = program.records;
     scalar_globals =
       scalar_globals program.globals
+      @ List.filter_map param_as_global fn.params
       @ List.filter (fun local -> not (is_pointer_type local.global_type)) fn.locals;
     pointer_globals =
       pointer_globals_of_program program
+      @ pointer_bindings_of_params fn.params
       @ pointer_bindings_of_defs (pointer_globals fn.locals);
+    function_sigs = build_function_sigs program;
     malloc_sites;
   }
 
@@ -553,6 +589,23 @@ let lookup_field_type env record_name field_name =
 
 let lookup_field_offset env record_name field_name =
   record_field_offset env.records record_name field_name
+
+let lookup_function_sig env name =
+  assoc_opt name env.function_sigs
+
+let lower_function_params (params : param list) =
+  let expand_param (param : param) =
+    match param.param_type, param.param_name with
+    | TPointer _, None ->
+        failwith "pointer parameters must be named after class desugaring"
+    | TPointer _, Some name ->
+        [ { param_type = TInt; param_name = Some (ptr_block_name name) }
+        ; { param_type = TInt; param_name = Some (ptr_offset_name name) }
+        ]
+    | _, _ ->
+        [ param ]
+  in
+  List.concat_map expand_param params
 
 let rec expr_kind env = function
   | Int _
@@ -988,7 +1041,7 @@ and lower_scalar_expr env state expr =
   | FuncCall (name, args) when String.equal name "malloc" ->
       fail "`malloc` used where a scalar was expected"
   | FuncCall (name, args) ->
-      let* prefix, args, state = lower_scalar_expr_list env state args in
+      let* prefix, args, state = lower_call_args env state name args in
       Ok (prefix, FuncCall (name, args), state)
 
 and lower_field_address env state base field =
@@ -1041,6 +1094,36 @@ and lower_pointer_value_from_addressable env state expr =
       Ok (prefix, block, offset, Some element_type, state)
   | _ ->
       fail "expression `%s` does not evaluate to a pointer" (expr_to_c expr)
+
+and lower_call_args env state name args =
+  match lookup_function_sig env name with
+  | None ->
+      lower_scalar_expr_list env state args
+  | Some (param_types, _return_type) ->
+      let rec loop state param_types args =
+        match param_types, args with
+        | [], [] ->
+            Ok ([], [], state)
+        | TPointer pointee :: rest_params, arg :: rest_args ->
+            let* prefix, block, offset, _pointee, state =
+              lower_ptr_expr ~expected:pointee env state arg
+            in
+            let* rest_prefix, rest_args, state = loop state rest_params rest_args in
+            Ok (prefix @ rest_prefix, block :: offset :: rest_args, state)
+        | (TInt | TFloat | TDouble | TChar | TBool) :: rest_params, arg :: rest_args ->
+            let* prefix, lowered_arg, state = lower_scalar_expr env state arg in
+            let* rest_prefix, rest_args, state = loop state rest_params rest_args in
+            Ok (prefix @ rest_prefix, lowered_arg :: rest_args, state)
+        | TVoid :: _, _ ->
+            fail "void parameters are unsupported in lowered calls to `%s`" name
+        | TRecord _ :: _, _ ->
+            fail "record parameters are unsupported in lowered calls to `%s`" name
+        | TArray _ :: _, _ ->
+            fail "array parameters are unsupported in lowered calls to `%s`" name
+        | _, _ ->
+            fail "arity mismatch while lowering call to `%s`" name
+      in
+      loop state param_types args
 
 and lower_scalar_expr_list env state exprs =
   match exprs with
@@ -1518,14 +1601,6 @@ and lower_stmt_list env state stmts =
       Ok (stmt :: rest, state)
 
 let lower_function env state fn =
-  let has_pointer_param =
-    List.exists
-      (fun param ->
-        match param.param_type with
-        | TPointer _ -> true
-        | TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TArray _ -> false)
-      fn.params
-  in
   let has_array_param =
     List.exists
       (fun param ->
@@ -1542,11 +1617,7 @@ let lower_function env state fn =
         | TInt | TFloat | TDouble | TChar | TBool | TVoid | TPointer _ | TArray _ -> false)
       fn.params
   in
-  if has_pointer_param then
-    fail
-      "pointer parameters in function `%s` are unsupported in this proof-of-concept"
-      fn.name
-  else if has_array_param then
+  if has_array_param then
     fail
       "array parameters in function `%s` are unsupported in this proof-of-concept"
       fn.name
@@ -1569,11 +1640,12 @@ let lower_function env state fn =
           "record return type in function `%s` is unsupported in this proof-of-concept"
           fn.name
     | TInt | TFloat | TDouble | TChar | TBool | TVoid ->
+        let params = lower_function_params fn.params in
         let state = clear_semantic_state state in
         let init = alloc_init_stmts env.malloc_sites in
         let* body, state = lower_stmt env state fn.body in
         let body = seq_of_list (Assign (heap_ok_name, Int 1) :: init @ [ body ]) in
-        Ok ({ fn with body }, clear_semantic_state state)
+        Ok ({ fn with params; body }, clear_semantic_state state)
 
 let lower_functions (program : program) state malloc_sites functions =
   let rec loop acc state = function
@@ -1631,6 +1703,7 @@ let contract_env_of_program (program : program) =
     records = program.records;
     scalar_globals = scalar_globals program.globals;
     pointer_globals = pointer_globals_of_program program;
+    function_sigs = build_function_sigs program;
     malloc_sites = count_malloc_program program;
   }
 

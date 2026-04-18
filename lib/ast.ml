@@ -123,6 +123,65 @@ type program = {
   main : function_def;
 }
 
+let method_this_name = "this"
+
+let class_method_name class_name method_name =
+  class_name ^ "__" ^ method_name
+
+let method_dot_call_prefix = "__anvil_method_dot__"
+
+let method_arrow_call_prefix = "__anvil_method_arrow__"
+
+let method_dot_call_name method_name =
+  method_dot_call_prefix ^ method_name
+
+let method_arrow_call_name method_name =
+  method_arrow_call_prefix ^ method_name
+
+type method_call_kind =
+  | Method_dot
+  | Method_arrow
+
+let parse_method_call_name name =
+  let prefix_length prefix = String.length prefix in
+  if String.length name > prefix_length method_dot_call_prefix
+     && String.sub name 0 (prefix_length method_dot_call_prefix) = method_dot_call_prefix
+  then
+    Some
+      ( Method_dot
+      , String.sub
+          name
+          (prefix_length method_dot_call_prefix)
+          (String.length name - prefix_length method_dot_call_prefix) )
+  else if
+    String.length name > prefix_length method_arrow_call_prefix
+    && String.sub name 0 (prefix_length method_arrow_call_prefix) = method_arrow_call_prefix
+  then
+    Some
+      ( Method_arrow
+      , String.sub
+          name
+          (prefix_length method_arrow_call_prefix)
+          (String.length name - prefix_length method_arrow_call_prefix) )
+  else
+    None
+
+let parse_class_method_name name =
+  match String.index_opt name '_' with
+  | None -> None
+  | Some first_sep ->
+      if first_sep + 1 >= String.length name || name.[first_sep + 1] <> '_' then
+        None
+      else
+        let class_name = String.sub name 0 first_sep in
+        let method_name =
+          String.sub name (first_sep + 2) (String.length name - first_sep - 2)
+        in
+        if String.length class_name = 0 || String.length method_name = 0 then
+          None
+        else
+          Some (class_name, method_name)
+
 let rec c_type_to_c = function
   | TInt -> "int"
   | TFloat -> "float"
@@ -271,50 +330,78 @@ let escape_char_code = function
   | n ->
       Printf.sprintf "'\\x%02x'" n
 
-let rec postfix_receiver_to_c expr =
-  match expr with
-  | Int _
-  | FloatLit _
-  | DoubleLit _
-  | CharLit _
-  | BoolLit _
-  | Var _
-  | Index _
-  | Deref _
-  | Field _
-  | FuncCall _ ->
-      expr_to_c expr
-  | AddrOf _
-  | Add _
-  | Sub _
-  | Mul _
-  | Div _
-  | Mod _ ->
-      "(" ^ expr_to_c expr ^ ")"
+let expr_prec_add = 10
 
-and expr_to_c = function
-  | Int i -> string_of_int i
-  | FloatLit text
-  | DoubleLit text ->
-      text
-  | CharLit value -> escape_char_code value
-  | BoolLit true -> "true"
-  | BoolLit false -> "false"
-  | Var x -> x
-  | AddrOf value -> "&" ^ expr_to_c value
-  | Index (base, index) -> expr_to_c base ^ "[" ^ expr_to_c index ^ "]"
-  | Deref e -> "*" ^ expr_to_c e
-  | Field (Deref base, field) ->
-      postfix_receiver_to_c base ^ "->" ^ field
-  | Field (base, field) ->
-      postfix_receiver_to_c base ^ "." ^ field
-  | Add (a, b) -> "(" ^ expr_to_c a ^ " + " ^ expr_to_c b ^ ")"
-  | Sub (a, b) -> "(" ^ expr_to_c a ^ " - " ^ expr_to_c b ^ ")"
-  | Mul (a, b) -> "(" ^ expr_to_c a ^ " * " ^ expr_to_c b ^ ")"
-  | Div (a, b) -> "(" ^ expr_to_c a ^ " / " ^ expr_to_c b ^ ")"
-  | Mod (a, b) -> "(" ^ expr_to_c a ^ " % " ^ expr_to_c b ^ ")"
-  | FuncCall (f, args) ->
-      f ^ "(" ^ String.concat ", " (List.map expr_to_c args) ^ ")"
+let expr_prec_mul = 20
+
+let expr_prec_unary = 30
+
+let expr_prec_postfix = 40
+
+let expr_prec_atom = 50
+
+let expr_precedence = function
+  | Add _ | Sub _ -> expr_prec_add
+  | Mul _ | Div _ | Mod _ -> expr_prec_mul
+  | AddrOf _ | Deref _ -> expr_prec_unary
+  | Index _ | Field _ | FuncCall _ -> expr_prec_postfix
+  | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ | Var _ -> expr_prec_atom
+
+let parenthesize_if needed text =
+  if needed then "(" ^ text ^ ")" else text
+
+let rec expr_to_c_with_prec min_prec expr =
+  let rendered =
+    match expr with
+    | Int i -> string_of_int i
+    | FloatLit text
+    | DoubleLit text ->
+        text
+    | CharLit value -> escape_char_code value
+    | BoolLit true -> "true"
+    | BoolLit false -> "false"
+    | Var x -> x
+    | AddrOf value ->
+        "&" ^ expr_to_c_with_prec expr_prec_postfix value
+    | Index (base, index) ->
+        expr_to_c_with_prec expr_prec_postfix base
+        ^ "[" ^ expr_to_c_with_prec 0 index ^ "]"
+    | Deref value ->
+        "*" ^ expr_to_c_with_prec expr_prec_unary value
+    | Field (Deref base, field) ->
+        expr_to_c_with_prec expr_prec_postfix base ^ "->" ^ field
+    | Field (base, field) ->
+        expr_to_c_with_prec expr_prec_postfix base ^ "." ^ field
+    | Add (left, right) ->
+        expr_to_c_with_prec expr_prec_add left
+        ^ " + "
+        ^ expr_to_c_with_prec (expr_prec_add + 1) right
+    | Sub (left, right) ->
+        expr_to_c_with_prec expr_prec_add left
+        ^ " - "
+        ^ expr_to_c_with_prec (expr_prec_add + 1) right
+    | Mul (left, right) ->
+        expr_to_c_with_prec expr_prec_mul left
+        ^ " * "
+        ^ expr_to_c_with_prec (expr_prec_mul + 1) right
+    | Div (left, right) ->
+        expr_to_c_with_prec expr_prec_mul left
+        ^ " / "
+        ^ expr_to_c_with_prec (expr_prec_mul + 1) right
+    | Mod (left, right) ->
+        expr_to_c_with_prec expr_prec_mul left
+        ^ " % "
+        ^ expr_to_c_with_prec (expr_prec_mul + 1) right
+    | FuncCall (f, args) ->
+        f ^ "(" ^ String.concat ", " (List.map (expr_to_c_with_prec 0) args) ^ ")"
+  in
+  parenthesize_if (expr_precedence expr < min_prec) rendered
+
+let expr_to_c expr =
+  expr_to_c_with_prec 0 expr
+
+let postfix_receiver_to_c expr =
+  expr_to_c_with_prec expr_prec_postfix expr
 
 let rec bexpr_to_c = function
   | True -> "1"
@@ -343,6 +430,13 @@ let params_to_c params =
   match params with
   | [] -> "void"
   | params -> String.concat ", " (List.map param_to_c params)
+
+let function_signature_to_c fn =
+  type_with_name_to_c fn.return_type fn.name
+  ^ "(" ^ params_to_c fn.params ^ ")"
+
+let function_prototype_to_c fn =
+  function_signature_to_c fn ^ ";\n"
 
 let local_decl_to_c ~indent_level local =
   indent indent_level
@@ -526,12 +620,19 @@ let rec vars_in_stmt = function
       vars_in_expr value
 
 let function_def_to_c fn =
-  let signature =
-    type_with_name_to_c fn.return_type fn.name
-    ^ "(" ^ params_to_c fn.params ^ ")"
-  in
+  let signature = function_signature_to_c fn in
   let referenced_vars =
     sort_uniq_strings (vars_in_stmt fn.body)
+  in
+  let unused_params =
+    fn.params
+    |> List.filter_map (fun param ->
+           match param.param_name with
+           | Some name when not (List.mem name referenced_vars) ->
+               Some (indent 1 ^ "(void) " ^ name ^ ";\n")
+           | Some _ | None ->
+               None)
+    |> String.concat ""
   in
   let local_decls =
     String.concat "" (List.map (local_decl_to_c ~indent_level:1) fn.locals)
@@ -547,6 +648,7 @@ let function_def_to_c fn =
   let body = stmt_to_c ~indent_level:1 ~return_type:fn.return_type fn.body in
   contract_to_c fn.contract
   ^ signature ^ " {\n"
+  ^ unused_params
   ^ local_decls
   ^ unused_locals
   ^ body
@@ -685,6 +787,12 @@ let program_to_c p =
              decls)
         ^ "\n\n"
   in
+  let prototypes =
+    match p.functions with
+    | [] -> ""
+    | functions ->
+        String.concat "" (List.map function_prototype_to_c functions) ^ "\n"
+  in
   let functions =
     match p.functions with
     | [] -> ""
@@ -692,4 +800,4 @@ let program_to_c p =
         String.concat "\n" (List.map function_def_to_c functions) ^ "\n"
   in
   let main = function_def_to_c p.main in
-  header ^ helpers ^ imports ^ records ^ globals ^ functions ^ main
+  header ^ helpers ^ imports ^ records ^ globals ^ prototypes ^ functions ^ main

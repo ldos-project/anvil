@@ -40,6 +40,7 @@ rule read = parse
   | "char"              { CHAR_KW }
   | "bool"              { BOOL_KW }
   | "struct"            { STRUCT_KW }
+  | "class"             { CLASS_KW }
   | "true"              { TRUE_KW }
   | "false"             { FALSE_KW }
   | "main"              { MAIN_KW }

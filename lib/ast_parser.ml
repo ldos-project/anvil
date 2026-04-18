@@ -401,6 +401,415 @@ let resolve_program_locals program =
   let* main = resolve_function_locals program.main in
   Ok { program with functions; main }
 
+type class_info = {
+  class_name : string;
+  field_names : string list;
+  method_names : string list;
+}
+
+type desugar_env = {
+  records : record_def list;
+  vars : (string * c_type) list;
+  function_sigs : (string * (c_type list * c_type)) list;
+  classes : (string * class_info) list;
+}
+
+let generated_method_info (fn : function_def) =
+  match fn.params with
+  | { param_type = TPointer (TRecord class_name); param_name = Some receiver } :: _
+    when String.equal receiver method_this_name ->
+      (match parse_class_method_name fn.name with
+      | Some (name_class, method_name) when String.equal class_name name_class ->
+          Some (class_name, method_name)
+      | Some _ | None ->
+          None)
+  | _ ->
+      None
+
+let build_class_infos (program : program) =
+  let add_method class_name method_name classes =
+    let existing =
+      Option.value
+        (assoc_opt class_name classes)
+        ~default:
+          {
+            class_name;
+            field_names =
+              (match lookup_record program.records class_name with
+              | Some record ->
+                  List.map (fun field -> field.field_name) record.fields
+              | None ->
+                  []);
+            method_names = [];
+          }
+    in
+    let updated =
+      {
+        existing with
+        method_names =
+          List.sort_uniq String.compare (method_name :: existing.method_names);
+      }
+    in
+    (class_name, updated)
+    :: List.filter (fun (name, _) -> not (String.equal name class_name)) classes
+  in
+  List.fold_left
+    (fun classes fn ->
+      match generated_method_info fn with
+      | Some (class_name, method_name) ->
+          add_method class_name method_name classes
+      | None ->
+          classes)
+    []
+    program.functions
+
+let build_function_sigs (program : program) =
+  let imported =
+    List.concat_map
+      (fun (imported_header : header_import) -> imported_header.functions)
+      program.imports
+    |> List.map (fun (fn : contracted_function) ->
+           fn.name,
+           ( List.map (fun param -> param.param_type) fn.params
+           , fn.return_type ))
+  in
+  let locals =
+    List.map
+      (fun (fn : function_def) ->
+        fn.name,
+        ( List.map (fun param -> param.param_type) fn.params
+        , fn.return_type ))
+      (program.functions @ [ program.main ])
+  in
+  imported @ locals
+
+let lookup_var_type env name =
+  assoc_opt name env.vars
+
+let lookup_function_sig env name =
+  assoc_opt name env.function_sigs
+
+let lookup_class_info env class_name =
+  assoc_opt class_name env.classes
+
+let rec desugar_addressable_type env = function
+  | Var name ->
+      lookup_var_type env name
+  | Field (base, field) ->
+      (match desugar_record_receiver_type env base with
+      | Some record_name -> record_field_type env.records record_name field
+      | None -> None)
+  | Index (base, _) ->
+      (match desugar_expr_type env base with
+      | Some (TPointer pointee) -> Some pointee
+      | Some (TArray (element_type, _)) -> Some element_type
+      | Some _ | None -> None)
+  | Deref expr ->
+      (match desugar_expr_type env expr with
+      | Some (TPointer pointee) -> Some pointee
+      | Some _ | None -> None)
+  | Int _
+  | FloatLit _
+  | DoubleLit _
+  | CharLit _
+  | BoolLit _
+  | AddrOf _
+  | Add _
+  | Sub _
+  | Mul _
+  | Div _
+  | Mod _
+  | FuncCall _ ->
+      None
+
+and desugar_record_receiver_type env expr =
+  match desugar_addressable_type env expr with
+  | Some (TRecord record_name) -> Some record_name
+  | Some _ | None -> None
+
+and desugar_expr_type env = function
+  | Int _ -> Some TInt
+  | FloatLit _ -> Some TFloat
+  | DoubleLit _ -> Some TDouble
+  | CharLit _ -> Some TChar
+  | BoolLit _ -> Some TBool
+  | Var name ->
+      lookup_var_type env name
+  | AddrOf expr ->
+      Option.map (fun c_type -> TPointer c_type) (desugar_addressable_type env expr)
+  | Index (base, _) ->
+      (match desugar_expr_type env base with
+      | Some (TPointer pointee) -> Some pointee
+      | Some (TArray (element_type, _)) -> Some element_type
+      | Some _ | None -> None)
+  | Deref expr ->
+      (match desugar_expr_type env expr with
+      | Some (TPointer pointee) -> Some pointee
+      | Some _ | None -> None)
+  | Field (base, field) ->
+      (match desugar_record_receiver_type env base with
+      | Some record_name -> record_field_type env.records record_name field
+      | None -> None)
+  | Add (left, right) ->
+      (match desugar_expr_type env left, desugar_expr_type env right with
+      | Some (TPointer pointee), Some right_type when is_integer_like_type right_type ->
+          Some (TPointer pointee)
+      | Some left_type, Some (TPointer pointee) when is_integer_like_type left_type ->
+          Some (TPointer pointee)
+      | Some left_type, Some right_type ->
+          if is_real_type left_type || is_real_type right_type then Some TDouble else Some TInt
+      | (Some _ | None), (Some _ | None) ->
+          None)
+  | Sub (left, right) ->
+      (match desugar_expr_type env left, desugar_expr_type env right with
+      | Some (TPointer pointee), Some right_type when is_integer_like_type right_type ->
+          Some (TPointer pointee)
+      | Some left_type, Some right_type ->
+          if is_real_type left_type || is_real_type right_type then Some TDouble else Some TInt
+      | (Some _ | None), (Some _ | None) ->
+          None)
+  | Mul (left, right)
+  | Div (left, right) ->
+      (match desugar_expr_type env left, desugar_expr_type env right with
+      | Some left_type, Some right_type ->
+          if is_real_type left_type || is_real_type right_type then Some TDouble else Some TInt
+      | (Some _ | None), (Some _ | None) ->
+          None)
+  | Mod _ ->
+      Some TInt
+  | FuncCall (name, args) ->
+      (match parse_method_call_name name, args with
+      | Some (Method_dot, method_name), receiver :: _ ->
+          (match desugar_expr_type env receiver with
+          | Some (TRecord class_name) ->
+              (match lookup_class_info env class_name with
+              | Some class_info when List.mem method_name class_info.method_names ->
+                  (match
+                     lookup_function_sig env (class_method_name class_name method_name)
+                   with
+                  | Some (_, return_type) -> Some return_type
+                  | None -> None)
+              | Some _ | None -> None)
+          | Some _ | None ->
+              None)
+      | Some (Method_arrow, method_name), receiver :: _ ->
+          (match desugar_expr_type env receiver with
+          | Some (TPointer (TRecord class_name)) ->
+              (match lookup_class_info env class_name with
+              | Some class_info when List.mem method_name class_info.method_names ->
+                  (match
+                     lookup_function_sig env (class_method_name class_name method_name)
+                   with
+                  | Some (_, return_type) -> Some return_type
+                  | None -> None)
+              | Some _ | None -> None)
+          | Some _ | None ->
+              None)
+      | Some _, [] ->
+          None
+      | None, _ ->
+          Option.map snd (lookup_function_sig env name))
+
+let desugar_env_for_function (program : program) classes fn =
+  {
+    records = program.records;
+    vars =
+      (List.map (fun global -> global.global_name, global.global_type) program.globals)
+      @ List.map (fun local -> local.global_name, local.global_type) fn.locals
+      @ List.filter_map
+          (fun param ->
+            Option.map (fun name -> name, param.param_type) param.param_name)
+          fn.params;
+    function_sigs = build_function_sigs program;
+    classes;
+  }
+
+let desugar_receiver_method_call env kind method_name receiver args =
+  let receiver_type = desugar_expr_type env receiver in
+  let class_name, receiver_arg =
+    match kind, receiver_type with
+    | Method_dot, Some (TRecord class_name) ->
+        class_name, AddrOf receiver
+    | Method_arrow, Some (TPointer (TRecord class_name)) ->
+        class_name, receiver
+    | Method_dot, Some other ->
+        failwith
+          (Printf.sprintf
+             "`.` method call `%s` requires an object receiver, got `%s`"
+             method_name
+             (c_type_to_c other))
+    | Method_arrow, Some other ->
+        failwith
+          (Printf.sprintf
+             "`->` method call `%s` requires a pointer receiver, got `%s`"
+             method_name
+             (c_type_to_c other))
+    | _, None ->
+        failwith
+          (Printf.sprintf
+             "could not infer the receiver type for method `%s`"
+             method_name)
+  in
+  match lookup_class_info env class_name with
+  | Some class_info when List.mem method_name class_info.method_names ->
+      FuncCall (class_method_name class_name method_name, receiver_arg :: args)
+  | Some _ | None ->
+      failwith
+        (Printf.sprintf
+           "unknown method `%s` on class `%s`"
+           method_name
+           class_name)
+
+let rec desugar_method_expr env current_class = function
+  | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ as expr ->
+      expr
+  | Var name ->
+      (match current_class with
+      | Some class_info when List.mem name class_info.field_names ->
+          Field (Deref (Var method_this_name), name)
+      | Some _ | None ->
+          Var name)
+  | AddrOf expr ->
+      AddrOf (desugar_method_expr env current_class expr)
+  | Index (base, index) ->
+      Index
+        (desugar_method_expr env current_class base, desugar_method_expr env current_class index)
+  | Deref expr ->
+      Deref (desugar_method_expr env current_class expr)
+  | Field (base, field) ->
+      Field (desugar_method_expr env current_class base, field)
+  | Add (left, right) ->
+      Add
+        (desugar_method_expr env current_class left, desugar_method_expr env current_class right)
+  | Sub (left, right) ->
+      Sub
+        (desugar_method_expr env current_class left, desugar_method_expr env current_class right)
+  | Mul (left, right) ->
+      Mul
+        (desugar_method_expr env current_class left, desugar_method_expr env current_class right)
+  | Div (left, right) ->
+      Div
+        (desugar_method_expr env current_class left, desugar_method_expr env current_class right)
+  | Mod (left, right) ->
+      Mod
+        (desugar_method_expr env current_class left, desugar_method_expr env current_class right)
+  | FuncCall (name, args) ->
+      let args = List.map (desugar_method_expr env current_class) args in
+      (match parse_method_call_name name, args with
+      | Some (kind, method_name), receiver :: method_args ->
+          desugar_receiver_method_call env kind method_name receiver method_args
+      | Some _, [] ->
+          failwith
+            (Printf.sprintf
+               "internal error: missing receiver while desugaring `%s`"
+               name)
+      | None, _ ->
+          (match current_class with
+          | Some class_info when List.mem name class_info.method_names ->
+              FuncCall
+                (class_method_name class_info.class_name name, Var method_this_name :: args)
+          | Some _ | None ->
+              FuncCall (name, args)))
+
+let rec desugar_method_bexpr env current_class = function
+  | True -> True
+  | False -> False
+  | Eq (left, right) ->
+      Eq
+        (desugar_method_expr env current_class left, desugar_method_expr env current_class right)
+  | Neq (left, right) ->
+      Neq
+        (desugar_method_expr env current_class left, desugar_method_expr env current_class right)
+  | Lt (left, right) ->
+      Lt
+        (desugar_method_expr env current_class left, desugar_method_expr env current_class right)
+  | Le (left, right) ->
+      Le
+        (desugar_method_expr env current_class left, desugar_method_expr env current_class right)
+  | Gt (left, right) ->
+      Gt
+        (desugar_method_expr env current_class left, desugar_method_expr env current_class right)
+  | Ge (left, right) ->
+      Ge
+        (desugar_method_expr env current_class left, desugar_method_expr env current_class right)
+  | Not inner ->
+      Not (desugar_method_bexpr env current_class inner)
+  | And (left, right) ->
+      And
+        ( desugar_method_bexpr env current_class left
+        , desugar_method_bexpr env current_class right )
+  | Or (left, right) ->
+      Or
+        ( desugar_method_bexpr env current_class left
+        , desugar_method_bexpr env current_class right )
+
+let rec desugar_method_stmt env current_class = function
+  | Skip -> Skip
+  | Block stmts ->
+      Block (List.map (desugar_method_stmt env current_class) stmts)
+  | LocalDecl _ ->
+      failwith "internal error: unresolved local declaration reached class desugaring"
+  | Assign (name, rhs) ->
+      let rhs = desugar_method_expr env current_class rhs in
+      (match current_class with
+      | Some class_info when List.mem name class_info.field_names ->
+          FieldAssign (Deref (Var method_this_name), name, rhs)
+      | Some _ | None ->
+          Assign (name, rhs))
+  | Store (ptr, value) ->
+      Store
+        ( desugar_method_expr env current_class ptr
+        , desugar_method_expr env current_class value )
+  | ArrayAssign (base, index, value) ->
+      ArrayAssign
+        ( desugar_method_expr env current_class base
+        , desugar_method_expr env current_class index
+        , desugar_method_expr env current_class value )
+  | FieldAssign (base, field, value) ->
+      FieldAssign
+        ( desugar_method_expr env current_class base
+        , field
+        , desugar_method_expr env current_class value )
+  | Seq stmts ->
+      Seq (List.map (desugar_method_stmt env current_class) stmts)
+  | If (cond, then_branch, else_branch) ->
+      If
+        ( desugar_method_bexpr env current_class cond
+        , desugar_method_stmt env current_class then_branch
+        , desugar_method_stmt env current_class else_branch )
+  | While (invariant, cond, body) ->
+      While
+        ( Option.map (desugar_method_bexpr env current_class) invariant
+        , desugar_method_bexpr env current_class cond
+        , desugar_method_stmt env current_class body )
+  | Assume cond ->
+      Assume (desugar_method_bexpr env current_class cond)
+  | Assert (origin, cond) ->
+      Assert (origin, desugar_method_bexpr env current_class cond)
+  | Free ptr ->
+      Free (desugar_method_expr env current_class ptr)
+  | Return value ->
+      Return (Option.map (desugar_method_expr env current_class) value)
+
+let desugar_class_function program classes fn =
+  let env = desugar_env_for_function program classes fn in
+  let current_class =
+    match generated_method_info fn with
+    | Some (class_name, _method_name) ->
+        lookup_class_info env class_name
+    | None ->
+        None
+  in
+  { fn with body = normalize_stmt (desugar_method_stmt env current_class fn.body) }
+
+let desugar_classes program =
+  let classes = build_class_infos program in
+  {
+    program with
+    functions = List.map (desugar_class_function program classes) program.functions;
+    main = desugar_class_function program classes program.main;
+  }
+
 let rec attach_loop_invariants_stmt source_name invariants stmt =
   match stmt with
   | Skip | LocalDecl _ | Assign _ | Store _ | ArrayAssign _ | FieldAssign _ | Assume _ | Assert _ | Free _ | Return _ ->
@@ -496,6 +905,7 @@ let parse_program
       |> attach_loop_invariants source_name loop_invariants
     in
     let* program = resolve_program_locals program in
+    let program = desugar_classes program in
     Ok
       (normalize_program
          {
