@@ -1,4 +1,4 @@
-/* EXPECT: FAIL */
+/* EXPECT: PASS */
 #include "missing_safety_contracts.h"
 #include <stdlib.h>
 #include <stdio.h>

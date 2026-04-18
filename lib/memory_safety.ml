@@ -266,7 +266,7 @@ let contract_mentions_memory_predicates contract =
               else loop (i + 1)
             in
             loop 0))
-        [ contract.require; contract.guarantee; contract.safety ])
+        (contract.require @ contract.guarantee @ contract.safety))
     ghost_heap_predicates
 
 let function_mentions_memory_contract fn =

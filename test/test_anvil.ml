@@ -247,6 +247,146 @@ let assert_local_contract_roundtrip_and_instrumentation () =
             ("Expected local contract example to verify, got:\n"
             ^ Verify.format_outcome outcome))
 
+let assert_named_contract_roundtrip_and_verification () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n\n"
+    ^ "int x;\n\n"
+    ^ "/* @Contract helper\n"
+    ^ " * @Require y >= 0\n"
+    ^ " */\n"
+    ^ "/* @Contract unrelated\n"
+    ^ " * @Safety 1\n"
+    ^ " */\n"
+    ^ "/* @Contract helper\n"
+    ^ " * @Guarantee result > y\n"
+    ^ " */\n"
+    ^ "/* @Contract helper\n"
+    ^ " * @Safety y >= 0\n"
+    ^ " */\n"
+    ^ "int helper(int y) {\n"
+    ^ "  return (y + 1);\n"
+    ^ "}\n\n"
+    ^ "int unrelated(int z) {\n"
+    ^ "  return z;\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  x = helper(1);\n"
+    ^ "  return unrelated(0);\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Named-contract parse failed: " ^ e)
+  | Ok program ->
+      (match program.functions with
+      | [ helper; unrelated ] ->
+          (match helper.contract, unrelated.contract with
+          | Some helper_contract, Some unrelated_contract ->
+              if not (List.equal String.equal helper_contract.require [ "y >= 0" ]) then
+                failwith "Expected helper @Require clause to merge by name";
+              if
+                not
+                  (List.equal String.equal helper_contract.guarantee
+                     [ "result > y" ])
+              then
+                failwith "Expected helper @Guarantee clause to merge by name";
+              if not (List.equal String.equal helper_contract.safety [ "y >= 0" ]) then
+                failwith "Expected helper @Safety clause to merge by name";
+              if
+                not (List.equal String.equal unrelated_contract.require [])
+                || not (List.equal String.equal unrelated_contract.guarantee [])
+              then
+                failwith "Expected unrelated to keep only its named @Safety clause";
+              if not (List.equal String.equal unrelated_contract.safety [ "1" ]) then
+                failwith "Expected unrelated safety-only contract to attach by function name"
+          | _ ->
+              failwith "Expected both helper and unrelated to carry named contracts")
+      | _ ->
+          failwith "Expected helper and unrelated functions in named-contract test");
+      (match parse_program (program_to_c program) with
+      | Error e -> failwith ("Named-contract roundtrip failed: " ^ e)
+      | Ok roundtripped ->
+          if not (equal_program program roundtripped) then
+            failwith "Named-contract roundtrip mismatch");
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Named-contract verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected named-contract example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_named_header_contract_import_handles_partial_contracts () =
+  let header_path = Stdlib.Filename.temp_file "anvil_named_contracts" ".h" in
+  Fun.protect
+    ~finally:(fun () ->
+      try Stdlib.Sys.remove header_path with
+      | _ -> ())
+    (fun () ->
+      Out_channel.write_all header_path
+        ~data:
+          "int plain(int x);\n\
+           int inc(int x);\n\
+           int monitor(int x);\n\
+           /* @Contract inc\n\
+            * @Require x >= 0\n\
+            */\n\
+           /* @Contract inc\n\
+            * @Guarantee result >= x\n\
+            */\n\
+           /* @Contract monitor\n\
+            * @Safety 1\n\
+            */\n";
+      let base_dir = Stdlib.Filename.dirname header_path in
+      let include_name = Stdlib.Filename.basename header_path in
+      let source =
+        "#include \"" ^ include_name ^ "\"\n"
+        ^ "#include <stdlib.h>\n"
+        ^ "#include <stdio.h>\n\n"
+        ^ "int x;\n\n"
+        ^ "int main(void) {\n"
+        ^ "  x = inc(1);\n"
+        ^ "  return 0;\n"
+        ^ "}\n"
+      in
+      match parse_program ~base_dir source with
+      | Error e -> failwith ("Named-header parse failed: " ^ e)
+      | Ok program ->
+          (match program.imports with
+          | [ (imported : header_import) ] ->
+              let imported_names =
+                imported.functions
+                |> List.map ~f:(fun (fn : imported_function) -> fn.name)
+                |> List.sort ~compare:String.compare
+              in
+              if not (List.equal String.equal imported_names [ "inc"; "monitor" ]) then
+                failwith "Expected only contracted header functions to be imported";
+              (match
+                 List.find imported.functions
+                   ~f:(fun (fn : imported_function) -> String.equal fn.name "inc")
+               with
+              | None -> failwith "Expected imported named contract for inc"
+              | Some fn ->
+                  if not (List.equal String.equal fn.contract.require [ "x >= 0" ]) then
+                    failwith "Expected named header @Require to attach to inc";
+                  if
+                    not
+                      (List.equal String.equal fn.contract.guarantee
+                         [ "result >= x" ])
+                  then
+                    failwith "Expected named header @Guarantee to attach to inc";
+                  if not (List.equal String.equal fn.contract.safety []) then
+                    failwith "Expected missing @Safety to stay absent on inc")
+          | _ ->
+              failwith "Expected exactly one imported header in named-contract test");
+          (match Verify.verify_program program with
+          | Error e -> failwith ("Named-header verification failed: " ^ e)
+          | Ok Verify.Verified -> ()
+          | Ok outcome ->
+              failwith
+                ("Expected named-header example to verify, got:\n"
+                ^ Verify.format_outcome outcome)))
+
 let assert_verifier_reports_counterexample () =
   let source =
     "#include <stdlib.h>\n"
@@ -1245,10 +1385,82 @@ let assert_reference_header_import_roundtrip () =
               if not (equal_program program roundtripped) then
                 failwith "Reference header import roundtrip mismatch"))
 
+let assert_strict_mode_accepts_initialized_scalar_program () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n\n"
+    ^ "int main(void) {\n"
+    ^ "  int x = 0;\n"
+    ^ "  x = (x + 1);\n"
+    ^ "  if (!(x >= 1)) { abort(); }\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program ~strict:true source with
+  | Error e -> failwith ("Strict-mode scalar parse failed: " ^ e)
+  | Ok program ->
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Strict-mode scalar verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected strict-mode scalar example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_strict_mode_rejects_uninitialized_local () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n\n"
+    ^ "int main(void) {\n"
+    ^ "  int x;\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program ~strict:true source with
+  | Ok _ ->
+      failwith "Expected strict mode to reject an uninitialized local"
+  | Error e ->
+      if not (String.is_substring e ~substring:"requires local `x` in `main` to be initialized") then
+        failwith ("Unexpected strict-mode local error: " ^ e)
+
+let assert_strict_mode_rejects_globals () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n\n"
+    ^ "int x;\n\n"
+    ^ "int main(void) {\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program ~strict:true source with
+  | Ok _ ->
+      failwith "Expected strict mode to reject globals"
+  | Error e ->
+      if not (String.is_substring e ~substring:"requires global `x` to be initialized") then
+        failwith ("Unexpected strict-mode global error: " ^ e)
+
+let assert_strict_mode_rejects_memory_syntax () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n\n"
+    ^ "int main(void) {\n"
+    ^ "  int values[2];\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program ~strict:true source with
+  | Ok _ ->
+      failwith "Expected strict mode to reject array syntax"
+  | Error e ->
+      if not (String.is_substring e ~substring:"forbids array type `int[2]`") then
+        failwith ("Unexpected strict-mode memory error: " ^ e)
+
 let () =
   assert_header_import_roundtrip ();
   assert_contract_instrumentation ();
   assert_local_contract_roundtrip_and_instrumentation ();
+  assert_named_contract_roundtrip_and_verification ();
+  assert_named_header_contract_import_handles_partial_contracts ();
   assert_verifier_reports_counterexample ();
   assert_counterexample_reports_require_location ();
   assert_counterexample_reports_guarantee_location ();
@@ -1273,6 +1485,10 @@ let () =
   assert_reference_roundtrip_and_verification ();
   assert_const_reference_write_rejected ();
   assert_reference_header_import_roundtrip ();
+  assert_strict_mode_accepts_initialized_scalar_program ();
+  assert_strict_mode_rejects_uninitialized_local ();
+  assert_strict_mode_rejects_globals ();
+  assert_strict_mode_rejects_memory_syntax ();
   Quickcheck.test
     ~trials:300
     ~sexp_of:(fun _ -> Sexp.Atom "program")

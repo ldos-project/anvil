@@ -260,7 +260,7 @@ let bind_definition_params
   in
   loop contract_fn.params params []
 
-let instantiate_contract
+let instantiate_contract_clause
     (memory_env : Memory_safety.contract_env)
     (contract_fn : contracted_function)
     kind
@@ -275,6 +275,24 @@ let instantiate_contract
   | Ok bexpr ->
       let bexpr = substitute_bexpr bindings bexpr in
       Memory_safety.lower_contract_bexpr memory_env bexpr
+
+let rec instantiate_contracts
+    (memory_env : Memory_safety.contract_env)
+    (contract_fn : contracted_function)
+    kind
+    texts
+    bindings =
+  match texts with
+  | [] -> Ok []
+  | text :: rest ->
+      (match
+         instantiate_contract_clause memory_env contract_fn kind text bindings
+       with
+      | Error _ as error -> error
+      | Ok clause ->
+          (match instantiate_contracts memory_env contract_fn kind rest bindings with
+          | Error _ as error -> error
+          | Ok rest -> Ok (clause :: rest)))
 
 let ( let* ) result f =
   match result with
@@ -322,25 +340,25 @@ let effective_contract
              fn.name)
 
 let instantiate_void_guarantee current =
-  let* guarantee =
-    instantiate_contract current.memory_env current.contract_fn "@Guarantee"
+  let* guarantees =
+    instantiate_contracts current.memory_env current.contract_fn "@Guarantee"
       current.contract_fn.contract.guarantee current.param_bindings
   in
-  if bexpr_has_var "result" guarantee then
+  if List.exists (bexpr_has_var "result") guarantees then
     Error
       (Printf.sprintf
          "@Guarantee for `%s` references `result` on a void return"
        current.contract_fn.name)
   else
-    Ok guarantee
+    Ok guarantees
 
 let instantiate_current_safety current =
-  instantiate_contract current.memory_env current.contract_fn "@Safety"
+  instantiate_contracts current.memory_env current.contract_fn "@Safety"
     current.contract_fn.contract.safety current.param_bindings
 
 let instantiate_step_safety current =
   let* safety = instantiate_current_safety current in
-  if bexpr_has_var "result" safety then
+  if List.exists (bexpr_has_var "result") safety then
     Error
       (Printf.sprintf
          "@Safety for `%s` references `result` before return"
@@ -350,7 +368,7 @@ let instantiate_step_safety current =
 
 let instantiate_void_safety current =
   let* safety = instantiate_current_safety current in
-  if bexpr_has_var "result" safety then
+  if List.exists (bexpr_has_var "result") safety then
     Error
       (Printf.sprintf
          "@Safety for `%s` references `result` on a void return"
@@ -359,15 +377,19 @@ let instantiate_void_safety current =
     Ok safety
 
 let instantiate_current_safety_with_result current result =
-  instantiate_contract current.memory_env current.contract_fn "@Safety"
+  instantiate_contracts current.memory_env current.contract_fn "@Safety"
     current.contract_fn.contract.safety
     (("result", result) :: current.param_bindings)
 
+let assert_clauses origin clauses =
+  List.map (fun clause -> Assert (origin, clause)) clauses
+
+let assume_clauses clauses =
+  List.map (fun clause -> Assume clause) clauses
+
 let append_safety_assert current stmts =
   let* safety = instantiate_step_safety current in
-  Ok
-    (seq_of_list
-       (stmts @ [ Assert (Function_safety current.contract_fn.name, safety) ]))
+  Ok (seq_of_list (stmts @ assert_clauses (Function_safety current.contract_fn.name) safety))
 
 let rec instrument_expr
     (memory_env : Memory_safety.contract_env)
@@ -416,26 +438,25 @@ let rec instrument_expr
               let result_name, state = fresh_name contract_fn.return_type state in
               let result_expr = Var result_name in
               let* require =
-                instantiate_contract memory_env contract_fn "@Require"
+                instantiate_contracts memory_env contract_fn "@Require"
                   contract_fn.contract.require bindings
               in
               let* safety =
-                instantiate_contract memory_env contract_fn "@Safety"
+                instantiate_contracts memory_env contract_fn "@Safety"
                   contract_fn.contract.safety
                   (("result", result_expr) :: bindings)
               in
               let* guarantee =
-                instantiate_contract memory_env contract_fn "@Guarantee"
+                instantiate_contracts memory_env contract_fn "@Guarantee"
                   contract_fn.contract.guarantee
                   (("result", result_expr) :: bindings)
               in
               Ok
                 ( prefix
-                  @ [ Assert (Call_require contract_fn.name, require)
-                    ; Assign (result_name, FuncCall (name, args))
-                    ; Assume guarantee
-                    ; Assume safety
-                    ]
+                  @ assert_clauses (Call_require contract_fn.name) require
+                  @ [ Assign (result_name, FuncCall (name, args)) ]
+                  @ assume_clauses guarantee
+                  @ assume_clauses safety
                 , result_expr
                 , state )))
 
@@ -594,7 +615,7 @@ and instrument_stmt
           let* guarantee =
             match value with
             | Some result ->
-                instantiate_contract current.memory_env current.contract_fn "@Guarantee"
+                instantiate_contracts current.memory_env current.contract_fn "@Guarantee"
                   current.contract_fn.contract.guarantee
                   (("result", result) :: current.param_bindings)
             | None -> instantiate_void_guarantee current
@@ -602,10 +623,9 @@ and instrument_stmt
           Ok
             ( seq_of_list
                 ( prefix
-                @ [ Assert (Function_safety current.contract_fn.name, safety)
-                  ; Assert (Function_guarantee current.contract_fn.name, guarantee)
-                  ; Return value
-                  ] )
+                @ assert_clauses (Function_safety current.contract_fn.name) safety
+                @ assert_clauses (Function_guarantee current.contract_fn.name) guarantee
+                @ [ Return value ] )
             , state ))
   | Seq stmts ->
       let* stmts, state =
@@ -693,10 +713,10 @@ let instrument_function
         instrument_stmt memory_env env (Some current) state fn.body
       in
       let* require =
-        instantiate_contract memory_env contract_fn "@Require" contract_fn.contract.require
+        instantiate_contracts memory_env contract_fn "@Require" contract_fn.contract.require
           current.param_bindings
       in
-      let body = seq_of_list [ Assume require; body ] in
+      let body = seq_of_list (assume_clauses require @ [ body ]) in
       let* body =
         match fn.return_type with
         | TVoid ->
@@ -704,10 +724,9 @@ let instrument_function
             let* guarantee = instantiate_void_guarantee current in
             Ok
               (seq_of_list
-                 [ body
-                 ; Assert (Function_safety current.contract_fn.name, safety)
-                 ; Assert (Function_guarantee current.contract_fn.name, guarantee)
-                 ])
+                 ([ body ]
+                 @ assert_clauses (Function_safety current.contract_fn.name) safety
+                 @ assert_clauses (Function_guarantee current.contract_fn.name) guarantee))
         | _ -> Ok body
       in
       Ok ({ fn with body }, state)

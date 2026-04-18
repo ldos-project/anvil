@@ -146,21 +146,42 @@ let parse_param text =
       { param_type = parse_c_type trimmed; param_name = None }
 
 type pending_contract = {
-  require : string option;
-  guarantee : string option;
-  safety : string option;
+  target_name : string option;
+  require : string list;
+  guarantee : string list;
+  safety : string list;
 }
 
-let empty_contract = {
-  require = None;
-  guarantee = None;
-  safety = None;
+type contract_fragment = {
+  target_name : string option;
+  contract : contract;
 }
 
-let has_pending_contract contract =
-  Option.is_some contract.require
-  || Option.is_some contract.guarantee
-  || Option.is_some contract.safety
+type named_contract = {
+  line_number : int;
+  contract : contract;
+}
+
+type function_signature = {
+  name : func_name;
+  return_type : c_type;
+  params : param list;
+}
+
+let empty_pending_contract = {
+  target_name = None;
+  require = [];
+  guarantee = [];
+  safety = [];
+}
+
+let pending_has_clauses contract =
+  contract.require <> []
+  || contract.guarantee <> []
+  || contract.safety <> []
+
+let has_pending_contract (contract : pending_contract) =
+  Option.is_some contract.target_name || pending_has_clauses contract
 
 let take_tag_value ~tag line =
   if starts_with ~prefix:tag line then
@@ -176,75 +197,84 @@ let take_tag_value ~tag line =
     Some rest
   else None
 
-let set_contract_field line_number header_path contract tag value =
-  let set_field current update =
-    match current with
-    | Some _ ->
-        fail "duplicate %s in %s at line %d" tag header_path line_number
-    | None ->
-        if value = "" then
-          fail "empty %s in %s at line %d" tag header_path line_number
-        else update
-  in
+let set_contract_target line_number header_path (contract : pending_contract) value =
+  if value = "" then
+    fail "empty @Contract in %s at line %d" header_path line_number;
+  if not (is_qualified_ident value) then
+    fail "unsupported @Contract target `%s` in %s at line %d" value header_path line_number;
+  match contract.target_name with
+  | Some _ ->
+      fail "duplicate @Contract in %s at line %d" header_path line_number
+  | None ->
+      { contract with target_name = Some value }
+
+let append_contract_field line_number header_path (contract : pending_contract) tag value =
+  if value = "" then
+    fail "empty %s in %s at line %d" tag header_path line_number;
   match tag with
   | "@Require" ->
-      set_field contract.require { contract with require = Some value }
+      { contract with require = contract.require @ [ value ] }
   | "@Guarantee" ->
-      set_field contract.guarantee { contract with guarantee = Some value }
+      { contract with guarantee = contract.guarantee @ [ value ] }
   | "@Safety" ->
-      set_field contract.safety { contract with safety = Some value }
+      { contract with safety = contract.safety @ [ value ] }
   | _ -> contract
 
-let consume_comment_line contract ~header_path ~line_number raw_line =
+let consume_comment_line (contract : pending_contract) ~header_path ~line_number raw_line =
   let trimmed = String.trim raw_line in
   let trimmed =
     if starts_with ~prefix:"*" trimmed then
       String.sub trimmed 1 (String.length trimmed - 1) |> String.trim
     else trimmed
   in
-  match take_tag_value ~tag:"@Require" trimmed with
+  match take_tag_value ~tag:"@Contract" trimmed with
   | Some value ->
-      set_contract_field line_number header_path contract "@Require" value
+      set_contract_target line_number header_path contract value
   | None ->
-      (match take_tag_value ~tag:"@Guarantee" trimmed with
+      (match take_tag_value ~tag:"@Require" trimmed with
       | Some value ->
-          set_contract_field line_number header_path contract "@Guarantee" value
+          append_contract_field line_number header_path contract "@Require" value
       | None ->
-          (match take_tag_value ~tag:"@Safety" trimmed with
+          (match take_tag_value ~tag:"@Guarantee" trimmed with
           | Some value ->
-              set_contract_field line_number header_path contract "@Safety" value
-          | None -> contract))
+              append_contract_field line_number header_path contract "@Guarantee" value
+          | None ->
+              (match take_tag_value ~tag:"@Safety" trimmed with
+              | Some value ->
+                  append_contract_field line_number header_path contract "@Safety" value
+              | None -> contract)))
 
-let consume_comment_text contract ~header_path ~line_number text =
+let consume_comment_text (contract : pending_contract) ~header_path ~line_number text =
   String.split_on_char '\n' text
   |> List.fold_left
        (fun current line ->
          consume_comment_line current ~header_path ~line_number line)
        contract
 
-let materialize_contract ~header_path ~line_number = function
-  | { require = Some require; guarantee = Some guarantee; safety = Some safety } ->
-      ({ require; guarantee; safety } : contract)
-  | { require; guarantee; safety } ->
-      let missing =
-        [ ("@Require", require); ("@Guarantee", guarantee); ("@Safety", safety) ]
-        |> List.filter_map (fun (tag, value) ->
-               match value with
-               | Some _ -> None
-               | None -> Some tag)
-      in
-      fail
-        "missing %s for function contract in %s at line %d"
-        (String.concat ", " missing)
-        header_path
-        line_number
+let materialize_contract_block ~header_path ~line_number (pending : pending_contract) =
+  if Option.is_some pending.target_name && not (pending_has_clauses pending) then
+    let name = Option.value pending.target_name ~default:"<unknown>" in
+    fail "empty contract block for function `%s` in %s at line %d" name header_path line_number
+  else if not (pending_has_clauses pending) then
+    None
+  else
+    Some
+      {
+        target_name = pending.target_name;
+        contract =
+          {
+            require = pending.require;
+            guarantee = pending.guarantee;
+            safety = pending.safety;
+          };
+      }
 
 let parse_params text =
   let trimmed = String.trim text in
   if trimmed = "" || trimmed = "void" then []
   else String.split_on_char ',' trimmed |> List.map parse_param
 
-let parse_prototype ~header_path ~line_number ~contract decl =
+let parse_prototype_signature ~header_path ~line_number decl =
   let trimmed = String.trim decl in
   if not (ends_with ~suffix:";" trimmed) then
     fail "unterminated function declaration in %s at line %d" header_path line_number;
@@ -285,12 +315,88 @@ let parse_prototype ~header_path ~line_number ~contract decl =
       "reference return types are unsupported in %s at line %d"
       header_path
       line_number;
+  { name; return_type; params = parse_params params_text }
+
+let apply_contract (signature : function_signature) (contract : contract) =
   {
-    name;
-    return_type;
-    params = parse_params params_text;
-    contract = materialize_contract ~header_path ~line_number contract;
+    name = signature.name;
+    return_type = signature.return_type;
+    params = signature.params;
+    contract;
   }
+
+let add_signature signatures signature =
+  if List.exists (( = ) signature) signatures then signatures else signature :: signatures
+
+let assoc_signature_opt signature bindings =
+  List.find_map
+    (fun (candidate, contract) ->
+      if candidate = signature then Some contract else None)
+    bindings
+
+let add_signature_contract signature contract bindings =
+  let rec loop acc = function
+    | [] -> List.rev ((signature, contract) :: acc)
+    | ((candidate, existing) as binding) :: rest ->
+        if candidate = signature then
+          List.rev_append acc ((signature, merge_contracts existing contract) :: rest)
+        else
+          loop (binding :: acc) rest
+  in
+  loop [] bindings
+
+let assoc_named_contract name bindings =
+  List.find_map
+    (fun (candidate, entry) ->
+      if String.equal candidate name then Some entry else None)
+    bindings
+
+let add_named_contract line_number name contract bindings =
+  let rec loop acc = function
+    | [] -> List.rev ((name, { line_number; contract }) :: acc)
+    | ((candidate, entry) as binding) :: rest ->
+        if String.equal candidate name then
+          List.rev_append acc ((name, { entry with contract = merge_contracts entry.contract contract }) :: rest)
+        else
+          loop (binding :: acc) rest
+  in
+  loop [] bindings
+
+let finalize_contracts ~source_path signatures_rev legacy_contracts named_contracts =
+  let signatures = List.rev signatures_rev in
+  List.iter
+    (fun (name, entry) ->
+      let matches =
+        List.filter (fun (signature : function_signature) -> String.equal signature.name name) signatures
+      in
+      match matches with
+      | [] ->
+          fail
+            "contract for unknown function `%s` in %s at line %d"
+            name
+            source_path
+            entry.line_number
+      | [ _ ] ->
+          ()
+      | _ ->
+          fail
+            "named contract for overloaded function `%s` in %s at line %d is ambiguous"
+            name
+            source_path
+            entry.line_number)
+    named_contracts;
+  signatures
+  |> List.filter_map (fun signature ->
+         let legacy =
+           Option.value (assoc_signature_opt signature legacy_contracts) ~default:empty_contract
+         in
+         let named =
+           match assoc_named_contract signature.name named_contracts with
+           | Some entry -> entry.contract
+           | None -> empty_contract
+         in
+         let contract = merge_contracts legacy named in
+         if contract_is_empty contract then None else Some (apply_contract signature contract))
 
 let is_local_include_line line =
   let trimmed = String.trim line in
@@ -322,12 +428,27 @@ let parse_header_file ~base_dir include_path =
     | Sys_error msg -> fail "failed to read header %s: %s" include_path msg
   in
   let lines = String.split_on_char '\n' source in
-  let functions = ref [] in
-  let pending = ref empty_contract in
+  let signatures_rev = ref [] in
+  let legacy_contracts = ref [] in
+  let named_contracts = ref [] in
+  let pending_legacy = ref empty_contract in
   let in_block_comment = ref false in
+  let block_start_line = ref 1 in
   let block_buffer = Buffer.create 128 in
   let decl_buffer = Buffer.create 128 in
   let decl_start_line = ref None in
+  let ingest_comment_fragment ~line_number text =
+    let fragment =
+      consume_comment_text empty_pending_contract ~header_path:include_path ~line_number text
+    in
+    match materialize_contract_block ~header_path:include_path ~line_number fragment with
+    | None -> ()
+    | Some { target_name = Some name; contract } ->
+        named_contracts :=
+          add_named_contract line_number name contract !named_contracts
+    | Some { target_name = None; contract } ->
+        pending_legacy := merge_contracts !pending_legacy contract
+  in
   let clear_decl () =
     Buffer.clear decl_buffer;
     decl_start_line := None
@@ -344,11 +465,14 @@ let parse_header_file ~base_dir include_path =
     let decl = Buffer.contents decl_buffer in
     if decl <> "" && ends_with ~suffix:";" decl then begin
       let line_number = Option.value !decl_start_line ~default:1 in
-      let fn =
-        parse_prototype ~header_path:include_path ~line_number ~contract:!pending decl
+      let signature =
+        parse_prototype_signature ~header_path:include_path ~line_number decl
       in
-      functions := fn :: !functions;
-      pending := empty_contract;
+      signatures_rev := add_signature !signatures_rev signature;
+      if not (contract_is_empty !pending_legacy) then
+        legacy_contracts :=
+          add_signature_contract signature !pending_legacy !legacy_contracts;
+      pending_legacy := empty_contract;
       clear_decl ()
     end
   in
@@ -360,9 +484,9 @@ let parse_header_file ~base_dir include_path =
         match find_substring ~sub:"*/" raw_line with
         | Some end_idx ->
             Buffer.add_string block_buffer (String.sub raw_line 0 end_idx);
-            pending :=
-              consume_comment_text !pending ~header_path:include_path ~line_number
-                (Buffer.contents block_buffer);
+            ingest_comment_fragment
+              ~line_number:!block_start_line
+              (Buffer.contents block_buffer);
             Buffer.clear block_buffer;
             in_block_comment := false;
             let rest =
@@ -384,15 +508,14 @@ let parse_header_file ~base_dir include_path =
         | None ->
             if trimmed.[0] = '#' then ()
             else if starts_with ~prefix:"//" trimmed then
-              pending :=
-                consume_comment_text !pending ~header_path:include_path ~line_number
-                  (String.sub trimmed 2 (String.length trimmed - 2))
+              ingest_comment_fragment
+                ~line_number
+                (String.sub trimmed 2 (String.length trimmed - 2))
             else if starts_with ~prefix:"/*" trimmed then
               (match find_substring ~sub:"*/" trimmed with
               | Some end_idx when end_idx >= 2 ->
                   let body = String.sub trimmed 2 (end_idx - 2) in
-                  pending :=
-                    consume_comment_text !pending ~header_path:include_path ~line_number body;
+                  ingest_comment_fragment ~line_number body;
                   let rest =
                     String.sub trimmed (end_idx + 2)
                       (String.length trimmed - end_idx - 2)
@@ -404,6 +527,7 @@ let parse_header_file ~base_dir include_path =
                   end
               | _ ->
                   in_block_comment := true;
+                  block_start_line := line_number;
                   Buffer.clear block_buffer;
                   Buffer.add_string block_buffer
                     (String.sub trimmed 2 (String.length trimmed - 2));
@@ -411,21 +535,29 @@ let parse_header_file ~base_dir include_path =
             else if Buffer.length decl_buffer > 0 || find_substring ~sub:"(" trimmed <> None then begin
               append_decl line_number trimmed;
               maybe_finish_decl ()
-            end else if has_pending_contract !pending then
-              pending := empty_contract)
+            end else if not (contract_is_empty !pending_legacy) then
+              pending_legacy := empty_contract)
     lines;
   if !in_block_comment then
     fail "unterminated block comment in %s" include_path;
   if Buffer.length decl_buffer > 0 then
     fail "unterminated function declaration in %s" include_path;
-  { include_path; functions = List.rev !functions }
+  {
+    include_path;
+    functions =
+      finalize_contracts
+        ~source_path:include_path
+        !signatures_rev
+        !legacy_contracts
+        !named_contracts;
+  }
 
 let load_imports ~base_dir source =
   String.split_on_char '\n' source
   |> List.filter_map is_local_include_line
   |> List.map (parse_header_file ~base_dir)
 
-let parse_definition ~source_path ~line_number ~contract decl =
+let parse_definition_signature ~source_path ~line_number decl =
   let trimmed = String.trim decl in
   if not (ends_with ~suffix:"{" trimmed) then
     fail "unterminated function definition in %s at line %d" source_path line_number;
@@ -434,7 +566,7 @@ let parse_definition ~source_path ~line_number ~contract decl =
     |> String.trim
     |> fun text -> text ^ ";"
   in
-  parse_prototype ~header_path:source_path ~line_number ~contract prototype
+  parse_prototype_signature ~header_path:source_path ~line_number prototype
 
 type definition_scan_mode =
   | Code
@@ -451,12 +583,26 @@ type definition_scan_mode =
     }
 
 let load_defined_contracts ~source_path source =
-  let functions = ref [] in
-  let pending = ref empty_contract in
+  let signatures_rev = ref [] in
+  let legacy_contracts = ref [] in
+  let named_contracts = ref [] in
+  let pending_legacy = ref empty_contract in
   let brace_depth = ref 0 in
   let line_number = ref 1 in
   let top_buffer = Buffer.create 128 in
   let top_start_line = ref None in
+  let ingest_comment_fragment ~line_number text =
+    let fragment =
+      consume_comment_text empty_pending_contract ~header_path:source_path ~line_number text
+    in
+    match materialize_contract_block ~header_path:source_path ~line_number fragment with
+    | None -> ()
+    | Some { target_name = Some name; contract } ->
+        named_contracts :=
+          add_named_contract line_number name contract !named_contracts
+    | Some { target_name = None; contract } ->
+        pending_legacy := merge_contracts !pending_legacy contract
+  in
   let add_top_char c =
     let is_space =
       match c with
@@ -479,22 +625,21 @@ let load_defined_contracts ~source_path source =
     let decl_line = Option.value !top_start_line ~default:!line_number in
     if decl <> "" then
       if terminator = '{' && find_substring ~sub:"(" decl <> None then begin
-        if has_pending_contract !pending then begin
-          let fn =
-            parse_definition ~source_path ~line_number:decl_line ~contract:!pending decl
-          in
-          functions := fn :: !functions;
-          pending := empty_contract
-        end
-      end else if has_pending_contract !pending then
-        pending := empty_contract;
+        let signature =
+          parse_definition_signature ~source_path ~line_number:decl_line decl
+        in
+        signatures_rev := add_signature !signatures_rev signature;
+        if not (contract_is_empty !pending_legacy) then
+          legacy_contracts :=
+            add_signature_contract signature !pending_legacy !legacy_contracts;
+        pending_legacy := empty_contract
+      end else if not (contract_is_empty !pending_legacy) then
+        pending_legacy := empty_contract;
     clear_top ()
   in
   let finish_comment capture start_line buffer =
     if capture then
-      pending :=
-        consume_comment_text !pending ~header_path:source_path ~line_number:start_line
-          (Buffer.contents buffer)
+      ingest_comment_fragment ~line_number:start_line (Buffer.contents buffer)
   in
   let length = String.length source in
   let rec loop i mode =
@@ -505,7 +650,11 @@ let load_defined_contracts ~source_path source =
           finish_comment capture start_line buffer
       | Block_comment _ ->
           fail "unterminated block comment in %s" source_path);
-      List.rev !functions
+      finalize_contracts
+        ~source_path
+        !signatures_rev
+        !legacy_contracts
+        !named_contracts
     end else
       match mode with
       | Code ->
@@ -523,7 +672,8 @@ let load_defined_contracts ~source_path source =
             let buffer = Buffer.create 64 in
             loop (i + 2) (Block_comment { capture; start_line = !line_number; buffer })
           else if !brace_depth = 0 && c = '#' && Buffer.length top_buffer = 0 then begin
-            if has_pending_contract !pending then pending := empty_contract;
+            if not (contract_is_empty !pending_legacy) then
+              pending_legacy := empty_contract;
             loop (i + 1) Preprocessor
           end else begin
             if !brace_depth = 0 then begin
