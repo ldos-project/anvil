@@ -126,6 +126,12 @@ let stmt_of_if_without_else cond then_branch =
   | _ ->
       If (cond, then_branch, Skip)
 
+let raw_qualified_name parts =
+  String.concat raw_namespace_separator parts
+
+let qualify_decl_name namespace name =
+  namespace_qualify namespace name
+
 let make_method_function ~class_name ~name ~return_type ~params body =
   make_function
     ~name:(class_method_name class_name name)
@@ -144,6 +150,8 @@ type top_item =
   | Top_global of global_def
   | Top_function of function_def
   | Top_main of function_def
+
+type top_group_builder = string list -> top_item list
 
 let build_class class_name members =
   let fields_rev, methods_rev =
@@ -194,8 +202,8 @@ let build_program items =
 %token <string> DOUBLE_LIT
 %token <int> CHAR_LIT
 %token <string> IDENT
-%token INT_KW FLOAT_KW DOUBLE_KW CHAR_KW BOOL_KW MAIN_KW VOID_KW STRUCT_KW CLASS_KW IF_KW ELSE_KW WHILE_KW RETURN_KW FREE_KW TRUE_KW FALSE_KW
-%token LPAREN RPAREN LBRACE RBRACE LBRACKET RBRACKET SEMI COMMA AMP DOT ARROW
+%token INT_KW FLOAT_KW DOUBLE_KW CHAR_KW BOOL_KW MAIN_KW VOID_KW STRUCT_KW CLASS_KW NAMESPACE_KW IF_KW ELSE_KW WHILE_KW RETURN_KW FREE_KW TRUE_KW FALSE_KW
+%token LPAREN RPAREN LBRACE RBRACE LBRACKET RBRACKET SEMI COMMA AMP DOT ARROW SCOPE
 %token PLUS MINUS STAR SLASH PERCENT
 %token ASSIGN EQEQ NEQ LT LE GT GE NOT AND OR
 %token EOF
@@ -232,7 +240,7 @@ scalar_type:
       { TBool }
 
 struct_type:
-  | STRUCT_KW name = IDENT
+  | STRUCT_KW name = qualified_ident
       { TRecord name }
 
 nonvoid_type:
@@ -240,8 +248,17 @@ nonvoid_type:
       { base }
   | base = struct_type
       { base }
-  | name = IDENT
+  | name = qualified_ident
       { TRecord name }
+
+qualified_ident:
+  | first = IDENT rest = qualified_ident_tail
+      { raw_qualified_name (first :: rest) }
+
+qualified_ident_tail:
+  | { [] }
+  | SCOPE next = IDENT rest = qualified_ident_tail
+      { next :: rest }
 
 contract_expr:
   | value = contract_add_expr
@@ -326,9 +343,9 @@ contract_primary_expr:
       { BoolLit true }
   | FALSE_KW
       { BoolLit false }
-  | name = IDENT LPAREN args = separated_list(COMMA, contract_expr) RPAREN
+  | name = qualified_ident LPAREN args = separated_list(COMMA, contract_expr) RPAREN
       { FuncCall (name, args) }
-  | name = IDENT
+  | name = qualified_ident
       { Var name }
   | LPAREN value = contract_expr RPAREN
       { value }
@@ -352,9 +369,9 @@ contract_nonparen_primary_expr:
       { BoolLit true }
   | FALSE_KW
       { BoolLit false }
-  | name = IDENT LPAREN args = separated_list(COMMA, contract_expr) RPAREN
+  | name = qualified_ident LPAREN args = separated_list(COMMA, contract_expr) RPAREN
       { FuncCall (name, args) }
-  | name = IDENT
+  | name = qualified_ident
       { Var name }
 
 contract_bexpr:
@@ -403,28 +420,77 @@ contract_atom_bexpr:
 
 program:
   | items = list(top_group) EOF
-      { build_program (List.concat items) }
+      { build_program (List.concat_map (fun build -> build []) items) }
 
 top_group:
+  | NAMESPACE_KW name = qualified_ident LBRACE items = list(top_group) RBRACE
+      {
+        fun namespace ->
+          let nested_namespace =
+            namespace @ split_on_substring ~sep:raw_namespace_separator name
+          in
+          List.concat_map (fun build -> build nested_namespace) items
+      }
   | STRUCT_KW name = IDENT LBRACE fields = record_field_list RBRACE SEMI
-      { [ Top_record { record_name = name; fields } ] }
+      {
+        fun namespace ->
+          [ Top_record
+              {
+                record_name = qualify_decl_name namespace name;
+                fields;
+              }
+          ]
+      }
   | CLASS_KW name = IDENT LBRACE members = class_member_list RBRACE SEMI
-      { build_class name (List.map (fun build -> build name) members) }
+      {
+        fun namespace ->
+          let class_name = qualify_decl_name namespace name in
+          build_class class_name (List.map (fun build -> build class_name) members)
+      }
   | INT_KW MAIN_KW LPAREN VOID_KW RPAREN body = block
-      { [ Top_main (make_function ~name:"main" ~return_type:TInt ~params:[] body) ] }
+      {
+        fun namespace ->
+          if namespace <> [] then
+            fail "`main` must be declared at global scope";
+          [ Top_main (make_function ~name:"main" ~return_type:TInt ~params:[] body) ]
+      }
   | INT_KW MAIN_KW LPAREN RPAREN body = block
-      { [ Top_main (make_function ~name:"main" ~return_type:TInt ~params:[] body) ] }
+      {
+        fun namespace ->
+          if namespace <> [] then
+            fail "`main` must be declared at global scope";
+          [ Top_main (make_function ~name:"main" ~return_type:TInt ~params:[] body) ]
+      }
   | base = nonvoid_type stars = pointer_stars name = IDENT LPAREN params = param_list RPAREN SEMI
-      { ignore base; ignore stars; ignore name; ignore params; [] }
+      {
+        ignore base;
+        ignore stars;
+        ignore name;
+        ignore params;
+        fun _namespace -> []
+      }
   | base = nonvoid_type stars = pointer_stars name = IDENT tail = top_tail
-      { [ tail base stars name ] }
+      {
+        fun namespace ->
+          [ tail base stars (qualify_decl_name namespace name) ]
+      }
   | VOID_KW stars = pointer_stars name = IDENT LPAREN params = param_list RPAREN SEMI
-      { ignore stars; ignore name; ignore params; [] }
+      {
+        ignore stars;
+        ignore name;
+        ignore params;
+        fun _namespace -> []
+      }
   | VOID_KW stars = pointer_stars name = IDENT LPAREN params = param_list RPAREN body = block
       {
-        [ Top_function
-            (make_function ~name ~return_type:(pointer_type TVoid stars) ~params body)
-        ]
+        fun namespace ->
+          [ Top_function
+              (make_function
+                 ~name:(qualify_decl_name namespace name)
+                 ~return_type:(pointer_type TVoid stars)
+                 ~params
+                 body)
+          ]
       }
 
 class_member_list:
@@ -600,7 +666,7 @@ stmt:
       { assignment_stmt lhs rhs }
   | STAR lhs = expr ASSIGN rhs = expr SEMI
       { Store (lhs, rhs) }
-  | name = IDENT LPAREN args = separated_list(COMMA, expr) RPAREN SEMI
+  | name = qualified_ident LPAREN args = separated_list(COMMA, expr) RPAREN SEMI
       { call_stmt name args }
   | RETURN_KW value = option(expr) SEMI
       { Return value }
@@ -762,9 +828,9 @@ primary_expr:
       { BoolLit true }
   | FALSE_KW
       { BoolLit false }
-  | name = IDENT LPAREN args = separated_list(COMMA, expr) RPAREN
+  | name = qualified_ident LPAREN args = separated_list(COMMA, expr) RPAREN
       { FuncCall (name, args) }
-  | name = IDENT
+  | name = qualified_ident
       { Var name }
   | LPAREN value = expr RPAREN
       { value }
@@ -782,7 +848,7 @@ nonparen_primary_expr:
       { BoolLit true }
   | FALSE_KW
       { BoolLit false }
-  | name = IDENT LPAREN args = separated_list(COMMA, expr) RPAREN
+  | name = qualified_ident LPAREN args = separated_list(COMMA, expr) RPAREN
       { FuncCall (name, args) }
-  | name = IDENT
+  | name = qualified_ident
       { Var name }

@@ -401,6 +401,136 @@ let resolve_program_locals program =
   let* main = resolve_function_locals program.main in
   Ok { program with functions; main }
 
+let has_mangled_namespace name =
+  contains_substring ~sub:namespace_separator name
+
+let rec drop_last = function
+  | [] -> []
+  | [ _ ] -> []
+  | first :: rest -> first :: drop_last rest
+
+let rec namespace_search_paths = function
+  | [] -> [ [] ]
+  | namespace_path as current ->
+      current :: namespace_search_paths (drop_last namespace_path)
+
+let name_in_env names target =
+  List.exists (String.equal target) names
+
+let namespace_reference_candidates ~current_namespace name =
+  if has_mangled_namespace name then
+    [ name ]
+  else
+    let components =
+      if has_raw_namespace name then
+        split_on_substring ~sep:raw_namespace_separator name
+      else
+        [ name ]
+    in
+    namespace_search_paths current_namespace
+    |> List.map (fun namespace_path ->
+           mangle_namespace_path (namespace_path @ components))
+
+let resolve_namespace_reference ~available ~current_namespace name =
+  namespace_reference_candidates ~current_namespace name
+  |> List.find_opt (name_in_env available)
+  |> Option.value
+       ~default:
+         (if has_raw_namespace name then mangle_raw_namespace_name name else name)
+
+let rec resolve_type_names ~records ~current_namespace = function
+  | TInt | TFloat | TDouble | TChar | TBool | TVoid as c_type -> c_type
+  | TRecord name ->
+      TRecord
+        (resolve_namespace_reference
+           ~available:records
+           ~current_namespace
+           name)
+  | TPointer inner ->
+      TPointer (resolve_type_names ~records ~current_namespace inner)
+  | TArray (inner, size) ->
+      TArray (resolve_type_names ~records ~current_namespace inner, size)
+
+let resolve_field_type_names records record =
+  let current_namespace = namespace_path_of_name record.record_name in
+  {
+    record with
+    fields =
+      List.map
+        (fun field ->
+          {
+            field with
+            field_type =
+              resolve_type_names
+                ~records
+                ~current_namespace
+                field.field_type;
+          })
+        record.fields;
+  }
+
+let resolve_global_type_names records global =
+  let current_namespace = namespace_path_of_name global.global_name in
+  {
+    global with
+    global_type =
+      resolve_type_names
+        ~records
+        ~current_namespace
+        global.global_type;
+  }
+
+let resolve_param_type_names records current_namespace param =
+  {
+    param with
+    param_type =
+      resolve_type_names
+        ~records
+        ~current_namespace
+        param.param_type;
+  }
+
+let resolve_function_type_names records fn =
+  let current_namespace = namespace_path_of_name fn.name in
+  {
+    fn with
+    return_type =
+      resolve_type_names
+        ~records
+        ~current_namespace
+        fn.return_type;
+    params =
+      List.map (resolve_param_type_names records current_namespace) fn.params;
+    locals =
+      List.map
+        (fun local ->
+          {
+            local with
+            global_type =
+              resolve_type_names
+                ~records
+                ~current_namespace
+                local.global_type;
+          })
+        fn.locals;
+  }
+
+let resolve_program_type_names program =
+  let records =
+    List.map (fun (record : record_def) -> record.record_name) program.records
+  in
+  {
+    program with
+    records = List.map (resolve_field_type_names records) program.records;
+    globals = List.map (resolve_global_type_names records) program.globals;
+    functions = List.map (resolve_function_type_names records) program.functions;
+    main =
+      {
+        (resolve_function_type_names records program.main) with
+        name = program.main.name;
+      };
+  }
+
 type class_info = {
   class_name : string;
   field_names : string list;
@@ -810,6 +940,152 @@ let desugar_classes program =
     main = desugar_class_function program classes program.main;
   }
 
+type value_resolve_env = {
+  current_namespace : string list;
+  global_names : string list;
+  function_names : string list;
+  protected_names : string list;
+}
+
+let protected_name env name =
+  name_in_env env.protected_names name
+
+let resolve_global_name env name =
+  if protected_name env name then name
+  else
+    resolve_namespace_reference
+      ~available:env.global_names
+      ~current_namespace:env.current_namespace
+      name
+
+let resolve_function_name env name =
+  resolve_namespace_reference
+    ~available:env.function_names
+    ~current_namespace:env.current_namespace
+    name
+
+let rec resolve_value_expr env = function
+  | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ as expr -> expr
+  | Var name ->
+      Var (resolve_global_name env name)
+  | AddrOf expr ->
+      AddrOf (resolve_value_expr env expr)
+  | Index (base, index) ->
+      Index (resolve_value_expr env base, resolve_value_expr env index)
+  | Deref expr ->
+      Deref (resolve_value_expr env expr)
+  | Field (base, field) ->
+      Field (resolve_value_expr env base, field)
+  | Add (left, right) ->
+      Add (resolve_value_expr env left, resolve_value_expr env right)
+  | Sub (left, right) ->
+      Sub (resolve_value_expr env left, resolve_value_expr env right)
+  | Mul (left, right) ->
+      Mul (resolve_value_expr env left, resolve_value_expr env right)
+  | Div (left, right) ->
+      Div (resolve_value_expr env left, resolve_value_expr env right)
+  | Mod (left, right) ->
+      Mod (resolve_value_expr env left, resolve_value_expr env right)
+  | FuncCall (name, args) ->
+      FuncCall
+        (resolve_function_name env name, List.map (resolve_value_expr env) args)
+
+let rec resolve_value_bexpr env = function
+  | True -> True
+  | False -> False
+  | Eq (left, right) ->
+      Eq (resolve_value_expr env left, resolve_value_expr env right)
+  | Neq (left, right) ->
+      Neq (resolve_value_expr env left, resolve_value_expr env right)
+  | Lt (left, right) ->
+      Lt (resolve_value_expr env left, resolve_value_expr env right)
+  | Le (left, right) ->
+      Le (resolve_value_expr env left, resolve_value_expr env right)
+  | Gt (left, right) ->
+      Gt (resolve_value_expr env left, resolve_value_expr env right)
+  | Ge (left, right) ->
+      Ge (resolve_value_expr env left, resolve_value_expr env right)
+  | Not inner ->
+      Not (resolve_value_bexpr env inner)
+  | And (left, right) ->
+      And (resolve_value_bexpr env left, resolve_value_bexpr env right)
+  | Or (left, right) ->
+      Or (resolve_value_bexpr env left, resolve_value_bexpr env right)
+
+let rec resolve_value_stmt env = function
+  | Skip -> Skip
+  | Block stmts ->
+      Block (List.map (resolve_value_stmt env) stmts)
+  | LocalDecl _ ->
+      failwith "internal error: unresolved local declaration reached namespace resolution"
+  | Assign (name, value) ->
+      Assign (resolve_global_name env name, resolve_value_expr env value)
+  | Store (ptr, value) ->
+      Store (resolve_value_expr env ptr, resolve_value_expr env value)
+  | ArrayAssign (base, index, value) ->
+      ArrayAssign
+        ( resolve_value_expr env base
+        , resolve_value_expr env index
+        , resolve_value_expr env value )
+  | FieldAssign (base, field, value) ->
+      FieldAssign
+        (resolve_value_expr env base, field, resolve_value_expr env value)
+  | Seq stmts ->
+      Seq (List.map (resolve_value_stmt env) stmts)
+  | If (cond, then_branch, else_branch) ->
+      If
+        ( resolve_value_bexpr env cond
+        , resolve_value_stmt env then_branch
+        , resolve_value_stmt env else_branch )
+  | While (invariant, cond, body) ->
+      While
+        ( Option.map (resolve_value_bexpr env) invariant
+        , resolve_value_bexpr env cond
+        , resolve_value_stmt env body )
+  | Assume cond ->
+      Assume (resolve_value_bexpr env cond)
+  | Assert (origin, cond) ->
+      Assert (origin, resolve_value_bexpr env cond)
+  | Free ptr ->
+      Free (resolve_value_expr env ptr)
+  | Return value ->
+      Return (Option.map (resolve_value_expr env) value)
+
+let protected_names_for_function fn =
+  List.filter_map (fun param -> param.param_name) fn.params
+  @ List.map (fun local -> local.global_name) fn.locals
+
+let resolve_function_values global_names function_names fn =
+  let env =
+    {
+      current_namespace = namespace_path_of_name fn.name;
+      global_names;
+      function_names;
+      protected_names = protected_names_for_function fn;
+    }
+  in
+  { fn with body = normalize_stmt (resolve_value_stmt env fn.body) }
+
+let resolve_program_values program =
+  let global_names = List.map (fun global -> global.global_name) program.globals in
+  let imported_function_names =
+    List.concat_map
+      (fun (imported_header : header_import) ->
+        List.map (fun (fn : contracted_function) -> fn.name) imported_header.functions)
+      program.imports
+  in
+  let function_names =
+    imported_function_names
+    @ List.map (fun fn -> fn.name) program.functions
+    @ [ program.main.name ]
+  in
+  {
+    program with
+    functions =
+      List.map (resolve_function_values global_names function_names) program.functions;
+    main = resolve_function_values global_names function_names program.main;
+  }
+
 let rec attach_loop_invariants_stmt source_name invariants stmt =
   match stmt with
   | Skip | LocalDecl _ | Assign _ | Store _ | ArrayAssign _ | FieldAssign _ | Assume _ | Assert _ | Free _ | Return _ ->
@@ -905,7 +1181,9 @@ let parse_program
       |> attach_loop_invariants source_name loop_invariants
     in
     let* program = resolve_program_locals program in
+    let program = resolve_program_type_names program in
     let program = desugar_classes program in
+    let program = resolve_program_values program in
     Ok
       (normalize_program
          {

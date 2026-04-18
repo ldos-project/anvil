@@ -41,6 +41,7 @@ rule read = parse
   | "bool"              { BOOL_KW }
   | "struct"            { STRUCT_KW }
   | "class"             { CLASS_KW }
+  | "namespace"         { NAMESPACE_KW }
   | "true"              { TRUE_KW }
   | "false"             { FALSE_KW }
   | "main"              { MAIN_KW }
@@ -52,6 +53,7 @@ rule read = parse
   | "free"              { FREE_KW }
   | "&&"                { AND }
   | "||"                { OR }
+  | "::"                { SCOPE }
   | "->"                { ARROW }
   | "=="                { EQEQ }
   | "!="                { NEQ }

@@ -123,6 +123,60 @@ type program = {
   main : function_def;
 }
 
+let namespace_separator = "__ns__"
+
+let raw_namespace_separator = "::"
+
+let contains_substring ~sub s =
+  let sub_len = String.length sub in
+  let s_len = String.length s in
+  let rec loop i =
+    if i + sub_len > s_len then false
+    else if String.sub s i sub_len = sub then true
+    else loop (i + 1)
+  in
+  if sub_len = 0 then true else loop 0
+
+let split_on_substring ~sep s =
+  let sep_len = String.length sep in
+  let s_len = String.length s in
+  let rec find_from start =
+    if start + sep_len > s_len then None
+    else if String.sub s start sep_len = sep then Some start
+    else find_from (start + 1)
+  in
+  if sep_len = 0 then [ s ]
+  else
+    let rec loop start parts_rev =
+      match find_from start with
+      | None ->
+          List.rev (String.sub s start (s_len - start) :: parts_rev)
+      | Some i ->
+          let part = String.sub s start (i - start) in
+          loop (i + sep_len) (part :: parts_rev)
+    in
+    loop 0 []
+
+let has_raw_namespace name =
+  contains_substring ~sub:raw_namespace_separator name
+
+let mangle_namespace_path = function
+  | [] -> ""
+  | components -> String.concat namespace_separator components
+
+let mangle_raw_namespace_name name =
+  mangle_namespace_path (split_on_substring ~sep:raw_namespace_separator name)
+
+let namespace_qualify path name =
+  match path with
+  | [] -> name
+  | _ -> mangle_namespace_path (path @ [ name ])
+
+let namespace_path_of_name name =
+  match List.rev (split_on_substring ~sep:namespace_separator name) with
+  | [] -> []
+  | _base :: rev_namespace -> List.rev rev_namespace
+
 let method_this_name = "this"
 
 let class_method_name class_name method_name =
@@ -167,20 +221,22 @@ let parse_method_call_name name =
     None
 
 let parse_class_method_name name =
-  match String.index_opt name '_' with
+  let rec find_last_double_underscore i last =
+    if i + 1 >= String.length name then last
+    else if name.[i] = '_' && name.[i + 1] = '_' then
+      find_last_double_underscore (i + 1) (Some i)
+    else
+      find_last_double_underscore (i + 1) last
+  in
+  match find_last_double_underscore 0 None with
   | None -> None
-  | Some first_sep ->
-      if first_sep + 1 >= String.length name || name.[first_sep + 1] <> '_' then
-        None
-      else
-        let class_name = String.sub name 0 first_sep in
-        let method_name =
-          String.sub name (first_sep + 2) (String.length name - first_sep - 2)
-        in
-        if String.length class_name = 0 || String.length method_name = 0 then
-          None
-        else
-          Some (class_name, method_name)
+  | Some sep ->
+      let class_name = String.sub name 0 sep in
+      let method_name =
+        String.sub name (sep + 2) (String.length name - sep - 2)
+      in
+      if String.length class_name = 0 || String.length method_name = 0 then None
+      else Some (class_name, method_name)
 
 let rec c_type_to_c = function
   | TInt -> "int"

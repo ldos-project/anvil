@@ -788,6 +788,136 @@ let assert_class_desugaring_roundtrip_and_verification () =
             ("Expected class example to verify, got:\n"
             ^ Verify.format_outcome outcome))
 
+let assert_namespace_resolution_roundtrip_and_verification () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n"
+    ^ "#include <stdbool.h>\n\n"
+    ^ "namespace math {\n"
+    ^ "  struct Pair {\n"
+    ^ "    int left;\n"
+    ^ "    int right;\n"
+    ^ "  };\n"
+    ^ "  Pair pair;\n"
+    ^ "  int helper(Pair *p) {\n"
+    ^ "    return (p->left + p->right);\n"
+    ^ "  }\n"
+    ^ "  namespace detail {\n"
+    ^ "    int twice(int x) {\n"
+    ^ "      return (x + x);\n"
+    ^ "    }\n"
+    ^ "  }\n"
+    ^ "  int sum(void) {\n"
+    ^ "    return detail::twice(helper(&pair));\n"
+    ^ "  }\n"
+    ^ "}\n\n"
+    ^ "int out;\n\n"
+    ^ "int main(void) {\n"
+    ^ "  math::pair.left = 2;\n"
+    ^ "  math::pair.right = 5;\n"
+    ^ "  out = math::sum();\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Namespace parse failed: " ^ e)
+  | Ok program ->
+      if not (List.exists program.records ~f:(fun record -> String.equal record.record_name "math__ns__Pair")) then
+        failwith "Expected namespaced record to be flattened to `math__ns__Pair`";
+      if not (List.exists program.globals ~f:(fun global -> String.equal global.global_name "math__ns__pair")) then
+        failwith "Expected namespaced global to be flattened to `math__ns__pair`";
+      let function_names = List.map program.functions ~f:(fun fn -> fn.name) in
+      if not (List.mem function_names "math__ns__helper" ~equal:String.equal) then
+        failwith "Expected `math__ns__helper` in flattened functions";
+      if not (List.mem function_names "math__ns__detail__ns__twice" ~equal:String.equal) then
+        failwith "Expected nested namespace function to flatten to `math__ns__detail__ns__twice`";
+      if not (List.mem function_names "math__ns__sum" ~equal:String.equal) then
+        failwith "Expected `math__ns__sum` in flattened functions";
+      let desugared = program_to_c program in
+      if String.is_substring desugared ~substring:"namespace math" then
+        failwith "Expected pretty-printer to emit flattened C, not namespace syntax";
+      if not (String.is_substring desugared ~substring:"return math__ns__detail__ns__twice(math__ns__helper(&math__ns__pair));") then
+        failwith "Expected namespace references to resolve in function bodies";
+      if not (String.is_substring desugared ~substring:"math__ns__pair.left = 2;") then
+        failwith "Expected explicit qualified global access to flatten";
+      (match parse_program desugared with
+      | Error e -> failwith ("Namespace roundtrip failed: " ^ e)
+      | Ok roundtripped ->
+          if not (equal_program program roundtripped) then
+            failwith "Namespace roundtrip mismatch");
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Namespace verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected namespace example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_namespaced_class_desugaring_roundtrip_and_verification () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n"
+    ^ "#include <stdbool.h>\n\n"
+    ^ "namespace box {\n"
+    ^ "  class Counter {\n"
+    ^ "    int value;\n"
+    ^ "    int put(int next) {\n"
+    ^ "      value = next;\n"
+    ^ "      return get();\n"
+    ^ "    }\n"
+    ^ "    int get() {\n"
+    ^ "      return value;\n"
+    ^ "    }\n"
+    ^ "  };\n"
+    ^ "}\n\n"
+    ^ "box::Counter c;\n"
+    ^ "box::Counter *cp;\n"
+    ^ "int out;\n\n"
+    ^ "int main(void) {\n"
+    ^ "  out = c.put(7);\n"
+    ^ "  cp = &c;\n"
+    ^ "  out = cp->get();\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Namespaced class parse failed: " ^ e)
+  | Ok program ->
+      if
+        not
+          (List.exists program.records ~f:(fun record ->
+               String.equal record.record_name "box__ns__Counter"))
+      then
+        failwith "Expected namespaced class desugaring to introduce `struct box__ns__Counter`";
+      let method_names = List.map program.functions ~f:(fun fn -> fn.name) in
+      if not (List.mem method_names "box__ns__Counter__put" ~equal:String.equal) then
+        failwith "Expected `box__ns__Counter__put` in desugared methods";
+      if not (List.mem method_names "box__ns__Counter__get" ~equal:String.equal) then
+        failwith "Expected `box__ns__Counter__get` in desugared methods";
+      let desugared = program_to_c program in
+      if String.is_substring desugared ~substring:"namespace box" then
+        failwith "Expected pretty-printer to emit flattened C, not namespace syntax";
+      if String.is_substring desugared ~substring:"class Counter" then
+        failwith "Expected pretty-printer to emit desugared C, not class syntax";
+      if not (String.is_substring desugared ~substring:"box__ns__Counter__put(&c, 7)") then
+        failwith "Expected dot-call desugaring to preserve the namespaced class name";
+      if not (String.is_substring desugared ~substring:"box__ns__Counter__get(cp)") then
+        failwith "Expected arrow-call desugaring to preserve the namespaced class name";
+      if not (String.is_substring desugared ~substring:"return box__ns__Counter__get(this);") then
+        failwith "Expected implicit method call to desugar through the namespaced class receiver";
+      (match parse_program desugared with
+      | Error e -> failwith ("Namespaced class roundtrip failed: " ^ e)
+      | Ok roundtripped ->
+          if not (equal_program program roundtripped) then
+            failwith "Namespaced class roundtrip mismatch");
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Namespaced class verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected namespaced class example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
 let assert_example_file_verifies file_name =
   let path = "test/e2e_cases/" ^ file_name in
   let source = In_channel.read_all path in
@@ -862,6 +992,8 @@ let () =
   assert_array_out_of_bounds_reports_counterexample ();
   assert_record_roundtrip_and_verification ();
   assert_class_desugaring_roundtrip_and_verification ();
+  assert_namespace_resolution_roundtrip_and_verification ();
+  assert_namespaced_class_desugaring_roundtrip_and_verification ();
   assert_typed_memory_examples_verify ();
   assert_typed_memory_negative_examples_fail ();
   Quickcheck.test
