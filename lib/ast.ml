@@ -607,6 +607,14 @@ let negate_bexpr bexpr =
   | Not inner -> inner
   | other -> Not other
 
+let compound_rhs_suffix target = function
+  | Add (left, right) when left = target ->
+      Some ("+=", right)
+  | Sub (left, right) when left = target ->
+      Some ("-=", right)
+  | _ ->
+      None
+
 let rec stmt_to_c ~indent_level ~return_type = function
   | Skip -> indent indent_level ^ ";\n"
   | Block stmts ->
@@ -622,18 +630,42 @@ let rec stmt_to_c ~indent_level ~return_type = function
       (match init with
       | None -> decl ^ ";\n"
       | Some expr -> decl ^ " = " ^ expr_to_c expr ^ ";\n")
-  | Assign (x, e) -> indent indent_level ^ x ^ " = " ^ expr_to_c e ^ ";\n"
+  | Assign (x, e) ->
+      (match compound_rhs_suffix (Var x) e with
+      | Some (op, rhs) ->
+          indent indent_level ^ x ^ " " ^ op ^ " " ^ expr_to_c rhs ^ ";\n"
+      | None ->
+          indent indent_level ^ x ^ " = " ^ expr_to_c e ^ ";\n")
   | Store (ptr, value) ->
-      indent indent_level ^ "*" ^ expr_to_c ptr ^ " = " ^ expr_to_c value ^ ";\n"
+      (match compound_rhs_suffix (Deref ptr) value with
+      | Some (op, rhs) ->
+          indent indent_level ^ "*" ^ expr_to_c ptr ^ " " ^ op ^ " " ^ expr_to_c rhs ^ ";\n"
+      | None ->
+          indent indent_level ^ "*" ^ expr_to_c ptr ^ " = " ^ expr_to_c value ^ ";\n")
   | ArrayAssign (base, index, value) ->
-      indent indent_level ^ expr_to_c base ^ "[" ^ expr_to_c index ^ "] = "
-      ^ expr_to_c value ^ ";\n"
+      (match compound_rhs_suffix (Index (base, index)) value with
+      | Some (op, rhs) ->
+          indent indent_level ^ expr_to_c base ^ "[" ^ expr_to_c index ^ "] "
+          ^ op ^ " " ^ expr_to_c rhs ^ ";\n"
+      | None ->
+          indent indent_level ^ expr_to_c base ^ "[" ^ expr_to_c index ^ "] = "
+          ^ expr_to_c value ^ ";\n")
   | FieldAssign (Deref base, field, value) ->
-      indent indent_level ^ postfix_receiver_to_c base ^ "->" ^ field ^ " = "
-      ^ expr_to_c value ^ ";\n"
+      (match compound_rhs_suffix (Field (Deref base, field)) value with
+      | Some (op, rhs) ->
+          indent indent_level ^ postfix_receiver_to_c base ^ "->" ^ field ^ " "
+          ^ op ^ " " ^ expr_to_c rhs ^ ";\n"
+      | None ->
+          indent indent_level ^ postfix_receiver_to_c base ^ "->" ^ field ^ " = "
+          ^ expr_to_c value ^ ";\n")
   | FieldAssign (base, field, value) ->
-      indent indent_level ^ postfix_receiver_to_c base ^ "." ^ field ^ " = "
-      ^ expr_to_c value ^ ";\n"
+      (match compound_rhs_suffix (Field (base, field)) value with
+      | Some (op, rhs) ->
+          indent indent_level ^ postfix_receiver_to_c base ^ "." ^ field ^ " "
+          ^ op ^ " " ^ expr_to_c rhs ^ ";\n"
+      | None ->
+          indent indent_level ^ postfix_receiver_to_c base ^ "." ^ field ^ " = "
+          ^ expr_to_c value ^ ";\n")
   | Seq ss ->
       String.concat ""
         (List.map (stmt_to_c ~indent_level ~return_type) ss)

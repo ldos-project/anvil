@@ -55,6 +55,8 @@ rule read = parse
   | "||"                { OR }
   | "::"                { SCOPE }
   | "->"                { ARROW }
+  | "+="                { PLUSEQ }
+  | "-="                { MINUSEQ }
   | "=="                { EQEQ }
   | "!="                { NEQ }
   | "<="                { LE }

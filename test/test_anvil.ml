@@ -727,6 +727,59 @@ let assert_record_roundtrip_and_verification () =
             ("Expected record example to verify, got:\n"
             ^ Verify.format_outcome outcome))
 
+let assert_compound_assignment_roundtrip () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n"
+    ^ "#include <stdbool.h>\n\n"
+    ^ "struct Counter {\n"
+    ^ "  int value;\n"
+    ^ "};\n\n"
+    ^ "int x;\n"
+    ^ "int xs[2];\n"
+    ^ "int *p;\n"
+    ^ "struct Counter c;\n"
+    ^ "struct Counter *cp;\n\n"
+    ^ "int main(void) {\n"
+    ^ "  p = &x;\n"
+    ^ "  cp = &c;\n"
+    ^ "  x += 1;\n"
+    ^ "  x -= 2;\n"
+    ^ "  xs[0] += 3;\n"
+    ^ "  xs[1] -= 4;\n"
+    ^ "  c.value += 5;\n"
+    ^ "  cp->value -= 6;\n"
+    ^ "  *p += 7;\n"
+    ^ "  *p -= 8;\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Compound assignment parse failed: " ^ e)
+  | Ok program ->
+      let desugared = program_to_c program in
+      if not (String.is_substring desugared ~substring:"x += 1;") then
+        failwith "Expected variable `+=` to roundtrip through the pretty-printer";
+      if not (String.is_substring desugared ~substring:"x -= 2;") then
+        failwith "Expected variable `-=` to roundtrip through the pretty-printer";
+      if not (String.is_substring desugared ~substring:"xs[0] += 3;") then
+        failwith "Expected array `+=` to roundtrip through the pretty-printer";
+      if not (String.is_substring desugared ~substring:"xs[1] -= 4;") then
+        failwith "Expected array `-=` to roundtrip through the pretty-printer";
+      if not (String.is_substring desugared ~substring:"c.value += 5;") then
+        failwith "Expected field `+=` to roundtrip through the pretty-printer";
+      if not (String.is_substring desugared ~substring:"cp->value -= 6;") then
+        failwith "Expected arrow-field `-=` to roundtrip through the pretty-printer";
+      if not (String.is_substring desugared ~substring:"*p += 7;") then
+        failwith "Expected dereference `+=` to roundtrip through the pretty-printer";
+      if not (String.is_substring desugared ~substring:"*p -= 8;") then
+        failwith "Expected dereference `-=` to roundtrip through the pretty-printer";
+      (match parse_program desugared with
+      | Error e -> failwith ("Compound assignment roundtrip failed: " ^ e)
+      | Ok roundtripped ->
+          if not (equal_program program roundtripped) then
+            failwith "Compound assignment roundtrip mismatch")
+
 let assert_class_desugaring_roundtrip_and_verification () =
   let source =
     "#include <stdlib.h>\n"
@@ -1112,6 +1165,7 @@ let () =
   assert_array_roundtrip_and_verification ();
   assert_array_out_of_bounds_reports_counterexample ();
   assert_record_roundtrip_and_verification ();
+  assert_compound_assignment_roundtrip ();
   assert_class_desugaring_roundtrip_and_verification ();
   assert_namespace_resolution_roundtrip_and_verification ();
   assert_namespaced_class_desugaring_roundtrip_and_verification ();

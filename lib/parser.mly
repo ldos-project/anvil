@@ -108,6 +108,12 @@ let assignment_stmt lhs rhs =
   | _ ->
       fail "unsupported assignment target `%s`" (expr_to_c lhs)
 
+let compound_assignment_stmt combine lhs rhs =
+  assignment_stmt lhs (combine lhs rhs)
+
+let compound_store_stmt combine ptr rhs =
+  Store (ptr, combine (Deref ptr) rhs)
+
 let call_stmt name args =
   expect_abort name;
   if args <> [] then
@@ -205,7 +211,7 @@ let build_program items =
 %token INT_KW FLOAT_KW DOUBLE_KW CHAR_KW BOOL_KW MAIN_KW VOID_KW STRUCT_KW CLASS_KW NAMESPACE_KW IF_KW ELSE_KW WHILE_KW RETURN_KW FREE_KW TRUE_KW FALSE_KW
 %token LPAREN RPAREN LBRACE RBRACE LBRACKET RBRACKET SEMI COMMA AMP DOT ARROW SCOPE
 %token PLUS MINUS STAR SLASH PERCENT
-%token ASSIGN EQEQ NEQ LT LE GT GE NOT AND OR
+%token ASSIGN PLUSEQ MINUSEQ EQEQ NEQ LT LE GT GE NOT AND OR
 %token EOF
 
 %start <Ast.program> program
@@ -664,8 +670,16 @@ stmt:
       { tail stars name }
   | lhs = postfix_expr ASSIGN rhs = expr SEMI
       { assignment_stmt lhs rhs }
+  | lhs = postfix_expr PLUSEQ rhs = expr SEMI
+      { compound_assignment_stmt (fun left right -> Add (left, right)) lhs rhs }
+  | lhs = postfix_expr MINUSEQ rhs = expr SEMI
+      { compound_assignment_stmt (fun left right -> Sub (left, right)) lhs rhs }
   | STAR lhs = expr ASSIGN rhs = expr SEMI
       { Store (lhs, rhs) }
+  | STAR lhs = expr PLUSEQ rhs = expr SEMI
+      { compound_store_stmt (fun left right -> Add (left, right)) lhs rhs }
+  | STAR lhs = expr MINUSEQ rhs = expr SEMI
+      { compound_store_stmt (fun left right -> Sub (left, right)) lhs rhs }
   | name = qualified_ident LPAREN args = separated_list(COMMA, expr) RPAREN SEMI
       { call_stmt name args }
   | RETURN_KW value = option(expr) SEMI
