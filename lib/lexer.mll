@@ -39,6 +39,7 @@ rule read = parse
   | "double"            { DOUBLE_KW }
   | "char"              { CHAR_KW }
   | "bool"              { BOOL_KW }
+  | "const"             { CONST_KW }
   | "struct"            { STRUCT_KW }
   | "class"             { CLASS_KW }
   | "namespace"         { NAMESPACE_KW }

@@ -12,6 +12,8 @@ type c_type =
   | TRecord of string
   | TPointer of c_type
   | TArray of c_type * int
+  | TReference of c_type
+  | TConstReference of c_type
 
 type field_def = {
   field_type : c_type;
@@ -202,6 +204,10 @@ let rec overload_type_component = function
   | TPointer inner -> overload_type_component inner ^ "_ptr"
   | TArray (inner, size) ->
       Printf.sprintf "%s_array_%d" (overload_type_component inner) size
+  | TReference inner ->
+      overload_type_component inner ^ "_ref"
+  | TConstReference inner ->
+      overload_type_component inner ^ "_const_ref"
 
 let overload_suffix_of_params params =
   let components =
@@ -310,6 +316,8 @@ let rec c_type_to_c = function
   | TPointer inner -> c_type_to_c inner ^ "*"
   | TArray (inner, size) ->
       Printf.sprintf "%s[%d]" (c_type_to_c inner) size
+  | TReference inner -> c_type_to_c inner ^ "&"
+  | TConstReference inner -> "const " ^ c_type_to_c inner ^ "&"
 
 let type_with_name_to_c c_type name =
   match c_type with
@@ -323,41 +331,81 @@ let global_names globals =
 
 let is_pointer_type = function
   | TPointer _ -> true
-  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TArray _ -> false
+  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TArray _
+  | TReference _ | TConstReference _ ->
+      false
+
+let is_reference_type = function
+  | TReference _ | TConstReference _ -> true
+  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TPointer _ | TArray _ ->
+      false
+
+let is_const_reference_type = function
+  | TConstReference _ -> true
+  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TPointer _ | TArray _
+  | TReference _ ->
+      false
+
+let reference_inner_type = function
+  | TReference inner | TConstReference inner -> Some inner
+  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TPointer _ | TArray _ ->
+      None
+
+let strip_reference_type = function
+  | TReference inner | TConstReference inner -> inner
+  | c_type -> c_type
+
+let lower_reference_type = function
+  | TReference inner | TConstReference inner -> TPointer inner
+  | c_type -> c_type
 
 let pointer_base_type = function
   | TPointer inner -> Some inner
-  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TArray _ -> None
+  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TArray _
+  | TReference _ | TConstReference _ ->
+      None
 
 let pointer_object_byte_size = 8
 
 let is_array_type = function
   | TArray _ -> true
-  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TPointer _ -> false
+  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TPointer _
+  | TReference _ | TConstReference _ ->
+      false
 
 let array_element_type = function
   | TArray (inner, _) -> Some inner
-  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TPointer _ -> None
+  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TPointer _
+  | TReference _ | TConstReference _ ->
+      None
 
 let array_length = function
   | TArray (_, length) -> Some length
-  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TPointer _ -> None
+  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TPointer _
+  | TReference _ | TConstReference _ ->
+      None
 
 let is_record_type = function
   | TRecord _ -> true
-  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TPointer _ | TArray _ -> false
+  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TPointer _ | TArray _
+  | TReference _ | TConstReference _ ->
+      false
 
 let is_real_type = function
   | TFloat | TDouble -> true
-  | TInt | TChar | TBool | TVoid | TRecord _ | TPointer _ | TArray _ -> false
+  | TInt | TChar | TBool | TVoid | TRecord _ | TPointer _ | TArray _
+  | TReference _ | TConstReference _ ->
+      false
 
 let is_integer_like_type = function
   | TInt | TChar | TBool -> true
-  | TFloat | TDouble | TVoid | TRecord _ | TPointer _ | TArray _ -> false
+  | TFloat | TDouble | TVoid | TRecord _ | TPointer _ | TArray _
+  | TReference _ | TConstReference _ ->
+      false
 
 let is_scalar_type = function
   | TInt | TFloat | TDouble | TChar | TBool -> true
-  | TVoid | TRecord _ | TPointer _ | TArray _ -> false
+  | TVoid | TRecord _ | TPointer _ | TArray _ | TReference _ | TConstReference _ -> false
 
 let lookup_record records name =
   List.find_opt (fun record -> String.equal record.record_name name) records
@@ -390,6 +438,8 @@ let rec c_type_object_byte_size records = function
   | TVoid -> failwith "void has no object byte size"
   | TPointer _ -> pointer_object_byte_size
   | TArray (inner, size) -> size * c_type_object_byte_size records inner
+  | TReference _ | TConstReference _ ->
+      failwith "reference types should be lowered before object-size queries"
 
 let record_field_offset records record_name field_name =
   match lookup_record records record_name with
@@ -424,7 +474,8 @@ let load_helper_name = function
   | TDouble -> "__anvil_load_double"
   | TChar -> "__anvil_load_char"
   | TBool -> "__anvil_load_bool"
-  | TVoid | TRecord _ | TPointer _ | TArray _ -> failwith "unsupported helper load type"
+  | TVoid | TRecord _ | TPointer _ | TArray _ | TReference _ | TConstReference _ ->
+      failwith "unsupported helper load type"
 
 let load_ptr_block_helper_name = "__anvil_load_ptr_block"
 
@@ -591,6 +642,8 @@ let zero_literal_for_type = function
   | TRecord _ -> failwith "record values do not have a zero literal"
   | TPointer _ -> "0"
   | TArray _ -> failwith "array does not have a zero literal"
+  | TReference _ | TConstReference _ ->
+      failwith "reference values do not have a zero literal"
 
 let assume_fallback_to_c = function
   | TVoid -> "return;"

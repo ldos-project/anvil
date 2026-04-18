@@ -1132,6 +1132,8 @@ let assert_typed_memory_examples_verify () =
     ; "memory_safe_char_expression.c"
     ; "memory_safe_bool_expression.c"
     ; "memory_safe_array_expression.c"
+    ; "memory_safe_address_of_global_deref.c"
+    ; "memory_safe_null_free.c"
     ; "memory_safe_record_expression.c"
     ; "record_pointer_field_deref.c"
     ]
@@ -1145,8 +1147,103 @@ let assert_typed_memory_negative_examples_fail () =
     ; "memory_unsafe_char_out_of_bounds.c"
     ; "memory_unsafe_bool_out_of_bounds.c"
     ; "memory_unsafe_array_out_of_bounds.c"
+    ; "memory_unsafe_address_of_out_of_bounds.c"
+    ; "memory_unsafe_dangling_load.c"
     ]
     ~f:assert_example_file_reports_counterexample
+
+let assert_reference_roundtrip_and_verification () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n\n"
+    ^ "int x;\n\n"
+    ^ "int inc(int& y) {\n"
+    ^ "  y += 1;\n"
+    ^ "  return 0;\n"
+    ^ "}\n\n"
+    ^ "int readback(const int& y) {\n"
+    ^ "  return y;\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  x = 0;\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Reference parse failed: " ^ e)
+  | Ok program ->
+      (match parse_program (program_to_c program) with
+      | Error e -> failwith ("Reference roundtrip failed: " ^ e)
+      | Ok roundtripped ->
+          if not (equal_program program roundtripped) then
+            failwith "Reference roundtrip mismatch");
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Reference verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected reference example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_const_reference_write_rejected () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n\n"
+    ^ "int bad(const int& x) {\n"
+    ^ "  x = 1;\n"
+    ^ "  return x;\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Const-reference rejection parse failed: " ^ e)
+  | Ok program ->
+      (match Instrument.instrument_program program with
+      | Error e ->
+          if not (String.is_substring e ~substring:"const reference") then
+            failwith ("Expected const-reference error, got: " ^ e)
+      | Ok instrumented ->
+          failwith
+            ("Expected const-reference write to be rejected, got:\n"
+            ^ program_to_c instrumented))
+
+let assert_reference_header_import_roundtrip () =
+  let header_path = Stdlib.Filename.temp_file "anvil_ref_contracts" ".h" in
+  Fun.protect
+    ~finally:(fun () ->
+      try Stdlib.Sys.remove header_path with
+      | _ -> ())
+    (fun () ->
+      Out_channel.write_all header_path
+        ~data:
+          "/* @Require x >= 0\n\
+           * @Guarantee result >= x\n\
+           * @Safety x >= 0\n\
+           */\n\
+           int clamp_nonneg(const int& x);\n";
+      let base_dir = Stdlib.Filename.dirname header_path in
+      let include_name = Stdlib.Filename.basename header_path in
+      let source =
+        "#include \"" ^ include_name ^ "\"\n"
+        ^ "#include <stdlib.h>\n"
+        ^ "#include <stdio.h>\n\n"
+        ^ "int x;\n\n"
+        ^ "int main(void) {\n"
+        ^ "  x = 1;\n"
+        ^ "  if (!(clamp_nonneg(x) >= x)) { abort(); }\n"
+        ^ "  return 0;\n"
+        ^ "}\n"
+      in
+      match parse_program ~base_dir source with
+      | Error e -> failwith ("Reference header import parse failed: " ^ e)
+      | Ok program ->
+          (match parse_program ~base_dir (program_to_c program) with
+          | Error e -> failwith ("Reference header import roundtrip failed: " ^ e)
+          | Ok roundtripped ->
+              if not (equal_program program roundtripped) then
+                failwith "Reference header import roundtrip mismatch"))
 
 let () =
   assert_header_import_roundtrip ();
@@ -1173,6 +1270,9 @@ let () =
   assert_method_overloading_roundtrip_and_verification ();
   assert_typed_memory_examples_verify ();
   assert_typed_memory_negative_examples_fail ();
+  assert_reference_roundtrip_and_verification ();
+  assert_const_reference_write_rejected ();
+  assert_reference_header_import_roundtrip ();
   Quickcheck.test
     ~trials:300
     ~sexp_of:(fun _ -> Sexp.Atom "program")

@@ -100,10 +100,12 @@ let sort_of_c_type = function
   | TRecord _ -> failwith "record values should be lowered before SMT translation"
   | TArray _ -> failwith "array values should be lowered before SMT translation"
   | TVoid -> failwith "void cannot appear in SMT expressions"
+  | TReference _ | TConstReference _ ->
+      failwith "reference values should be lowered before SMT translation"
 
 let is_queryable_type = function
   | TInt | TFloat | TDouble | TChar | TBool | TPointer _ -> true
-  | TVoid | TRecord _ | TArray _ -> false
+  | TVoid | TRecord _ | TArray _ | TReference _ | TConstReference _ -> false
 
 let helper_signature = function
   | "__anvil_load_int" -> Some ([ Ir.Int; Ir.Int ], TInt)

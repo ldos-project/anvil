@@ -214,6 +214,11 @@ let bind_params
     match params, args with
     | [], [] -> Ok (List.rev bindings)
     | param :: rest_params, arg :: rest_args ->
+        let arg =
+          match param.param_type with
+          | TReference _ | TConstReference _ -> Deref arg
+          | _ -> arg
+        in
         let bindings =
           match param.param_name with
           | None -> bindings
@@ -235,10 +240,15 @@ let bind_definition_params
     match contract_params, params with
     | [], [] -> Ok (List.rev bindings)
     | contract_param :: rest_contract, param :: rest_params ->
+        let bound_expr param_name =
+          match contract_param.param_type with
+          | TReference _ | TConstReference _ -> Deref (Var param_name)
+          | _ -> Var param_name
+        in
         let bindings =
           match contract_param.param_name, param.param_name with
           | Some contract_name, Some param_name ->
-              (contract_name, Var param_name) :: bindings
+              (contract_name, bound_expr param_name) :: bindings
           | _ -> bindings
         in
         loop rest_contract rest_params bindings
@@ -290,8 +300,12 @@ let param_types params =
 let compatible_signature
     (fn : function_def)
     (contract_fn : contracted_function) =
+  let expected_param_types =
+    contract_fn.params
+    |> List.map (fun (param : param) -> lower_reference_type param.param_type)
+  in
   fn.return_type = contract_fn.return_type
-  && param_types fn.params = param_types contract_fn.params
+  && param_types fn.params = expected_param_types
 
 let effective_contract
     (env : (string * contracted_function) list)
@@ -363,8 +377,19 @@ let rec instrument_expr
   match expr with
   | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ | Var _ ->
       Ok ([], expr, state)
-  | AddrOf _ | Index _ | Deref _ | Field _ ->
-      Error "memory expressions should be lowered before contract instrumentation"
+  | AddrOf inner ->
+      let* prefix, inner, state = instrument_expr memory_env env state inner in
+      Ok (prefix, AddrOf inner, state)
+  | Index (base, index) ->
+      let* base_prefix, base, state = instrument_expr memory_env env state base in
+      let* index_prefix, index, state = instrument_expr memory_env env state index in
+      Ok (base_prefix @ index_prefix, Index (base, index), state)
+  | Deref inner ->
+      let* prefix, inner, state = instrument_expr memory_env env state inner in
+      Ok (prefix, Deref inner, state)
+  | Field (base, field) ->
+      let* prefix, base, state = instrument_expr memory_env env state base in
+      Ok (prefix, Field (base, field), state)
   | Add (left, right) ->
       instrument_binary_expr memory_env env state left right (fun l r -> Add (l, r))
   | Sub (left, right) ->
@@ -496,8 +521,44 @@ and instrument_stmt
       | Some current ->
           let* stmt = append_safety_assert current (prefix @ [ Assign (name, expr) ]) in
           Ok (stmt, state))
-  | Store _ | ArrayAssign _ | FieldAssign _ | Free _ ->
-      Error "memory statements should be lowered before contract instrumentation"
+  | Store (ptr, value) ->
+      let* ptr_prefix, ptr, state = instrument_expr memory_env env state ptr in
+      let* value_prefix, value, state = instrument_expr memory_env env state value in
+      (match current_contract with
+      | None -> Ok (seq_of_list (ptr_prefix @ value_prefix @ [ Store (ptr, value) ]), state)
+      | Some current ->
+          let* stmt =
+            append_safety_assert current (ptr_prefix @ value_prefix @ [ Store (ptr, value) ])
+          in
+          Ok (stmt, state))
+  | ArrayAssign (base, index, value) ->
+      let* base_prefix, base, state = instrument_expr memory_env env state base in
+      let* index_prefix, index, state = instrument_expr memory_env env state index in
+      let* value_prefix, value, state = instrument_expr memory_env env state value in
+      (match current_contract with
+      | None ->
+          Ok
+            ( seq_of_list
+                (base_prefix @ index_prefix @ value_prefix @ [ ArrayAssign (base, index, value) ])
+            , state )
+      | Some current ->
+          let* stmt =
+            append_safety_assert current
+              (base_prefix @ index_prefix @ value_prefix @ [ ArrayAssign (base, index, value) ])
+          in
+          Ok (stmt, state))
+  | FieldAssign (base, field, value) ->
+      let* base_prefix, base, state = instrument_expr memory_env env state base in
+      let* value_prefix, value, state = instrument_expr memory_env env state value in
+      (match current_contract with
+      | None ->
+          Ok (seq_of_list (base_prefix @ value_prefix @ [ FieldAssign (base, field, value) ]), state)
+      | Some current ->
+          let* stmt =
+            append_safety_assert current
+              (base_prefix @ value_prefix @ [ FieldAssign (base, field, value) ])
+          in
+          Ok (stmt, state))
   | Assume cond ->
       let* prefix, cond, state = instrument_bexpr memory_env env state cond in
       (match current_contract with
@@ -578,6 +639,13 @@ and instrument_stmt
         | Some current ->
             let* stmt = append_safety_assert current [ While (invariant, cond, body) ] in
             Ok (stmt, state))
+  | Free ptr ->
+      let* prefix, ptr, state = instrument_expr memory_env env state ptr in
+      (match current_contract with
+      | None -> Ok (seq_of_list (prefix @ [ Free ptr ]), state)
+      | Some current ->
+          let* stmt = append_safety_assert current (prefix @ [ Free ptr ]) in
+          Ok (stmt, state))
 
 and instrument_expr_comparison
     (memory_env : Memory_safety.contract_env)
@@ -606,10 +674,14 @@ and instrument_stmt_list
       Ok (stmt :: rest, state)
 
 let instrument_function
+    (program : program)
     (memory_env : Memory_safety.contract_env)
     (env : (string * contracted_function) list)
     state
     (fn : function_def) =
+  let memory_env =
+    Memory_safety.function_env_of_program program fn memory_env.malloc_sites
+  in
   let* contract = effective_contract env fn in
   match contract with
   | None ->
@@ -640,28 +712,39 @@ let instrument_function
       in
       Ok ({ fn with body }, state)
 
-let rec instrument_functions memory_env env state functions =
+let rec instrument_functions_for_program program memory_env env state functions =
   match functions with
   | [] -> Ok ([], state)
   | fn :: rest ->
-      let* fn, state = instrument_function memory_env env state fn in
-      let* rest, state = instrument_functions memory_env env state rest in
+      let* fn, state = instrument_function program memory_env env state fn in
+      let* rest, state =
+        instrument_functions_for_program program memory_env env state rest
+      in
       Ok (fn :: rest, state)
 
 let instrument_program program =
-  let memory_env = Memory_safety.contract_env_of_program program in
-  let* program = Memory_safety.lower_program program in
   let* env =
     build_contract_env program.imports (program.functions @ [ program.main ])
   in
+  let* program = Memory_safety.lower_references_program program in
+  let memory_env = Memory_safety.contract_env_of_program program in
   let* functions, state =
-    instrument_functions memory_env env (make_state program) program.functions
+    instrument_functions_for_program
+      program
+      memory_env
+      env
+      (make_state program)
+      program.functions
   in
-  let* main, state = instrument_function memory_env env state program.main in
-  Ok
+  let* main, state =
+    instrument_function program memory_env env state program.main
+  in
+  let instrumented =
     {
       program with
       globals = program.globals @ List.rev state.fresh_globals_rev;
       functions;
       main;
     }
+  in
+  Memory_safety.lower_program instrumented

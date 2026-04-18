@@ -197,6 +197,46 @@ This is still static dispatch, not a full virtual-method runtime:
 - no late-bound virtual dispatch
 - no implicit numeric conversions during overload selection
 
+## References
+
+Anvil supports a small C++-style reference fragment for function and method parameters:
+
+- `T&`
+- `const T&`
+
+The current surface support is intentionally narrow:
+
+- references are supported in parameters, not in returns, globals, locals, or fields;
+- `T` must currently be a scalar type or a record type; and
+- temporary lifetime extension is not modeled, so a reference argument must be an addressable lvalue.
+
+Operationally, references are front-end syntax only.
+Before the ordinary memory lowering pass runs:
+
+- `T& x` is rewritten to a pointer parameter `T* x`;
+- `const T& x` is rewritten to the same pointer representation, but treated as read-only at direct write sites;
+- reading `x` is rewritten to `*x`;
+- assigning `x = e` is rewritten to a store through that pointer; and
+- taking `&x` reuses the underlying pointer alias instead of creating a separate reference cell.
+
+This means reference uses inherit the same side conditions as the pointer model:
+
+- every read through `x` or `x.f` must satisfy the same modeled read-validity check as a dereference;
+- every direct write through `x` or `x.f` must satisfy the same modeled write-validity check as a pointer store; and
+- passing an argument to a reference parameter requires a syntactic lvalue so Anvil can materialize an address for it.
+
+For `const T&`, Anvil currently rejects direct writes through that alias:
+
+- `x = e`
+- `x.f = e`
+- passing that same alias to a mutable `T&` parameter
+
+This is a lightweight alias discipline rather than full C++ cv-qualification.
+In particular:
+
+- writes through other aliases remain possible; and
+- if a const-referenced record contains a pointer-valued field, writing through the pointee of that field is treated as a separate pointer effect rather than as a direct write to the record.
+
 ## Ghost Heap Interface
 
 Memory reasoning in Anvil is contract-driven rather than automatic.
@@ -436,6 +476,8 @@ For example, a contracted local function call becomes a sequence like:
 
 - Pointer safety support is currently a proof-of-concept for global scalar pointers.
 - Pointer parameters and pointer return values in function definitions are currently unsupported.
+- Reference parameters are supported, but only for scalar and record types.
+- Contracts may mention reference parameters, but post-state reasoning about an arbitrary referenced cell is still limited by the current shadow-memory model.
 - Address-of is only supported for scalar globals.
 - Memory safety is opt-in through contracts such as `@Safety heap_ok()`. Pointer operations alone do not add user-visible proof obligations.
 - Memory contents are not modeled precisely yet: loads become uninterpreted values, while the ghost-heap predicates cover bounds, liveness, null, and invalid free conditions.

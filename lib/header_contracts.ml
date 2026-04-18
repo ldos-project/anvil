@@ -61,37 +61,63 @@ let rec pointer_type base = function
   | 0 -> base
   | depth -> TPointer (pointer_type base (depth - 1))
 
+let is_qualified_ident text =
+  let is_ident segment =
+    segment <> ""
+    && String.for_all
+         (function
+           | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' -> true
+           | _ -> false)
+         segment
+  in
+  split_on_substring ~sep:"::" text |> List.for_all is_ident
+
 let parse_c_type text =
   let compact = compact_no_space text in
-  let parse_base base_name base_type =
-    let base_len = String.length base_name in
-    if starts_with ~prefix:base_name compact then
-      let rest =
-        String.sub compact base_len (String.length compact - base_len)
-      in
-      if String.for_all (fun c -> c = '*') rest then
-        Some (pointer_type base_type (String.length rest))
-      else None
-    else None
+  let strip_trailing_char ch text =
+    let rec loop count index =
+      if index >= 0 && text.[index] = ch then
+        loop (count + 1) (index - 1)
+      else
+        count, String.sub text 0 (index + 1)
+    in
+    loop 0 (String.length text - 1)
   in
-  match parse_base "int" TInt with
-  | Some t -> t
-  | None ->
-      (match parse_base "float" TFloat with
-      | Some t -> t
-      | None ->
-          (match parse_base "double" TDouble with
-          | Some t -> t
-          | None ->
-              (match parse_base "char" TChar with
-              | Some t -> t
-              | None ->
-                  (match parse_base "bool" TBool with
-                  | Some t -> t
-                  | None ->
-                      (match parse_base "void" TVoid with
-                      | Some t -> t
-                      | None -> fail "unsupported C type `%s`" text)))))
+  let is_const, compact =
+    if starts_with ~prefix:"const" compact then
+      true, String.sub compact 5 (String.length compact - 5)
+    else
+      false, compact
+  in
+  let ref_count, compact = strip_trailing_char '&' compact in
+  if ref_count > 1 then
+    fail "unsupported reference type `%s`" text;
+  let star_count, compact = strip_trailing_char '*' compact in
+  let base =
+    match compact with
+    | "int" -> TInt
+    | "float" -> TFloat
+    | "double" -> TDouble
+    | "char" -> TChar
+    | "bool" -> TBool
+    | "void" -> TVoid
+    | _ when starts_with ~prefix:"struct" compact ->
+        let name = String.sub compact 6 (String.length compact - 6) in
+        if name = "" then fail "unsupported C type `%s`" text else TRecord name
+    | _ when is_qualified_ident compact ->
+        TRecord compact
+    | _ ->
+        fail "unsupported C type `%s`" text
+  in
+  let base = pointer_type base star_count in
+  match is_const, ref_count with
+  | false, 0 -> base
+  | false, 1 -> TReference base
+  | true, 1 -> TConstReference base
+  | true, 0 ->
+      fail "only const references are supported in header contracts, got `%s`" text
+  | _ ->
+      fail "unsupported C type `%s`" text
 
 let split_last_identifier text =
   let trimmed = String.trim text in
@@ -254,6 +280,11 @@ let parse_prototype ~header_path ~line_number ~contract decl =
     | _ ->
         fail "unsupported function declaration in %s at line %d" header_path line_number
   in
+  if is_reference_type return_type then
+    fail
+      "reference return types are unsupported in %s at line %d"
+      header_path
+      line_number;
   {
     name;
     return_type;

@@ -59,6 +59,8 @@ let scalar_byte_size = function
   | TRecord _ -> failwith "record is not a scalar byte-sized type"
   | TPointer _ -> failwith "pointer byte size is not modeled directly"
   | TArray _ -> failwith "array is not a scalar byte-sized type"
+  | TReference _ | TConstReference _ ->
+      failwith "reference types should be lowered before byte-size queries"
 
 let scalar_byte_size_expr c_type =
   Int (scalar_byte_size c_type)
@@ -274,6 +276,382 @@ let function_mentions_memory_contract fn =
 
 let imported_function_mentions_memory_contract (fn : contracted_function) =
   contract_mentions_memory_predicates fn.contract
+
+type reference_binding = {
+  inner_type : c_type;
+  is_const : bool;
+}
+
+type reference_lower_env = {
+  reference_bindings : (var * reference_binding) list;
+  function_params : (func_name * c_type list) list;
+}
+
+let supported_reference_inner_type = function
+  | TInt | TFloat | TDouble | TChar | TBool | TRecord _ -> true
+  | TVoid | TPointer _ | TArray _ | TReference _ | TConstReference _ -> false
+
+let lower_reference_param_type = function
+  | TReference inner | TConstReference inner ->
+      if supported_reference_inner_type inner then
+        Ok (TPointer inner)
+      else
+        fail
+          "unsupported reference type `%s`; only scalar and record references are supported"
+          (c_type_to_c (TReference inner))
+  | c_type ->
+      Ok c_type
+
+let lower_reference_param (param : param) =
+  let* param_type = lower_reference_param_type param.param_type in
+  Ok { param with param_type }
+
+let reference_binding_of_param (param : param) =
+  match param.param_type, param.param_name with
+  | TReference inner, Some name ->
+      Some (name, { inner_type = inner; is_const = false })
+  | TConstReference inner, Some name ->
+      Some (name, { inner_type = inner; is_const = true })
+  | (TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TPointer _ | TArray _), _
+    ->
+      None
+  | (TReference _ | TConstReference _), None ->
+      None
+
+let build_reference_function_params (program : program) =
+  let imported =
+    List.concat_map
+      (fun (header : header_import) -> header.functions)
+      program.imports
+    |> List.map (fun (fn : contracted_function) ->
+           fn.name, List.map (fun param -> param.param_type) fn.params)
+  in
+  let locals =
+    List.map
+      (fun (fn : function_def) ->
+        fn.name, List.map (fun param -> param.param_type) fn.params)
+      (program.functions @ [ program.main ])
+  in
+  imported @ locals
+
+let lookup_reference_binding env name =
+  assoc_opt name env.reference_bindings
+
+let lookup_reference_function_params env name =
+  assoc_opt name env.function_params
+
+let is_reference_var env name =
+  Option.is_some (lookup_reference_binding env name)
+
+let is_const_reference_var env name =
+  match lookup_reference_binding env name with
+  | Some binding -> binding.is_const
+  | None -> false
+
+let expr_is_addressable = function
+  | Var _ | Field _ | Index _ | Deref _ -> true
+  | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ | AddrOf _ | Add _ | Sub _
+  | Mul _ | Div _ | Mod _ | FuncCall _ ->
+      false
+
+let rec direct_const_reference_lvalue env = function
+  | Var name -> is_const_reference_var env name
+  | Field (base, _) -> direct_const_reference_lvalue env base
+  | Index (base, _) -> direct_const_reference_lvalue env base
+  | Deref _ -> false
+  | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ | AddrOf _ | Add _ | Sub _
+  | Mul _ | Div _ | Mod _ | FuncCall _ ->
+      false
+
+let rec lower_reference_addressable_expr env = function
+  | Var name when is_reference_var env name ->
+      Ok (Deref (Var name))
+  | Var name ->
+      Ok (Var name)
+  | Field (base, field) ->
+      let* base = lower_reference_expr env base in
+      Ok (Field (base, field))
+  | Index (base, index) ->
+      let* base = lower_reference_expr env base in
+      let* index = lower_reference_expr env index in
+      Ok (Index (base, index))
+  | Deref expr ->
+      let* expr = lower_reference_expr env expr in
+      Ok (Deref expr)
+  | expr ->
+      fail "non-addressable expression `%s` cannot be bound to a reference" (expr_to_c expr)
+
+and lower_reference_arg env param_type arg =
+  match param_type with
+  | TReference inner ->
+      if direct_const_reference_lvalue env arg then
+        fail
+          "cannot bind mutable reference `%s` to const reference expression `%s`"
+          (c_type_to_c (TReference inner))
+          (expr_to_c arg)
+      else
+        lower_reference_binding_arg env arg
+  | TConstReference _ ->
+      lower_reference_binding_arg env arg
+  | _ ->
+      lower_reference_expr env arg
+
+and lower_reference_binding_arg env arg =
+  match arg with
+  | Var name when is_reference_var env name ->
+      Ok (Var name)
+  | _ when expr_is_addressable arg ->
+      let* arg = lower_reference_addressable_expr env arg in
+      Ok (AddrOf arg)
+  | _ ->
+      fail
+        "reference arguments must be addressable lvalues; temporary `%s` is unsupported"
+        (expr_to_c arg)
+
+and lower_reference_call env name args =
+  match lookup_reference_function_params env name with
+  | None ->
+      let* args = lower_reference_expr_list env args in
+      Ok (FuncCall (name, args))
+  | Some param_types ->
+      let rec loop param_types args =
+        match param_types, args with
+        | [], [] ->
+            Ok []
+        | param_type :: rest_params, arg :: rest_args ->
+            let* arg = lower_reference_arg env param_type arg in
+            let* rest = loop rest_params rest_args in
+            Ok (arg :: rest)
+        | _, _ ->
+            fail "arity mismatch while lowering references for `%s`" name
+      in
+      let* args = loop param_types args in
+      Ok (FuncCall (name, args))
+
+and lower_reference_expr env = function
+  | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ as expr ->
+      Ok expr
+  | Var name when is_reference_var env name ->
+      Ok (Deref (Var name))
+  | Var name ->
+      Ok (Var name)
+  | AddrOf (Var name) when is_reference_var env name ->
+      Ok (Var name)
+  | AddrOf expr ->
+      let* expr = lower_reference_addressable_expr env expr in
+      Ok (AddrOf expr)
+  | Index (base, index) ->
+      let* base = lower_reference_expr env base in
+      let* index = lower_reference_expr env index in
+      Ok (Index (base, index))
+  | Deref expr ->
+      let* expr = lower_reference_expr env expr in
+      Ok (Deref expr)
+  | Field (base, field) ->
+      let* base = lower_reference_expr env base in
+      Ok (Field (base, field))
+  | Add (left, right) ->
+      let* left = lower_reference_expr env left in
+      let* right = lower_reference_expr env right in
+      Ok (Add (left, right))
+  | Sub (left, right) ->
+      let* left = lower_reference_expr env left in
+      let* right = lower_reference_expr env right in
+      Ok (Sub (left, right))
+  | Mul (left, right) ->
+      let* left = lower_reference_expr env left in
+      let* right = lower_reference_expr env right in
+      Ok (Mul (left, right))
+  | Div (left, right) ->
+      let* left = lower_reference_expr env left in
+      let* right = lower_reference_expr env right in
+      Ok (Div (left, right))
+  | Mod (left, right) ->
+      let* left = lower_reference_expr env left in
+      let* right = lower_reference_expr env right in
+      Ok (Mod (left, right))
+  | FuncCall (name, args) ->
+      lower_reference_call env name args
+
+and lower_reference_expr_list env = function
+  | [] -> Ok []
+  | expr :: rest ->
+      let* expr = lower_reference_expr env expr in
+      let* rest = lower_reference_expr_list env rest in
+      Ok (expr :: rest)
+
+let rec lower_reference_bexpr env = function
+  | True -> Ok True
+  | False -> Ok False
+  | Eq (left, right) ->
+      let* left = lower_reference_expr env left in
+      let* right = lower_reference_expr env right in
+      Ok (Eq (left, right))
+  | Neq (left, right) ->
+      let* left = lower_reference_expr env left in
+      let* right = lower_reference_expr env right in
+      Ok (Neq (left, right))
+  | Lt (left, right) ->
+      let* left = lower_reference_expr env left in
+      let* right = lower_reference_expr env right in
+      Ok (Lt (left, right))
+  | Le (left, right) ->
+      let* left = lower_reference_expr env left in
+      let* right = lower_reference_expr env right in
+      Ok (Le (left, right))
+  | Gt (left, right) ->
+      let* left = lower_reference_expr env left in
+      let* right = lower_reference_expr env right in
+      Ok (Gt (left, right))
+  | Ge (left, right) ->
+      let* left = lower_reference_expr env left in
+      let* right = lower_reference_expr env right in
+      Ok (Ge (left, right))
+  | Not inner ->
+      let* inner = lower_reference_bexpr env inner in
+      Ok (Not inner)
+  | And (left, right) ->
+      let* left = lower_reference_bexpr env left in
+      let* right = lower_reference_bexpr env right in
+      Ok (And (left, right))
+  | Or (left, right) ->
+      let* left = lower_reference_bexpr env left in
+      let* right = lower_reference_bexpr env right in
+      Ok (Or (left, right))
+
+let rec lower_reference_stmt env = function
+  | Skip -> Ok Skip
+  | Block _ | LocalDecl _ ->
+      fail "unresolved local syntax reached reference lowering"
+  | Assign (name, rhs) ->
+      let* rhs = lower_reference_expr env rhs in
+      (match lookup_reference_binding env name with
+      | Some { is_const = true; _ } ->
+          fail "cannot assign through const reference `%s`" name
+      | Some _ ->
+          Ok (Store (Var name, rhs))
+      | None ->
+          Ok (Assign (name, rhs)))
+  | Store (ptr, value) ->
+      let* ptr = lower_reference_expr env ptr in
+      let* value = lower_reference_expr env value in
+      Ok (Store (ptr, value))
+  | ArrayAssign (base, index, value) ->
+      let* base = lower_reference_expr env base in
+      let* index = lower_reference_expr env index in
+      let* value = lower_reference_expr env value in
+      Ok (ArrayAssign (base, index, value))
+  | FieldAssign (base, field, value) ->
+      if direct_const_reference_lvalue env base then
+        fail "cannot assign field `%s` through a const reference" field
+      else
+        let* base = lower_reference_expr env base in
+        let* value = lower_reference_expr env value in
+        Ok (FieldAssign (base, field, value))
+  | Seq stmts ->
+      let* stmts = lower_reference_stmt_list env stmts in
+      Ok (Seq stmts)
+  | If (cond, then_branch, else_branch) ->
+      let* cond = lower_reference_bexpr env cond in
+      let* then_branch = lower_reference_stmt env then_branch in
+      let* else_branch = lower_reference_stmt env else_branch in
+      Ok (If (cond, then_branch, else_branch))
+  | While (invariant, cond, body) ->
+      let* invariant =
+        match invariant with
+        | None -> Ok None
+        | Some invariant ->
+            let* invariant = lower_reference_bexpr env invariant in
+            Ok (Some invariant)
+      in
+      let* cond = lower_reference_bexpr env cond in
+      let* body = lower_reference_stmt env body in
+      Ok (While (invariant, cond, body))
+  | Assume cond ->
+      let* cond = lower_reference_bexpr env cond in
+      Ok (Assume cond)
+  | Assert (origin, cond) ->
+      let* cond = lower_reference_bexpr env cond in
+      Ok (Assert (origin, cond))
+  | Free ptr ->
+      let* ptr = lower_reference_expr env ptr in
+      Ok (Free ptr)
+  | Return value ->
+      let* value =
+        match value with
+        | None -> Ok None
+        | Some value ->
+            let* value = lower_reference_expr env value in
+            Ok (Some value)
+      in
+      Ok (Return value)
+
+and lower_reference_stmt_list env = function
+  | [] -> Ok []
+  | stmt :: rest ->
+      let* stmt = lower_reference_stmt env stmt in
+      let* rest = lower_reference_stmt_list env rest in
+      Ok (stmt :: rest)
+
+let lower_reference_function_params params =
+  let rec loop acc = function
+    | [] -> Ok (List.rev acc)
+    | param :: rest ->
+        let* param = lower_reference_param param in
+        loop (param :: acc) rest
+  in
+  loop [] params
+
+let lower_reference_function function_params (fn : function_def) =
+  if is_reference_type fn.return_type then
+    fail "reference return type in function `%s` is unsupported" fn.name
+  else
+    let env =
+      {
+        reference_bindings = List.filter_map reference_binding_of_param fn.params;
+        function_params;
+      }
+    in
+    let* params = lower_reference_function_params fn.params in
+    let* body = lower_reference_stmt env fn.body in
+    Ok { fn with params; body }
+
+let lower_reference_imported_function (fn : contracted_function) =
+  if is_reference_type fn.return_type then
+    fail "reference return type in imported function `%s` is unsupported" fn.name
+  else
+    let* params = lower_reference_function_params fn.params in
+    Ok { fn with params }
+
+let lower_reference_imports imports =
+  let rec loop_headers acc = function
+    | [] -> Ok (List.rev acc)
+    | (header : header_import) :: rest ->
+        let rec loop_functions (functions_acc : imported_function list) = function
+          | [] ->
+              loop_headers
+                ({ header with functions = List.rev functions_acc } :: acc)
+                rest
+          | (fn : imported_function) :: tail ->
+              let* fn = lower_reference_imported_function fn in
+              loop_functions (fn :: functions_acc) tail
+        in
+        loop_functions [] header.functions
+  in
+  loop_headers [] imports
+
+let lower_references_program (program : program) =
+  let function_params = build_reference_function_params program in
+  let* imports = lower_reference_imports program.imports in
+  let rec loop_functions acc = function
+    | [] -> Ok (List.rev acc)
+    | fn :: rest ->
+        let* fn = lower_reference_function function_params fn in
+        loop_functions (fn :: acc) rest
+  in
+  let* functions = loop_functions [] program.functions in
+  let* main = lower_reference_function function_params program.main in
+  Ok { program with imports; functions; main }
 
 let locals_need_memory locals =
   List.exists
@@ -537,7 +915,9 @@ let pointer_bindings_of_defs defs =
     (fun def ->
       match def.global_type with
       | TPointer inner -> Some (def.global_name, inner)
-      | TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TArray _ -> None)
+      | TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TArray _
+      | TReference _ | TConstReference _ ->
+          None)
     defs
 
 let pointer_bindings_of_params params =
@@ -546,7 +926,8 @@ let pointer_bindings_of_params params =
       match param.param_type, param.param_name with
       | TPointer inner, Some name -> Some (name, inner)
       | TPointer _, None -> None
-      | (TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TArray _), _ ->
+      | (TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TArray _
+        | TReference _ | TConstReference _), _ ->
           None)
     params
 
@@ -602,6 +983,8 @@ let lower_function_params (params : param list) =
         [ { param_type = TInt; param_name = Some (ptr_block_name name) }
         ; { param_type = TInt; param_name = Some (ptr_offset_name name) }
         ]
+    | (TReference _ | TConstReference _), _ ->
+        failwith "reference parameters should be lowered before memory lowering"
     | _, _ ->
         [ param ]
   in
@@ -912,6 +1295,8 @@ and lower_scalar_expr env state expr =
             fail "pointer-to-pointer indexing is unsupported in this proof-of-concept"
         | Some (TArray _) ->
             fail "nested array indexing is unsupported in this proof-of-concept"
+        | Some (TReference _) | Some (TConstReference _) ->
+            fail "reference indexing is unsupported in this proof-of-concept"
         | None ->
             fail "could not infer the element type for indexed access"
       in
@@ -952,6 +1337,8 @@ and lower_scalar_expr env state expr =
             fail "pointer-to-pointer operations are unsupported in this proof-of-concept"
         | Some (TArray _) ->
             fail "nested array operations are unsupported in this proof-of-concept"
+        | Some (TReference _) | Some (TConstReference _) ->
+            fail "reference dereference is unsupported in this proof-of-concept"
         | None ->
             fail "could not infer the pointee type for dereference"
       in
@@ -992,6 +1379,8 @@ and lower_scalar_expr env state expr =
             fail "pointer-valued fields are unsupported in this proof-of-concept"
         | TArray _ ->
             fail "array-valued fields are unsupported in this proof-of-concept"
+        | TReference _ | TConstReference _ ->
+            fail "reference-valued fields are unsupported in this proof-of-concept"
       in
       (match scalar_shadow_location env block offset field_type with
       | Some location ->
@@ -1120,6 +1509,9 @@ and lower_call_args env state name args =
             fail "record parameters are unsupported in lowered calls to `%s`" name
         | TArray _ :: _, _ ->
             fail "array parameters are unsupported in lowered calls to `%s`" name
+        | TReference _ :: _, _
+        | TConstReference _ :: _, _ ->
+            fail "reference parameters should be lowered before lowered calls to `%s`" name
         | _, _ ->
             fail "arity mismatch while lowering call to `%s`" name
       in
@@ -1406,6 +1798,8 @@ and lower_stmt env state stmt =
             , state )
       | Some (TArray _) ->
           fail "nested array stores are unsupported in this proof-of-concept"
+      | Some (TReference _) | Some (TConstReference _) ->
+          fail "reference stores are unsupported in this proof-of-concept"
       | None ->
           fail "could not infer the pointee type for store")
   | ArrayAssign (base, index, value) ->
@@ -1469,6 +1863,8 @@ and lower_stmt env state stmt =
             , state )
       | Some (TArray _) ->
           fail "nested array stores are unsupported in this proof-of-concept"
+      | Some (TReference _) | Some (TConstReference _) ->
+          fail "reference stores are unsupported in this proof-of-concept"
       | None ->
           fail "could not infer the element type for indexed store")
   | FieldAssign (base, field, value) ->
@@ -1531,7 +1927,9 @@ and lower_stmt env state stmt =
                   ])
             , state )
       | TArray _ ->
-          fail "array-valued fields are unsupported in this proof-of-concept")
+          fail "array-valued fields are unsupported in this proof-of-concept"
+      | TReference _ | TConstReference _ ->
+          fail "reference-valued fields are unsupported in this proof-of-concept")
   | Seq stmts ->
       let* stmts, state = lower_stmt_list env state stmts in
       Ok (seq_of_list stmts, state)
@@ -1606,7 +2004,9 @@ let lower_function env state fn =
       (fun param ->
         match param.param_type with
         | TArray _ -> true
-        | TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TPointer _ -> false)
+        | TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TPointer _
+        | TReference _ | TConstReference _ ->
+            false)
       fn.params
   in
   let has_record_param =
@@ -1614,7 +2014,9 @@ let lower_function env state fn =
       (fun param ->
         match param.param_type with
         | TRecord _ -> true
-        | TInt | TFloat | TDouble | TChar | TBool | TVoid | TPointer _ | TArray _ -> false)
+        | TInt | TFloat | TDouble | TChar | TBool | TVoid | TPointer _ | TArray _
+        | TReference _ | TConstReference _ ->
+            false)
       fn.params
   in
   if has_array_param then
@@ -1646,6 +2048,11 @@ let lower_function env state fn =
         let* body, state = lower_stmt env state fn.body in
         let body = seq_of_list (Assign (heap_ok_name, Int 1) :: init @ [ body ]) in
         Ok ({ fn with params; body }, clear_semantic_state state)
+    | TReference _
+    | TConstReference _ ->
+        fail
+          "reference return type in function `%s` is unsupported in this proof-of-concept"
+          fn.name
 
 let lower_functions (program : program) state malloc_sites functions =
   let rec loop acc state = function
@@ -1658,6 +2065,7 @@ let lower_functions (program : program) state malloc_sites functions =
   loop [] state functions
 
 let lower_program (program : program) =
+  let* program = lower_references_program program in
   if not (uses_memory_program program) then
     Ok program
   else
@@ -1725,8 +2133,23 @@ let rec lower_contract_scalar_expr env expr =
       fail "address-of expression used where a scalar contract expression was expected"
   | Index _ ->
       fail "indexed reads are unsupported inside contract expressions"
-  | Deref _ ->
-      fail "dereference is unsupported inside contract expressions"
+  | Deref ptr ->
+      let* block, offset, pointee_opt = lower_contract_ptr_expr env ptr in
+      (match pointee_opt with
+      | Some (TInt | TFloat | TDouble | TChar | TBool as pointee) ->
+          Ok (FuncCall (load_helper_name pointee, [ block; offset ]))
+      | Some TVoid ->
+          fail "cannot dereference `void*` inside contract expressions"
+      | Some (TRecord _) ->
+          fail "record dereference is unsupported inside contract expressions"
+      | Some (TPointer _) ->
+          fail "pointer-to-pointer dereference is unsupported inside contract expressions"
+      | Some (TArray _) ->
+          fail "nested array dereference is unsupported inside contract expressions"
+      | Some (TReference _) | Some (TConstReference _) ->
+          fail "reference dereference is unsupported inside contract expressions"
+      | None ->
+          fail "could not infer the pointee type for contract dereference")
   | Field _ ->
       fail "field reads are unsupported inside contract expressions"
   | Add (left, right) ->
@@ -1793,6 +2216,8 @@ and lower_contract_ptr_expr ?expected env expr =
           fail "only address-of for globals is supported in contracts, got `&%s`" name)
   | AddrOf (Index (base, index)) ->
       lower_contract_ptr_expr env (Add (base, index))
+  | AddrOf (Deref ptr) ->
+      lower_contract_ptr_expr env ptr
   | AddrOf (Field _) ->
       fail "field addresses are unsupported inside contract expressions"
   | AddrOf _ ->
@@ -1833,7 +2258,8 @@ let allocated_formula env block offset pointee_opt =
         scalar_byte_size_expr pointee
     | Some (TRecord name) ->
         object_byte_size_expr env.records (TRecord name)
-    | Some TVoid | Some (TPointer _) | Some (TArray _) | None ->
+    | Some TVoid | Some (TPointer _) | Some (TArray _) | Some (TReference _)
+    | Some (TConstReference _) | None ->
         Int 1
   in
   valid_access_formula env block offset width

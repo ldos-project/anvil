@@ -81,6 +81,8 @@ let array_type element_type size =
       fail "arrays of `void` are unsupported"
   | TArray _ ->
       fail "nested arrays are unsupported in this proof-of-concept"
+  | TReference _ | TConstReference _ ->
+      fail "arrays of references are unsupported"
 
 let make_function ?contract ~name ~return_type ~params body =
   { name; return_type; params; locals = []; contract; body }
@@ -208,7 +210,7 @@ let build_program items =
 %token <string> DOUBLE_LIT
 %token <int> CHAR_LIT
 %token <string> IDENT
-%token INT_KW FLOAT_KW DOUBLE_KW CHAR_KW BOOL_KW MAIN_KW VOID_KW STRUCT_KW CLASS_KW NAMESPACE_KW IF_KW ELSE_KW WHILE_KW RETURN_KW FREE_KW TRUE_KW FALSE_KW
+%token INT_KW FLOAT_KW DOUBLE_KW CHAR_KW BOOL_KW CONST_KW MAIN_KW VOID_KW STRUCT_KW CLASS_KW NAMESPACE_KW IF_KW ELSE_KW WHILE_KW RETURN_KW FREE_KW TRUE_KW FALSE_KW
 %token LPAREN RPAREN LBRACE RBRACE LBRACKET RBRACKET SEMI COMMA AMP DOT ARROW SCOPE
 %token PLUS MINUS STAR SLASH PERCENT
 %token ASSIGN PLUSEQ MINUSEQ EQEQ NEQ LT LE GT GE NOT AND OR
@@ -616,6 +618,10 @@ param_tail:
 named_param:
   | base = nonvoid_type stars = pointer_stars name = IDENT
       { { param_type = pointer_type base stars; param_name = Some name } }
+  | base = nonvoid_type stars = pointer_stars AMP name = IDENT
+      { { param_type = TReference (pointer_type base stars); param_name = Some name } }
+  | CONST_KW base = nonvoid_type stars = pointer_stars AMP name = IDENT
+      { { param_type = TConstReference (pointer_type base stars); param_name = Some name } }
   | VOID_KW STAR stars = pointer_stars name = IDENT
       { { param_type = pointer_type TVoid (stars + 1); param_name = Some name } }
 

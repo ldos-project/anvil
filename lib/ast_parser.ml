@@ -450,6 +450,10 @@ let rec resolve_type_names ~records ~current_namespace = function
       TPointer (resolve_type_names ~records ~current_namespace inner)
   | TArray (inner, size) ->
       TArray (resolve_type_names ~records ~current_namespace inner, size)
+  | TReference inner ->
+      TReference (resolve_type_names ~records ~current_namespace inner)
+  | TConstReference inner ->
+      TConstReference (resolve_type_names ~records ~current_namespace inner)
 
 let resolve_field_type_names records record =
   let current_namespace = namespace_path_of_name record.record_name in
@@ -713,25 +717,44 @@ let lookup_function_sig env name =
 let lookup_class_info env class_name =
   assoc_opt class_name env.classes
 
-let overload_signature_matches arg_types param_types =
+let overload_signature_matches arg_types arg_addressable_types param_types =
   if List.length arg_types <> List.length param_types then
     None
   else
-    let rec loop unknowns arg_types param_types =
-      match arg_types, param_types with
-      | [], [] -> Some unknowns
-      | arg_type :: rest_args, param_type :: rest_params ->
-          (match arg_type with
-          | Some arg_type when arg_type = param_type ->
-              loop unknowns rest_args rest_params
-          | Some _ ->
-              None
+    let rec loop unknowns arg_types arg_addressable_types param_types =
+      match arg_types, arg_addressable_types, param_types with
+      | [], [], [] -> Some unknowns
+      | arg_type :: rest_args, arg_addressable_type :: rest_addressable, param_type :: rest_params ->
+          let match_unknowns =
+            match param_type with
+            | TReference inner | TConstReference inner ->
+                (match arg_addressable_type with
+                | Some arg_addressable_type when arg_addressable_type = inner ->
+                    (match arg_type with
+                    | Some arg_type when arg_type = inner -> Some 0
+                    | Some _ -> None
+                    | None -> Some 1)
+                | Some _ | None ->
+                    None)
+            | _ ->
+                (match arg_type with
+                | Some arg_type when arg_type = param_type -> Some 0
+                | Some _ -> None
+                | None -> Some 1)
+          in
+          (match match_unknowns with
+          | Some extra_unknowns ->
+              loop
+                (unknowns + extra_unknowns)
+                rest_args
+                rest_addressable
+                rest_params
           | None ->
-              loop (unknowns + 1) rest_args rest_params)
+              None)
       | _ ->
           None
     in
-    loop 0 arg_types param_types
+    loop 0 arg_types arg_addressable_types param_types
 
 let format_overload_types arg_types =
   let format = function
@@ -740,13 +763,16 @@ let format_overload_types arg_types =
   in
   String.concat ", " (List.map format arg_types)
 
-let choose_best_signature context call_name arg_types candidates =
+let choose_best_signature context call_name arg_types arg_addressable_types candidates =
   let matches =
     List.filter_map
       (fun (candidate : function_sig) ->
         Option.map
           (fun unknowns -> unknowns, candidate)
-          (overload_signature_matches arg_types candidate.param_types))
+          (overload_signature_matches
+             arg_types
+             arg_addressable_types
+             candidate.param_types))
       candidates
   in
   match matches with
@@ -786,6 +812,7 @@ let rec resolve_free_function_sig env name args =
       Some signature
   | None ->
       let arg_types = List.map (desugar_expr_type env) args in
+      let arg_addressable_types = List.map (desugar_addressable_type env) args in
       let rec search = function
         | [] -> None
         | candidate_base :: rest ->
@@ -803,6 +830,7 @@ let rec resolve_free_function_sig env name args =
                      "function call"
                      candidate_base
                      arg_types
+                     arg_addressable_types
                      candidates))
       in
       search (namespace_reference_candidates ~current_namespace:env.current_namespace name)
@@ -819,16 +847,18 @@ and resolve_method_sig env class_name method_name args =
   | [] -> None
   | _ ->
       let arg_types = List.map (desugar_expr_type env) args in
+      let arg_addressable_types = List.map (desugar_addressable_type env) args in
       Some
         (choose_best_signature
            "method call"
            call_name
            arg_types
+           arg_addressable_types
            candidates)
 
 and desugar_addressable_type env = function
   | Var name ->
-      lookup_var_type env name
+      Option.map strip_reference_type (lookup_var_type env name)
   | Field (base, field) ->
       (match desugar_record_receiver_type env base with
       | Some record_name -> record_field_type env.records record_name field
@@ -868,7 +898,7 @@ and desugar_expr_type env = function
   | CharLit _ -> Some TChar
   | BoolLit _ -> Some TBool
   | Var name ->
-      lookup_var_type env name
+      Option.map strip_reference_type (lookup_var_type env name)
   | AddrOf expr ->
       Option.map (fun c_type -> TPointer c_type) (desugar_addressable_type env expr)
   | Index (base, _) ->
