@@ -46,6 +46,8 @@ let rec substitute_expr bindings = function
   | Index (base, index) ->
       Index (substitute_expr bindings base, substitute_expr bindings index)
   | Deref inner -> Deref (substitute_expr bindings inner)
+  | Field (base, field) ->
+      Field (substitute_expr bindings base, field)
   | Add (left, right) ->
       Add (substitute_expr bindings left, substitute_expr bindings right)
   | Sub (left, right) ->
@@ -87,6 +89,7 @@ let rec expr_has_var target = function
   | Index (base, index) ->
       expr_has_var target base || expr_has_var target index
   | Deref inner -> expr_has_var target inner
+  | Field (base, _) -> expr_has_var target base
   | Add (left, right)
   | Sub (left, right)
   | Mul (left, right)
@@ -360,8 +363,8 @@ let rec instrument_expr
   match expr with
   | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ | Var _ ->
       Ok ([], expr, state)
-  | AddrOf _ | Index _ | Deref _ ->
-      Error "pointer expressions should be lowered before contract instrumentation"
+  | AddrOf _ | Index _ | Deref _ | Field _ ->
+      Error "memory expressions should be lowered before contract instrumentation"
   | Add (left, right) ->
       instrument_binary_expr memory_env env state left right (fun l r -> Add (l, r))
   | Sub (left, right) ->
@@ -493,8 +496,8 @@ and instrument_stmt
       | Some current ->
           let* stmt = append_safety_assert current (prefix @ [ Assign (name, expr) ]) in
           Ok (stmt, state))
-  | Store _ | ArrayAssign _ | Free _ ->
-      Error "pointer statements should be lowered before contract instrumentation"
+  | Store _ | ArrayAssign _ | FieldAssign _ | Free _ ->
+      Error "memory statements should be lowered before contract instrumentation"
   | Assume cond ->
       let* prefix, cond, state = instrument_bexpr memory_env env state cond in
       (match current_contract with

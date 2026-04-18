@@ -64,12 +64,10 @@ let array_type element_type size =
   if size <= 0 then
     fail "array size must be positive, got %d" size;
   match element_type with
-  | TInt | TFloat | TDouble | TChar | TBool ->
+  | TInt | TFloat | TDouble | TChar | TBool | TRecord _ | TPointer _ ->
       TArray (element_type, size)
   | TVoid ->
       fail "arrays of `void` are unsupported"
-  | TPointer _ ->
-      fail "arrays of pointer type are unsupported in this proof-of-concept"
   | TArray _ ->
       fail "nested arrays are unsupported in this proof-of-concept"
 
@@ -82,13 +80,31 @@ let make_global global_type global_name =
 let make_local_decl local_type local_name init =
   LocalDecl (make_global local_type local_name, init)
 
+let record_field field_type field_name =
+  { field_type; field_name }
+
+let record_field_tail base stars field_name = function
+  | `Scalar ->
+      record_field (pointer_type base stars) field_name
+  | `Array size ->
+      record_field (array_type (pointer_type base stars) size) field_name
+
+let assignment_stmt lhs rhs =
+  match lhs with
+  | Var name -> Assign (name, rhs)
+  | Index (base, index) -> ArrayAssign (base, index, rhs)
+  | Field (base, field) -> FieldAssign (base, field, rhs)
+  | _ ->
+      fail "unsupported assignment target `%s`" (expr_to_c lhs)
+
 type top_item =
+  | Top_record of record_def
   | Top_global of global_def
   | Top_function of function_def
   | Top_main of function_def
 
 let build_program items =
-  let rec loop globals_rev functions_rev main = function
+  let rec loop records_rev globals_rev functions_rev main = function
     | [] ->
         let main =
           match main with
@@ -97,21 +113,24 @@ let build_program items =
         in
         {
           imports = [];
+          records = List.rev records_rev;
           globals = List.rev globals_rev;
           functions = List.rev functions_rev;
           main;
         }
+    | Top_record record :: rest ->
+        loop (record :: records_rev) globals_rev functions_rev main rest
     | Top_global global :: rest ->
-        loop (global :: globals_rev) functions_rev main rest
+        loop records_rev (global :: globals_rev) functions_rev main rest
     | Top_function fn :: rest ->
-        loop globals_rev (fn :: functions_rev) main rest
+        loop records_rev globals_rev (fn :: functions_rev) main rest
     | Top_main fn :: rest ->
         (match main with
         | Some _ -> fail "multiple `main` definitions"
         | None ->
-            loop globals_rev functions_rev (Some fn) rest)
+            loop records_rev globals_rev functions_rev (Some fn) rest)
   in
-  loop [] [] None items
+  loop [] [] [] None items
 %}
 
 %token <int> INT_LIT
@@ -119,8 +138,8 @@ let build_program items =
 %token <string> DOUBLE_LIT
 %token <int> CHAR_LIT
 %token <string> IDENT
-%token INT_KW FLOAT_KW DOUBLE_KW CHAR_KW BOOL_KW MAIN_KW VOID_KW IF_KW ELSE_KW WHILE_KW RETURN_KW FREE_KW TRUE_KW FALSE_KW
-%token LPAREN RPAREN LBRACE RBRACE LBRACKET RBRACKET SEMI COMMA AMP
+%token INT_KW FLOAT_KW DOUBLE_KW CHAR_KW BOOL_KW MAIN_KW VOID_KW STRUCT_KW IF_KW ELSE_KW WHILE_KW RETURN_KW FREE_KW TRUE_KW FALSE_KW
+%token LPAREN RPAREN LBRACE RBRACE LBRACKET RBRACKET SEMI COMMA AMP DOT ARROW
 %token PLUS MINUS STAR SLASH PERCENT
 %token ASSIGN EQEQ NEQ LT LE GT GE NOT AND OR
 %token EOF
@@ -155,6 +174,16 @@ scalar_type:
       { TChar }
   | BOOL_KW
       { TBool }
+
+struct_type:
+  | STRUCT_KW name = IDENT
+      { TRecord name }
+
+nonvoid_type:
+  | base = scalar_type
+      { base }
+  | base = struct_type
+      { base }
 
 contract_expr:
   | value = contract_add_expr
@@ -265,11 +294,13 @@ program:
       { build_program items }
 
 top_item:
+  | STRUCT_KW name = IDENT LBRACE fields = record_field_list RBRACE SEMI
+      { Top_record { record_name = name; fields } }
   | INT_KW MAIN_KW LPAREN VOID_KW RPAREN body = block
       { Top_main (make_function ~name:"main" ~return_type:TInt ~params:[] body) }
   | INT_KW MAIN_KW LPAREN RPAREN body = block
       { Top_main (make_function ~name:"main" ~return_type:TInt ~params:[] body) }
-  | base = scalar_type stars = pointer_stars name = IDENT tail = scalar_top_tail
+  | base = nonvoid_type stars = pointer_stars name = IDENT tail = top_tail
       { tail base stars name }
   | VOID_KW stars = pointer_stars name = IDENT LPAREN params = param_list RPAREN body = block
       {
@@ -277,7 +308,30 @@ top_item:
           (make_function ~name ~return_type:(pointer_type TVoid stars) ~params body)
       }
 
-scalar_top_tail:
+record_field_list:
+  | { [] }
+  | field = record_field_decl rest = record_field_list
+      { field :: rest }
+
+record_field_decl:
+  | base = nonvoid_type stars = pointer_stars field_name = IDENT tail = record_field_nonvoid_tail
+      { tail base stars field_name }
+  | VOID_KW STAR stars = pointer_stars field_name = IDENT SEMI
+      { record_field (pointer_type TVoid (stars + 1)) field_name }
+
+record_field_nonvoid_tail:
+  | SEMI
+      {
+        fun base stars field_name ->
+          record_field_tail base stars field_name `Scalar
+      }
+  | LBRACKET size = INT_LIT RBRACKET SEMI
+      {
+        fun base stars field_name ->
+          record_field_tail base stars field_name (`Array size)
+      }
+
+top_tail:
   | SEMI
       {
         fun base stars name ->
@@ -315,7 +369,7 @@ param_tail:
       { next :: rest }
 
 named_param:
-  | base = scalar_type stars = pointer_stars name = IDENT
+  | base = nonvoid_type stars = pointer_stars name = IDENT
       { { param_type = pointer_type base stars; param_name = Some name } }
   | VOID_KW STAR stars = pointer_stars name = IDENT
       { { param_type = pointer_type TVoid (stars + 1); param_name = Some name } }
@@ -329,7 +383,7 @@ block:
   | LBRACE stmts = stmt_list RBRACE
       { Block stmts }
 
-local_scalar_decl_tail:
+local_decl_tail:
   | SEMI
       {
         fun base stars name ->
@@ -365,14 +419,12 @@ stmt:
       { Skip }
   | body = block
       { body }
-  | base = scalar_type stars = pointer_stars name = IDENT tail = local_scalar_decl_tail
+  | base = nonvoid_type stars = pointer_stars name = IDENT tail = local_decl_tail
       { tail base stars name }
   | VOID_KW STAR stars = pointer_stars name = IDENT tail = local_void_decl_tail
       { tail stars name }
-  | base = postfix_expr LBRACKET index = expr RBRACKET ASSIGN rhs = expr SEMI
-      { ArrayAssign (base, index, rhs) }
-  | name = IDENT ASSIGN rhs = expr SEMI
-      { Assign (name, rhs) }
+  | lhs = postfix_expr ASSIGN rhs = expr SEMI
+      { assignment_stmt lhs rhs }
   | STAR lhs = expr ASSIGN rhs = expr SEMI
       { Store (lhs, rhs) }
   | RETURN_KW value = option(expr) SEMI
@@ -471,6 +523,10 @@ postfix_expr:
       { value }
   | base = postfix_expr LBRACKET index = expr RBRACKET
       { Index (base, index) }
+  | base = postfix_expr DOT field = IDENT
+      { Field (base, field) }
+  | base = postfix_expr ARROW field = IDENT
+      { Field (Deref base, field) }
 
 primary_expr:
   | n = INT_LIT

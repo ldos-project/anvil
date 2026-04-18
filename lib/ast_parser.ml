@@ -29,6 +29,7 @@ let rec normalize_stmt = function
           Assume (negate_bexpr c)
       | _ -> While (invariant, c, body))
   | ArrayAssign (base, index, value) -> ArrayAssign (base, index, value)
+  | FieldAssign (base, field, value) -> FieldAssign (base, field, value)
   | Store (ptr, value) -> Store (ptr, value)
   | Assume _ as stmt -> stmt
   | Assert _ as stmt -> stmt
@@ -226,6 +227,8 @@ let rec resolve_expr scopes = function
   | Index (base, index) ->
       Index (resolve_expr scopes base, resolve_expr scopes index)
   | Deref expr -> Deref (resolve_expr scopes expr)
+  | Field (base, field) ->
+      Field (resolve_expr scopes base, field)
   | Add (left, right) ->
       Add (resolve_expr scopes left, resolve_expr scopes right)
   | Sub (left, right) ->
@@ -325,6 +328,12 @@ let rec resolve_stmt scopes state stmt =
             , resolve_expr scopes value )
         , state
         , scopes )
+  | FieldAssign (base, field, value) ->
+      Ok
+        ( FieldAssign
+            (resolve_expr scopes base, field, resolve_expr scopes value)
+        , state
+        , scopes )
   | Seq stmts ->
       let* stmts, state = resolve_stmt_list scopes state stmts in
       Ok (seq_of_list stmts, state, scopes)
@@ -394,7 +403,7 @@ let resolve_program_locals program =
 
 let rec attach_loop_invariants_stmt source_name invariants stmt =
   match stmt with
-  | Skip | LocalDecl _ | Assign _ | Store _ | ArrayAssign _ | Assume _ | Assert _ | Free _ | Return _ ->
+  | Skip | LocalDecl _ | Assign _ | Store _ | ArrayAssign _ | FieldAssign _ | Assume _ | Assert _ | Free _ | Return _ ->
       stmt, invariants
   | Block stmts ->
       let stmts, invariants =

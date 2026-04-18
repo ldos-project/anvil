@@ -97,8 +97,13 @@ let strip_float_suffix text =
 let sort_of_c_type = function
   | TFloat | TDouble -> Ir.Real
   | TInt | TChar | TBool | TPointer _ -> Ir.Int
+  | TRecord _ -> failwith "record values should be lowered before SMT translation"
   | TArray _ -> failwith "array values should be lowered before SMT translation"
   | TVoid -> failwith "void cannot appear in SMT expressions"
+
+let is_queryable_type = function
+  | TInt | TFloat | TDouble | TChar | TBool | TPointer _ -> true
+  | TVoid | TRecord _ | TArray _ -> false
 
 let helper_signature = function
   | "__anvil_load_int" -> Some ([ Ir.Int; Ir.Int ], TInt)
@@ -106,6 +111,8 @@ let helper_signature = function
   | "__anvil_load_double" -> Some ([ Ir.Int; Ir.Int ], TDouble)
   | "__anvil_load_char" -> Some ([ Ir.Int; Ir.Int ], TChar)
   | "__anvil_load_bool" -> Some ([ Ir.Int; Ir.Int ], TBool)
+  | "__anvil_load_ptr_block" -> Some ([ Ir.Int; Ir.Int ], TInt)
+  | "__anvil_load_ptr_offset" -> Some ([ Ir.Int; Ir.Int ], TInt)
   | _ -> None
 
 let build_function_sigs (program : program) =
@@ -153,8 +160,8 @@ let rec expr_type env = function
   | BoolLit _ -> TBool
   | Var name ->
       Option.value (lookup_var_type env name) ~default:TInt
-  | AddrOf _ | Index _ | Deref _ ->
-      failwith "pointer expressions should be lowered before verification"
+  | AddrOf _ | Index _ | Deref _ | Field _ ->
+      failwith "memory expressions should be lowered before verification"
   | Add (left, right)
   | Sub (left, right)
   | Mul (left, right)
@@ -177,8 +184,8 @@ let rec expr_to_ir env = function
   | BoolLit true -> Ir.Int_lit 1
   | BoolLit false -> Ir.Int_lit 0
   | Var name -> Ir.Var name
-  | AddrOf _ | Index _ | Deref _ ->
-      failwith "pointer expressions should be lowered before verification"
+  | AddrOf _ | Index _ | Deref _ | Field _ ->
+      failwith "memory expressions should be lowered before verification"
   | Add (left, right) -> Ir.Add [expr_to_ir env left; expr_to_ir env right]
   | Sub (left, right) -> Ir.Sub (expr_to_ir env left, expr_to_ir env right)
   | Mul (left, right) -> Ir.Mul [expr_to_ir env left; expr_to_ir env right]
@@ -241,8 +248,8 @@ let rec wp_stmt env state stmt post =
       failwith "unresolved local syntax reached weakest-precondition generation"
   | Assign (name, expr) ->
       Ir.subst_formula name (expr_to_ir env expr) post, state
-  | Store _ | ArrayAssign _ | Free _ ->
-      failwith "pointer statements should be lowered before verification"
+  | Store _ | ArrayAssign _ | FieldAssign _ | Free _ ->
+      failwith "memory statements should be lowered before verification"
   | Seq stmts ->
       List.fold_right
         (fun stmt (post, state) -> wp_stmt env state stmt post)
@@ -617,6 +624,8 @@ let rec apps_in_expr env acc = function
       apps_in_expr env (apps_in_expr env acc base) index
   | Deref inner ->
       apps_in_expr env acc inner
+  | Field (base, _) ->
+      apps_in_expr env acc base
   | Add (left, right)
   | Sub (left, right)
   | Mul (left, right)
@@ -656,6 +665,8 @@ let rec apps_in_stmt env acc = function
   | Store (ptr, value) -> apps_in_expr env (apps_in_expr env acc ptr) value
   | ArrayAssign (base, index, value) ->
       apps_in_expr env (apps_in_expr env (apps_in_expr env acc base) index) value
+  | FieldAssign (base, _, value) ->
+      apps_in_expr env (apps_in_expr env acc base) value
   | Seq stmts ->
       List.fold_left (apps_in_stmt env) acc stmts
   | If (cond, then_branch, else_branch) ->
@@ -683,21 +694,28 @@ let queries_for_vc (program : program) (vc : verification_condition) =
       let queryable_globals =
         List.filter_map
           (fun global ->
-            if is_array_type global.global_type then None
-            else Some global.global_name)
+            if is_queryable_type global.global_type then Some global.global_name
+            else None)
           program.globals
       in
       let queryable_locals =
         List.filter_map
           (fun local ->
-            if is_array_type local.global_type then None
-            else Some local.global_name)
+            if is_queryable_type local.global_type then Some local.global_name
+            else None)
           fn.locals
       in
       let extra_var_queries =
         List.map
           (fun name -> { label = name; term = Ir.Var name })
-          (queryable_globals @ queryable_locals @ param_names fn.params)
+          ( queryable_globals
+          @ queryable_locals
+          @ List.filter_map
+              (fun param ->
+                match param.param_name with
+                | Some name when is_queryable_type param.param_type -> Some name
+                | Some _ | None -> None)
+              fn.params )
       in
       let extra_app_queries =
         apps_in_stmt env String_map.empty fn.body
@@ -734,8 +752,8 @@ let rec symbolic_expr env = function
       (match lookup_env env name with
       | Some value -> value
       | None -> Ir.Var name)
-  | AddrOf _ | Index _ | Deref _ ->
-      failwith "pointer expressions should be lowered before replay"
+  | AddrOf _ | Index _ | Deref _ | Field _ ->
+      failwith "memory expressions should be lowered before replay"
   | Add (left, right) ->
       Ir.Add [ symbolic_expr env left; symbolic_expr env right ]
   | Sub (left, right) ->
@@ -884,7 +902,7 @@ let rec replay_stmt model env fuel stmt =
         Replay_blocked
     | Assign (name, expr) ->
         Replay_continue (bind_env env name (symbolic_expr env expr))
-    | Store _ | ArrayAssign _ | Free _ ->
+    | Store _ | ArrayAssign _ | FieldAssign _ | Free _ ->
         Replay_blocked
     | Seq stmts ->
         replay_stmt_list model env fuel stmts
@@ -974,6 +992,8 @@ let string_of_runtime_scalar env model c_type name =
     | None -> "<unknown>"
   else if is_array_type c_type then
     Printf.sprintf "&%s[0]" name
+  else if is_record_type c_type then
+    "&" ^ name
   else
     string_of_runtime_int env model name
 

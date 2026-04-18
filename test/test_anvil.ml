@@ -77,6 +77,7 @@ let gen_program size =
         ~f:(fun globals body ->
           {
             imports = [];
+            records = [];
             globals =
               List.map globals ~f:(fun global_name ->
                   { global_type = TInt; global_name });
@@ -645,6 +646,60 @@ let assert_array_out_of_bounds_reports_counterexample () =
             ("Expected array bounds example to fail verification, got:\n"
             ^ Verify.format_outcome outcome))
 
+let assert_record_roundtrip_and_verification () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n"
+    ^ "#include <stdbool.h>\n\n"
+    ^ "struct Leaf {\n"
+    ^ "  int value;\n"
+    ^ "};\n\n"
+    ^ "struct Node {\n"
+    ^ "  struct Leaf leaf;\n"
+    ^ "  struct Leaf leaves[2];\n"
+    ^ "  int slots[2];\n"
+    ^ "  struct Leaf *next;\n"
+    ^ "};\n\n"
+    ^ "struct Leaf leaf0;\n"
+    ^ "struct Node node;\n"
+    ^ "struct Node *np;\n"
+    ^ "struct Leaf *lp;\n"
+    ^ "int out;\n\n"
+    ^ "/* @Require 1\n"
+    ^ " * @Guarantee 1\n"
+    ^ " * @Safety heap_ok()\n"
+    ^ " */\n"
+    ^ "int main(void) {\n"
+    ^ "  node.leaf.value = 1;\n"
+    ^ "  node.leaves[0].value = 2;\n"
+    ^ "  node.slots[0] = 3;\n"
+    ^ "  np = &node;\n"
+    ^ "  np->leaves[1].value = (node.slots[0] + node.leaf.value);\n"
+    ^ "  out = np->leaf.value;\n"
+    ^ "  out = node.leaves[1].value;\n"
+    ^ "  lp = &node.leaf;\n"
+    ^ "  out = lp->value;\n"
+    ^ "  node.next = &leaf0;\n"
+    ^ "  lp = node.next;\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Record parse failed: " ^ e)
+  | Ok program ->
+      (match parse_program (program_to_c program) with
+      | Error e -> failwith ("Record roundtrip failed: " ^ e)
+      | Ok roundtripped ->
+          if not (equal_program program roundtripped) then
+            failwith "Record roundtrip mismatch");
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Record verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected record example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
 let assert_example_file_verifies file_name =
   let path = "test/e2e_cases/" ^ file_name in
   let source = In_channel.read_all path in
@@ -685,6 +740,8 @@ let assert_typed_memory_examples_verify () =
     ; "memory_safe_char_expression.c"
     ; "memory_safe_bool_expression.c"
     ; "memory_safe_array_expression.c"
+    ; "memory_safe_record_expression.c"
+    ; "record_pointer_field_deref.c"
     ]
     ~f:assert_example_file_verifies
 
@@ -715,6 +772,7 @@ let () =
   assert_local_array_memory_examples ();
   assert_array_roundtrip_and_verification ();
   assert_array_out_of_bounds_reports_counterexample ();
+  assert_record_roundtrip_and_verification ();
   assert_typed_memory_examples_verify ();
   assert_typed_memory_negative_examples_fail ();
   Quickcheck.test

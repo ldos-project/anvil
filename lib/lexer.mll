@@ -39,6 +39,7 @@ rule read = parse
   | "double"            { DOUBLE_KW }
   | "char"              { CHAR_KW }
   | "bool"              { BOOL_KW }
+  | "struct"            { STRUCT_KW }
   | "true"              { TRUE_KW }
   | "false"             { FALSE_KW }
   | "main"              { MAIN_KW }
@@ -50,6 +51,7 @@ rule read = parse
   | "free"              { FREE_KW }
   | "&&"                { AND }
   | "||"                { OR }
+  | "->"                { ARROW }
   | "=="                { EQEQ }
   | "!="                { NEQ }
   | "<="                { LE }
@@ -75,6 +77,7 @@ rule read = parse
   | ';'                 { SEMI }
   | ','                 { COMMA }
   | '&'                 { AMP }
+  | '.'                 { DOT }
   | '+'                 { PLUS }
   | '-'                 { MINUS }
   | '*'                 { STAR }

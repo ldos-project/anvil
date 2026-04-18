@@ -9,8 +9,19 @@ type c_type =
   | TChar
   | TBool
   | TVoid
+  | TRecord of string
   | TPointer of c_type
   | TArray of c_type * int
+
+type field_def = {
+  field_type : c_type;
+  field_name : string;
+}
+
+type record_def = {
+  record_name : string;
+  fields : field_def list;
+}
 
 type global_def = {
   global_type : c_type;
@@ -52,6 +63,7 @@ type expr =
   | AddrOf of expr
   | Index of expr * expr
   | Deref of expr
+  | Field of expr * string
   | Add of expr * expr
   | Sub of expr * expr
   | Mul of expr * expr
@@ -79,6 +91,7 @@ type stmt =
   | Assign of var * expr
   | Store of expr * expr
   | ArrayAssign of expr * expr * expr
+  | FieldAssign of expr * string * expr
   | Seq of stmt list
   | If of bexpr * stmt * stmt
   | While of bexpr option * bexpr * stmt
@@ -104,6 +117,7 @@ type function_def = {
 
 type program = {
   imports : header_import list;
+  records : record_def list;
   globals : global_def list;
   functions : function_def list;
   main : function_def;
@@ -116,6 +130,7 @@ let rec c_type_to_c = function
   | TChar -> "char"
   | TBool -> "bool"
   | TVoid -> "void"
+  | TRecord name -> "struct " ^ name
   | TPointer inner -> c_type_to_c inner ^ "*"
   | TArray (inner, size) ->
       Printf.sprintf "%s[%d]" (c_type_to_c inner) size
@@ -132,35 +147,88 @@ let global_names globals =
 
 let is_pointer_type = function
   | TPointer _ -> true
-  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TArray _ -> false
+  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TArray _ -> false
 
 let pointer_base_type = function
   | TPointer inner -> Some inner
-  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TArray _ -> None
+  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TArray _ -> None
+
+let pointer_object_byte_size = 8
 
 let is_array_type = function
   | TArray _ -> true
-  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TPointer _ -> false
+  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TPointer _ -> false
 
 let array_element_type = function
   | TArray (inner, _) -> Some inner
-  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TPointer _ -> None
+  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TPointer _ -> None
 
 let array_length = function
   | TArray (_, length) -> Some length
-  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TPointer _ -> None
+  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TRecord _ | TPointer _ -> None
+
+let is_record_type = function
+  | TRecord _ -> true
+  | TInt | TFloat | TDouble | TChar | TBool | TVoid | TPointer _ | TArray _ -> false
 
 let is_real_type = function
   | TFloat | TDouble -> true
-  | TInt | TChar | TBool | TVoid | TPointer _ | TArray _ -> false
+  | TInt | TChar | TBool | TVoid | TRecord _ | TPointer _ | TArray _ -> false
 
 let is_integer_like_type = function
   | TInt | TChar | TBool -> true
-  | TFloat | TDouble | TVoid | TPointer _ | TArray _ -> false
+  | TFloat | TDouble | TVoid | TRecord _ | TPointer _ | TArray _ -> false
 
 let is_scalar_type = function
   | TInt | TFloat | TDouble | TChar | TBool -> true
-  | TVoid | TPointer _ | TArray _ -> false
+  | TVoid | TRecord _ | TPointer _ | TArray _ -> false
+
+let lookup_record records name =
+  List.find_opt (fun record -> String.equal record.record_name name) records
+
+let lookup_record_field records record_name field_name =
+  match lookup_record records record_name with
+  | None -> None
+  | Some record ->
+      List.find_opt (fun field -> String.equal field.field_name field_name) record.fields
+
+let record_field_type records record_name field_name =
+  Option.map
+    (fun field -> field.field_type)
+    (lookup_record_field records record_name field_name)
+
+let rec c_type_object_byte_size records = function
+  | TInt -> 4
+  | TFloat -> 4
+  | TDouble -> 8
+  | TChar -> 1
+  | TBool -> 1
+  | TRecord name ->
+      (match lookup_record records name with
+      | None -> failwith ("unknown record type `" ^ name ^ "`")
+      | Some record ->
+          List.fold_left
+            (fun acc field -> acc + c_type_object_byte_size records field.field_type)
+            0
+            record.fields)
+  | TVoid -> failwith "void has no object byte size"
+  | TPointer _ -> pointer_object_byte_size
+  | TArray (inner, size) -> size * c_type_object_byte_size records inner
+
+let record_field_offset records record_name field_name =
+  match lookup_record records record_name with
+  | None -> None
+  | Some record ->
+      let rec loop offset = function
+        | [] -> None
+        | field :: rest ->
+            if String.equal field.field_name field_name then Some offset
+            else
+              loop
+                (offset + c_type_object_byte_size records field.field_type)
+                rest
+      in
+      loop 0 record.fields
 
 let lookup_global globals name =
   List.find_opt (fun global -> String.equal global.global_name name) globals
@@ -180,7 +248,11 @@ let load_helper_name = function
   | TDouble -> "__anvil_load_double"
   | TChar -> "__anvil_load_char"
   | TBool -> "__anvil_load_bool"
-  | TVoid | TPointer _ | TArray _ -> failwith "unsupported helper load type"
+  | TVoid | TRecord _ | TPointer _ | TArray _ -> failwith "unsupported helper load type"
+
+let load_ptr_block_helper_name = "__anvil_load_ptr_block"
+
+let load_ptr_offset_helper_name = "__anvil_load_ptr_offset"
 
 let escape_char_code = function
   | 0 -> "'\\0'"
@@ -199,7 +271,28 @@ let escape_char_code = function
   | n ->
       Printf.sprintf "'\\x%02x'" n
 
-let rec expr_to_c = function
+let rec postfix_receiver_to_c expr =
+  match expr with
+  | Int _
+  | FloatLit _
+  | DoubleLit _
+  | CharLit _
+  | BoolLit _
+  | Var _
+  | Index _
+  | Deref _
+  | Field _
+  | FuncCall _ ->
+      expr_to_c expr
+  | AddrOf _
+  | Add _
+  | Sub _
+  | Mul _
+  | Div _
+  | Mod _ ->
+      "(" ^ expr_to_c expr ^ ")"
+
+and expr_to_c = function
   | Int i -> string_of_int i
   | FloatLit text
   | DoubleLit text ->
@@ -211,6 +304,10 @@ let rec expr_to_c = function
   | AddrOf value -> "&" ^ expr_to_c value
   | Index (base, index) -> expr_to_c base ^ "[" ^ expr_to_c index ^ "]"
   | Deref e -> "*" ^ expr_to_c e
+  | Field (Deref base, field) ->
+      postfix_receiver_to_c base ^ "->" ^ field
+  | Field (base, field) ->
+      postfix_receiver_to_c base ^ "." ^ field
   | Add (a, b) -> "(" ^ expr_to_c a ^ " + " ^ expr_to_c b ^ ")"
   | Sub (a, b) -> "(" ^ expr_to_c a ^ " - " ^ expr_to_c b ^ ")"
   | Mul (a, b) -> "(" ^ expr_to_c a ^ " * " ^ expr_to_c b ^ ")"
@@ -252,6 +349,16 @@ let local_decl_to_c ~indent_level local =
   ^ type_with_name_to_c local.global_type local.global_name
   ^ ";\n"
 
+let field_def_to_c ~indent_level field =
+  indent indent_level
+  ^ type_with_name_to_c field.field_type field.field_name
+  ^ ";\n"
+
+let record_def_to_c record =
+  "struct " ^ record.record_name ^ " {\n"
+  ^ String.concat "" (List.map (field_def_to_c ~indent_level:1) record.fields)
+  ^ "};\n"
+
 let sort_uniq_strings names =
   List.sort_uniq String.compare names
 
@@ -270,6 +377,7 @@ let zero_literal_for_type = function
   | TChar -> "'\\0'"
   | TBool -> "false"
   | TVoid -> failwith "void does not have a zero literal"
+  | TRecord _ -> failwith "record values do not have a zero literal"
   | TPointer _ -> "0"
   | TArray _ -> failwith "array does not have a zero literal"
 
@@ -308,6 +416,12 @@ let rec stmt_to_c ~indent_level ~return_type = function
       indent indent_level ^ "*" ^ expr_to_c ptr ^ " = " ^ expr_to_c value ^ ";\n"
   | ArrayAssign (base, index, value) ->
       indent indent_level ^ expr_to_c base ^ "[" ^ expr_to_c index ^ "] = "
+      ^ expr_to_c value ^ ";\n"
+  | FieldAssign (Deref base, field, value) ->
+      indent indent_level ^ postfix_receiver_to_c base ^ "->" ^ field ^ " = "
+      ^ expr_to_c value ^ ";\n"
+  | FieldAssign (base, field, value) ->
+      indent indent_level ^ postfix_receiver_to_c base ^ "." ^ field ^ " = "
       ^ expr_to_c value ^ ";\n"
   | Seq ss ->
       String.concat ""
@@ -355,6 +469,7 @@ let rec vars_in_expr = function
   | Index (base, index) ->
       vars_in_expr base @ vars_in_expr index
   | Deref inner -> vars_in_expr inner
+  | Field (base, _) -> vars_in_expr base
   | Add (left, right)
   | Sub (left, right)
   | Mul (left, right)
@@ -392,6 +507,8 @@ let rec vars_in_stmt = function
       vars_in_expr ptr @ vars_in_expr value
   | ArrayAssign (base, index, value) ->
       vars_in_expr base @ vars_in_expr index @ vars_in_expr value
+  | FieldAssign (base, _, value) ->
+      vars_in_expr base @ vars_in_expr value
   | If (cond, then_branch, else_branch) ->
       vars_in_bexpr cond @ vars_in_stmt then_branch @ vars_in_stmt else_branch
   | While (invariant, cond, body) ->
@@ -442,6 +559,8 @@ let helper_prototype name =
   | "__anvil_load_double" -> "double __anvil_load_double(int block, int offset);\n"
   | "__anvil_load_char" -> "char __anvil_load_char(int block, int offset);\n"
   | "__anvil_load_bool" -> "bool __anvil_load_bool(int block, int offset);\n"
+  | "__anvil_load_ptr_block" -> "int __anvil_load_ptr_block(int block, int offset);\n"
+  | "__anvil_load_ptr_offset" -> "int __anvil_load_ptr_offset(int block, int offset);\n"
   | _ -> failwith ("unknown helper function " ^ name)
 
 let helper_prototypes p =
@@ -452,6 +571,7 @@ let helper_prototypes p =
     | Index (base, index) ->
         helpers_in_expr (helpers_in_expr acc base) index
     | Deref inner -> helpers_in_expr acc inner
+    | Field (base, _) -> helpers_in_expr acc base
     | Add (left, right)
     | Sub (left, right)
     | Mul (left, right)
@@ -497,6 +617,8 @@ let helper_prototypes p =
         helpers_in_expr
           (helpers_in_expr (helpers_in_expr acc base) index)
           value
+    | FieldAssign (base, _, value) ->
+        helpers_in_expr (helpers_in_expr acc base) value
     | Seq stmts ->
         List.fold_left helpers_in_stmt acc stmts
     | If (cond, then_branch, else_branch) ->
@@ -546,6 +668,12 @@ let program_to_c p =
              imports)
         ^ "\n"
   in
+  let records =
+    match p.records with
+    | [] -> ""
+    | records ->
+        String.concat "\n" (List.map record_def_to_c records) ^ "\n"
+  in
   let globals =
     match p.globals with
     | [] -> ""
@@ -564,4 +692,4 @@ let program_to_c p =
         String.concat "\n" (List.map function_def_to_c functions) ^ "\n"
   in
   let main = function_def_to_c p.main in
-  header ^ helpers ^ imports ^ globals ^ functions ^ main
+  header ^ helpers ^ imports ^ records ^ globals ^ functions ^ main
