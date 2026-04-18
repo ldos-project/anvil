@@ -918,6 +918,127 @@ let assert_namespaced_class_desugaring_roundtrip_and_verification () =
             ("Expected namespaced class example to verify, got:\n"
             ^ Verify.format_outcome outcome))
 
+let assert_function_overloading_roundtrip_and_verification () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n"
+    ^ "#include <stdbool.h>\n\n"
+    ^ "int x;\n"
+    ^ "int out;\n"
+    ^ "bool flag;\n\n"
+    ^ "int pick(int value) {\n"
+    ^ "  return (value + 1);\n"
+    ^ "}\n\n"
+    ^ "int pick(bool high) {\n"
+    ^ "  if (high) {\n"
+    ^ "    return 7;\n"
+    ^ "  } else {\n"
+    ^ "    return 3;\n"
+    ^ "  }\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  flag = true;\n"
+    ^ "  x = pick(4);\n"
+    ^ "  out = pick(flag);\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Function overloading parse failed: " ^ e)
+  | Ok program ->
+      let function_names = List.map program.functions ~f:(fun fn -> fn.name) in
+      if not (List.mem function_names "pick__ol__int" ~equal:String.equal) then
+        failwith "Expected `pick__ol__int` in overloaded functions";
+      if not (List.mem function_names "pick__ol__bool" ~equal:String.equal) then
+        failwith "Expected `pick__ol__bool` in overloaded functions";
+      let desugared = program_to_c program in
+      if not (String.is_substring desugared ~substring:"int pick__ol__int(int value)") then
+        failwith "Expected the `int` overload to be mangled in the pretty-printer";
+      if not (String.is_substring desugared ~substring:"int pick__ol__bool(bool high)") then
+        failwith "Expected the `bool` overload to be mangled in the pretty-printer";
+      if not (String.is_substring desugared ~substring:"x = pick__ol__int(4);") then
+        failwith "Expected the `int` call site to resolve to `pick__ol__int`";
+      if not (String.is_substring desugared ~substring:"out = pick__ol__bool(flag);") then
+        failwith "Expected the `bool` call site to resolve to `pick__ol__bool`";
+      (match parse_program desugared with
+      | Error e -> failwith ("Function overloading roundtrip failed: " ^ e)
+      | Ok roundtripped ->
+          if not (equal_program program roundtripped) then
+            failwith "Function overloading roundtrip mismatch");
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Function overloading verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected overloaded free-function example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_method_overloading_roundtrip_and_verification () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n"
+    ^ "#include <stdbool.h>\n\n"
+    ^ "class Counter {\n"
+    ^ "  int value;\n"
+    ^ "  int put(int next) {\n"
+    ^ "    value = next;\n"
+    ^ "    return get();\n"
+    ^ "  }\n"
+    ^ "  int put(bool bump) {\n"
+    ^ "    if (bump) {\n"
+    ^ "      value = (value + 1);\n"
+    ^ "    }\n"
+    ^ "    return get();\n"
+    ^ "  }\n"
+    ^ "  int get() {\n"
+    ^ "    return value;\n"
+    ^ "  }\n"
+    ^ "};\n\n"
+    ^ "Counter c;\n"
+    ^ "Counter *cp;\n"
+    ^ "int out;\n"
+    ^ "bool flag;\n\n"
+    ^ "int main(void) {\n"
+    ^ "  out = c.put(7);\n"
+    ^ "  flag = true;\n"
+    ^ "  out = c.put(flag);\n"
+    ^ "  cp = &c;\n"
+    ^ "  out = cp->put(false);\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Method overloading parse failed: " ^ e)
+  | Ok program ->
+      let method_names = List.map program.functions ~f:(fun fn -> fn.name) in
+      if not (List.mem method_names "Counter__put__ol__int" ~equal:String.equal) then
+        failwith "Expected `Counter__put__ol__int` in overloaded methods";
+      if not (List.mem method_names "Counter__put__ol__bool" ~equal:String.equal) then
+        failwith "Expected `Counter__put__ol__bool` in overloaded methods";
+      if not (List.mem method_names "Counter__get" ~equal:String.equal) then
+        failwith "Expected unique method `Counter__get` to remain unmangled";
+      let desugared = program_to_c program in
+      if not (String.is_substring desugared ~substring:"Counter__put__ol__int(&c, 7)") then
+        failwith "Expected the dot-call `int` overload to resolve to `Counter__put__ol__int`";
+      if not (String.is_substring desugared ~substring:"Counter__put__ol__bool(&c, flag)") then
+        failwith "Expected the dot-call `bool` overload to resolve to `Counter__put__ol__bool`";
+      if not (String.is_substring desugared ~substring:"Counter__put__ol__bool(cp, false)") then
+        failwith "Expected the arrow-call `bool` overload to resolve to `Counter__put__ol__bool`";
+      if not (String.is_substring desugared ~substring:"return Counter__get(this);") then
+        failwith "Expected implicit `get()` calls to resolve through the unmangled unique method";
+      (match parse_program desugared with
+      | Error e -> failwith ("Method overloading roundtrip failed: " ^ e)
+      | Ok roundtripped ->
+          if not (equal_program program roundtripped) then
+            failwith "Method overloading roundtrip mismatch");
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Method overloading verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected overloaded method example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
 let assert_example_file_verifies file_name =
   let path = "test/e2e_cases/" ^ file_name in
   let source = In_channel.read_all path in
@@ -994,6 +1115,8 @@ let () =
   assert_class_desugaring_roundtrip_and_verification ();
   assert_namespace_resolution_roundtrip_and_verification ();
   assert_namespaced_class_desugaring_roundtrip_and_verification ();
+  assert_function_overloading_roundtrip_and_verification ();
+  assert_method_overloading_roundtrip_and_verification ();
   assert_typed_memory_examples_verify ();
   assert_typed_memory_negative_examples_fail ();
   Quickcheck.test

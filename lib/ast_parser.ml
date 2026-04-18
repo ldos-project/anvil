@@ -531,17 +531,102 @@ let resolve_program_type_names program =
       };
   }
 
+let dispatch_param_types name params =
+  List.map (fun param -> param.param_type) (overload_dispatch_params name params)
+
+let overload_signature_key name params =
+  overload_suffix_of_params (overload_dispatch_params name params)
+
+let name_in_list names target =
+  List.exists (String.equal target) names
+
+let add_overload_signature groups name signature =
+  match assoc_opt name groups with
+  | Some signatures when name_in_list signatures signature ->
+      groups
+  | Some signatures ->
+      (name, signature :: signatures)
+      :: List.filter (fun (other_name, _) -> not (String.equal other_name name)) groups
+  | None ->
+      [ name, [ signature ] ] @ groups
+
+let collect_overload_groups imports defined_contracts program =
+  let groups =
+    List.fold_left
+      (fun groups (contract_fn : contracted_function) ->
+        add_overload_signature
+          groups
+          contract_fn.name
+          (overload_signature_key contract_fn.name contract_fn.params))
+      []
+      (defined_contracts
+      @ List.concat_map
+          (fun (imported_header : header_import) -> imported_header.functions)
+          imports)
+  in
+  List.fold_left
+    (fun groups (fn : function_def) ->
+      if String.equal fn.name "main" then groups
+      else
+        add_overload_signature
+          groups
+          fn.name
+          (overload_signature_key fn.name fn.params))
+    groups
+    program.functions
+
+let overloaded_names_of_groups groups =
+  groups
+  |> List.filter_map (fun (name, signatures) ->
+         if List.length signatures > 1 then Some name else None)
+
+let mangle_contract_name overloaded_names (contract_fn : contracted_function) =
+  if name_in_list overloaded_names contract_fn.name then
+    { contract_fn with name = mangle_overload_name contract_fn.name contract_fn.params }
+  else
+    contract_fn
+
+let mangle_import_names overloaded_names (imported_header : header_import) =
+  {
+    imported_header with
+    functions = List.map (mangle_contract_name overloaded_names) imported_header.functions;
+  }
+
+let mangle_function_name overloaded_names (fn : function_def) =
+  if String.equal fn.name "main" || not (name_in_list overloaded_names fn.name) then
+    fn
+  else
+    { fn with name = mangle_overload_name fn.name fn.params }
+
+let mangle_overloaded_program_names imports defined_contracts program =
+  let overloaded_names =
+    collect_overload_groups imports defined_contracts program
+    |> overloaded_names_of_groups
+  in
+  ( List.map (mangle_import_names overloaded_names) imports
+  , List.map (mangle_contract_name overloaded_names) defined_contracts
+  , { program with functions = List.map (mangle_function_name overloaded_names) program.functions }
+  )
+
 type class_info = {
   class_name : string;
   field_names : string list;
   method_names : string list;
 }
 
+type function_sig = {
+  actual_name : string;
+  base_name : string;
+  param_types : c_type list;
+  return_type : c_type;
+}
+
 type desugar_env = {
   records : record_def list;
   vars : (string * c_type) list;
-  function_sigs : (string * (c_type list * c_type)) list;
+  function_sigs : function_sig list;
   classes : (string * class_info) list;
+  current_namespace : string list;
 }
 
 let generated_method_info (fn : function_def) =
@@ -599,16 +684,22 @@ let build_function_sigs (program : program) =
       (fun (imported_header : header_import) -> imported_header.functions)
       program.imports
     |> List.map (fun (fn : contracted_function) ->
-           fn.name,
-           ( List.map (fun param -> param.param_type) fn.params
-           , fn.return_type ))
+           {
+             actual_name = fn.name;
+             base_name = overload_base_name fn.name;
+             param_types = dispatch_param_types fn.name fn.params;
+             return_type = fn.return_type;
+           })
   in
   let locals =
     List.map
       (fun (fn : function_def) ->
-        fn.name,
-        ( List.map (fun param -> param.param_type) fn.params
-        , fn.return_type ))
+        {
+          actual_name = fn.name;
+          base_name = overload_base_name fn.name;
+          param_types = dispatch_param_types fn.name fn.params;
+          return_type = fn.return_type;
+        })
       (program.functions @ [ program.main ])
   in
   imported @ locals
@@ -617,12 +708,125 @@ let lookup_var_type env name =
   assoc_opt name env.vars
 
 let lookup_function_sig env name =
-  assoc_opt name env.function_sigs
+  List.find_opt (fun signature -> String.equal signature.actual_name name) env.function_sigs
 
 let lookup_class_info env class_name =
   assoc_opt class_name env.classes
 
-let rec desugar_addressable_type env = function
+let overload_signature_matches arg_types param_types =
+  if List.length arg_types <> List.length param_types then
+    None
+  else
+    let rec loop unknowns arg_types param_types =
+      match arg_types, param_types with
+      | [], [] -> Some unknowns
+      | arg_type :: rest_args, param_type :: rest_params ->
+          (match arg_type with
+          | Some arg_type when arg_type = param_type ->
+              loop unknowns rest_args rest_params
+          | Some _ ->
+              None
+          | None ->
+              loop (unknowns + 1) rest_args rest_params)
+      | _ ->
+          None
+    in
+    loop 0 arg_types param_types
+
+let format_overload_types arg_types =
+  let format = function
+    | Some c_type -> c_type_to_c c_type
+    | None -> "?"
+  in
+  String.concat ", " (List.map format arg_types)
+
+let choose_best_signature context call_name arg_types candidates =
+  let matches =
+    List.filter_map
+      (fun (candidate : function_sig) ->
+        Option.map
+          (fun unknowns -> unknowns, candidate)
+          (overload_signature_matches arg_types candidate.param_types))
+      candidates
+  in
+  match matches with
+  | [] ->
+      failwith
+        (Printf.sprintf
+           "no matching overload for %s `%s(%s)`"
+           context
+           call_name
+           (format_overload_types arg_types))
+  | _ ->
+      let best_unknowns =
+        List.fold_left
+          (fun best (unknowns, _) -> min best unknowns)
+          max_int
+          matches
+      in
+      let best_matches =
+        List.filter
+          (fun (unknowns, _) -> unknowns = best_unknowns)
+          matches
+      in
+      match best_matches with
+      | [ _, candidate ] ->
+          candidate
+      | _ ->
+          failwith
+            (Printf.sprintf
+               "ambiguous overload for %s `%s(%s)`"
+               context
+               call_name
+               (format_overload_types arg_types))
+
+let rec resolve_free_function_sig env name args =
+  match lookup_function_sig env name with
+  | Some signature ->
+      Some signature
+  | None ->
+      let arg_types = List.map (desugar_expr_type env) args in
+      let rec search = function
+        | [] -> None
+        | candidate_base :: rest ->
+            let candidates =
+              List.filter
+                (fun (signature : function_sig) ->
+                  String.equal signature.base_name candidate_base)
+                env.function_sigs
+            in
+            (match candidates with
+            | [] -> search rest
+            | _ ->
+                Some
+                  (choose_best_signature
+                     "function call"
+                     candidate_base
+                     arg_types
+                     candidates))
+      in
+      search (namespace_reference_candidates ~current_namespace:env.current_namespace name)
+
+and resolve_method_sig env class_name method_name args =
+  let call_name = class_method_name class_name method_name in
+  let candidates =
+    List.filter
+      (fun (signature : function_sig) ->
+        String.equal signature.base_name call_name)
+      env.function_sigs
+  in
+  match candidates with
+  | [] -> None
+  | _ ->
+      let arg_types = List.map (desugar_expr_type env) args in
+      Some
+        (choose_best_signature
+           "method call"
+           call_name
+           arg_types
+           candidates)
+
+and desugar_addressable_type env = function
   | Var name ->
       lookup_var_type env name
   | Field (base, field) ->
@@ -714,11 +918,9 @@ and desugar_expr_type env = function
           | Some (TRecord class_name) ->
               (match lookup_class_info env class_name with
               | Some class_info when List.mem method_name class_info.method_names ->
-                  (match
-                     lookup_function_sig env (class_method_name class_name method_name)
-                   with
-                  | Some (_, return_type) -> Some return_type
-                  | None -> None)
+                  Option.map
+                    (fun (signature : function_sig) -> signature.return_type)
+                    (resolve_method_sig env class_name method_name (List.tl args))
               | Some _ | None -> None)
           | Some _ | None ->
               None)
@@ -727,18 +929,18 @@ and desugar_expr_type env = function
           | Some (TPointer (TRecord class_name)) ->
               (match lookup_class_info env class_name with
               | Some class_info when List.mem method_name class_info.method_names ->
-                  (match
-                     lookup_function_sig env (class_method_name class_name method_name)
-                   with
-                  | Some (_, return_type) -> Some return_type
-                  | None -> None)
+                  Option.map
+                    (fun (signature : function_sig) -> signature.return_type)
+                    (resolve_method_sig env class_name method_name (List.tl args))
               | Some _ | None -> None)
           | Some _ | None ->
               None)
       | Some _, [] ->
           None
       | None, _ ->
-          Option.map snd (lookup_function_sig env name))
+          Option.map
+            (fun (signature : function_sig) -> signature.return_type)
+            (resolve_free_function_sig env name args))
 
 let desugar_env_for_function (program : program) classes fn =
   {
@@ -752,6 +954,7 @@ let desugar_env_for_function (program : program) classes fn =
           fn.params;
     function_sigs = build_function_sigs program;
     classes;
+    current_namespace = namespace_path_of_name fn.name;
   }
 
 let desugar_receiver_method_call env kind method_name receiver args =
@@ -782,7 +985,15 @@ let desugar_receiver_method_call env kind method_name receiver args =
   in
   match lookup_class_info env class_name with
   | Some class_info when List.mem method_name class_info.method_names ->
-      FuncCall (class_method_name class_name method_name, receiver_arg :: args)
+      (match resolve_method_sig env class_name method_name args with
+      | Some signature ->
+          FuncCall (signature.actual_name, receiver_arg :: args)
+      | None ->
+          failwith
+            (Printf.sprintf
+               "unknown method `%s` on class `%s`"
+               method_name
+               class_name))
   | Some _ | None ->
       failwith
         (Printf.sprintf
@@ -836,10 +1047,19 @@ let rec desugar_method_expr env current_class = function
       | None, _ ->
           (match current_class with
           | Some class_info when List.mem name class_info.method_names ->
-              FuncCall
-                (class_method_name class_info.class_name name, Var method_this_name :: args)
+              (match resolve_method_sig env class_info.class_name name args with
+              | Some signature ->
+                  FuncCall (signature.actual_name, Var method_this_name :: args)
+              | None ->
+                  failwith
+                    (Printf.sprintf
+                       "unknown method `%s` on class `%s`"
+                       name
+                       class_info.class_name))
           | Some _ | None ->
-              FuncCall (name, args)))
+              (match resolve_free_function_sig env name args with
+              | Some signature -> FuncCall (signature.actual_name, args)
+              | None -> FuncCall (name, args))))
 
 let rec desugar_method_bexpr env current_class = function
   | True -> True
@@ -1175,11 +1395,15 @@ let parse_program
       Header_contracts.load_defined_contracts ~source_path:source_name source
     in
     let loop_invariants = Loop_annotations.load ~source_path:source_name source in
-    let defined_contracts = build_defined_contract_env source_name defined_contracts in
     let program =
       Parser.program Lexer.read lexbuf
       |> attach_loop_invariants source_name loop_invariants
     in
+    let program = resolve_program_type_names program in
+    let imports, defined_contracts, program =
+      mangle_overloaded_program_names imports defined_contracts program
+    in
+    let defined_contracts = build_defined_contract_env source_name defined_contracts in
     let* program = resolve_program_locals program in
     let program = resolve_program_type_names program in
     let program = desugar_classes program in

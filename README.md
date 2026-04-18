@@ -165,6 +165,38 @@ Use `result` inside `@Guarantee` to refer to the returned value.
 Operationally, Anvil assumes it after a contracted call, and proves it inside a contracted implementation.
 In practice, `@Safety` should be written as a state invariant rather than as a property of `result`.
 
+## Overloading And Type-Directed Dispatch
+
+Anvil now supports a simple form of C++-style overload resolution for free functions and methods.
+
+The current model is intentionally small:
+
+- dispatch is based on the statically inferred argument types;
+- overload resolution requires an exact type match on the explicit parameters;
+- methods dispatch on the receiver type plus the explicit argument types; and
+- overloaded names are lowered to mangled C identifiers in the pretty-printer.
+
+For example, these overloads:
+
+```c
+int pick(int value) { return (value + 1); }
+int pick(bool high) { return high ? 7 : 3; }
+```
+
+are lowered to names like:
+
+- `pick__ol__int`
+- `pick__ol__bool`
+
+Unique functions and methods keep their existing names.
+
+This is still static dispatch, not a full virtual-method runtime:
+
+- no inheritance
+- no vtables
+- no late-bound virtual dispatch
+- no implicit numeric conversions during overload selection
+
 ## Ghost Heap Interface
 
 Memory reasoning in Anvil is contract-driven rather than automatic.

@@ -127,6 +127,10 @@ let namespace_separator = "__ns__"
 
 let raw_namespace_separator = "::"
 
+let overload_separator = "__ol__"
+
+let overload_void_tag = "void"
+
 let contains_substring ~sub s =
   let sub_len = String.length sub in
   let s_len = String.length s in
@@ -136,6 +140,16 @@ let contains_substring ~sub s =
     else loop (i + 1)
   in
   if sub_len = 0 then true else loop 0
+
+let find_substring ~sub s =
+  let sub_len = String.length sub in
+  let s_len = String.length s in
+  let rec loop i =
+    if i + sub_len > s_len then None
+    else if String.sub s i sub_len = sub then Some i
+    else loop (i + 1)
+  in
+  if sub_len = 0 then Some 0 else loop 0
 
 let split_on_substring ~sep s =
   let sep_len = String.length sep in
@@ -176,6 +190,36 @@ let namespace_path_of_name name =
   match List.rev (split_on_substring ~sep:namespace_separator name) with
   | [] -> []
   | _base :: rev_namespace -> List.rev rev_namespace
+
+let rec overload_type_component = function
+  | TInt -> "int"
+  | TFloat -> "float"
+  | TDouble -> "double"
+  | TChar -> "char"
+  | TBool -> "bool"
+  | TVoid -> "void"
+  | TRecord name -> "record_" ^ name
+  | TPointer inner -> overload_type_component inner ^ "_ptr"
+  | TArray (inner, size) ->
+      Printf.sprintf "%s_array_%d" (overload_type_component inner) size
+
+let overload_suffix_of_params params =
+  let components =
+    match params with
+    | [] -> [ overload_void_tag ]
+    | _ ->
+        List.map (fun param -> overload_type_component param.param_type) params
+  in
+  String.concat "__" components
+
+let overload_base_name name =
+  match find_substring ~sub:overload_separator name with
+  | None -> name
+  | Some index ->
+      String.sub name 0 index
+
+let has_overload_suffix name =
+  not (String.equal (overload_base_name name) name)
 
 let method_this_name = "this"
 
@@ -221,6 +265,7 @@ let parse_method_call_name name =
     None
 
 let parse_class_method_name name =
+  let name = overload_base_name name in
   let rec find_last_double_underscore i last =
     if i + 1 >= String.length name then last
     else if name.[i] = '_' && name.[i + 1] = '_' then
@@ -237,6 +282,22 @@ let parse_class_method_name name =
       in
       if String.length class_name = 0 || String.length method_name = 0 then None
       else Some (class_name, method_name)
+
+let overload_dispatch_params name params =
+  match params with
+  | { param_type = TPointer (TRecord class_name); param_name = Some receiver } :: rest ->
+      (match parse_class_method_name name with
+      | Some (name_class, _method_name)
+        when String.equal receiver method_this_name && String.equal class_name name_class ->
+          rest
+      | Some _ | None ->
+          params)
+  | _ ->
+      params
+
+let mangle_overload_name name params =
+  let params = overload_dispatch_params name params in
+  overload_base_name name ^ overload_separator ^ overload_suffix_of_params params
 
 let rec c_type_to_c = function
   | TInt -> "int"
