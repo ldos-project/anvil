@@ -1,0 +1,3 @@
+[submodule "vulcan_examples/basic/libvulcan"]
+	path = vulcan_examples/basic/libvulcan
+	url = git@github.com:rohitdwivedula/libvulcan.git

@@ -11,3 +11,6 @@ _build/
 
 # macOS metadata
 .DS_Store
+
+vulcan_examples/basic/LLMCode.h
+vulcan_examples/basic/template
