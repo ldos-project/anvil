@@ -217,6 +217,22 @@ let add_binding scopes source_name binding =
       else
         ((source_name, binding) :: current_scope) :: rest
 
+let add_quantified_bindings scopes bindings =
+  match scopes with
+  | [] -> failwith "internal error: missing scope while resolving quantified variables"
+  | current_scope :: rest ->
+      let current_scope =
+        List.fold_left
+          (fun current_scope (binding : quantified_var) ->
+            (binding.quant_name, {
+               resolved_name = binding.quant_name;
+               resolved_type = binding.quant_type;
+             }) :: current_scope)
+          current_scope
+          bindings
+      in
+      current_scope :: rest
+
 let rec resolve_expr scopes = function
   | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ as expr -> expr
   | Var name ->
@@ -245,6 +261,8 @@ let rec resolve_expr scopes = function
 let rec resolve_bexpr scopes = function
   | True -> True
   | False -> False
+  | Forall (bindings, body) ->
+      Forall (bindings, resolve_bexpr (add_quantified_bindings scopes bindings) body)
   | Eq (left, right) ->
       Eq (resolve_expr scopes left, resolve_expr scopes right)
   | Neq (left, right) ->
@@ -1094,6 +1112,8 @@ let rec desugar_method_expr env current_class = function
 let rec desugar_method_bexpr env current_class = function
   | True -> True
   | False -> False
+  | Forall (bindings, body) ->
+      Forall (bindings, desugar_method_bexpr env current_class body)
   | Eq (left, right) ->
       Eq
         (desugar_method_expr env current_class left, desugar_method_expr env current_class right)
@@ -1243,6 +1263,8 @@ let rec resolve_value_expr env = function
 let rec resolve_value_bexpr env = function
   | True -> True
   | False -> False
+  | Forall (bindings, body) ->
+      Forall (bindings, resolve_value_bexpr env body)
   | Eq (left, right) ->
       Eq (resolve_value_expr env left, resolve_value_expr env right)
   | Neq (left, right) ->
@@ -1415,6 +1437,7 @@ let attach_loop_invariants source_name invariants program =
            source_name)
 
 let parse_program
+    ?(strict = false)
     ?(base_dir = Sys.getcwd ())
     ?(source_name = "<input>")
     source =
@@ -1430,8 +1453,15 @@ let parse_program
       |> attach_loop_invariants source_name loop_invariants
     in
     let program = resolve_program_type_names program in
+    let program = { program with imports } in
     let imports, defined_contracts, program =
       mangle_overloaded_program_names imports defined_contracts program
+    in
+    let* () =
+      if strict then
+        Strict_syntax.validate_program { program with imports }
+      else
+        Ok ()
     in
     let defined_contracts = build_defined_contract_env source_name defined_contracts in
     let* program = resolve_program_locals program in

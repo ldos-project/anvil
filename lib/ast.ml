@@ -35,10 +35,22 @@ type param = {
   param_name : string option;
 }
 
+type quantified_var = {
+  quant_type : c_type;
+  quant_name : string;
+}
+
+type ghost_binding = {
+  ghost_type : c_type;
+  ghost_name : string;
+  ghost_value : string;
+}
+
 type contract = {
-  require : string;
-  guarantee : string;
-  safety : string;
+  ghosts : ghost_binding list;
+  require : string list;
+  guarantee : string list;
+  safety : string list;
 }
 
 type contracted_function = {
@@ -76,6 +88,7 @@ type expr =
 type bexpr =
   | True
   | False
+  | Forall of quantified_var list * bexpr
   | Eq of expr * expr
   | Neq of expr * expr
   | Lt of expr * expr
@@ -571,9 +584,17 @@ let expr_to_c expr =
 let postfix_receiver_to_c expr =
   expr_to_c_with_prec expr_prec_postfix expr
 
+let quantified_var_to_c quantified =
+  type_with_name_to_c quantified.quant_type quantified.quant_name
+
 let rec bexpr_to_c = function
   | True -> "1"
   | False -> "0"
+  | Forall (bindings, body) ->
+      "forall("
+      ^ String.concat ", " (List.map quantified_var_to_c bindings)
+      ^ "). "
+      ^ bexpr_to_c body
   | Eq (a, b) -> "(" ^ expr_to_c a ^ " == " ^ expr_to_c b ^ ")"
   | Neq (a, b) -> "(" ^ expr_to_c a ^ " != " ^ expr_to_c b ^ ")"
   | Lt (a, b) -> "(" ^ expr_to_c a ^ " < " ^ expr_to_c b ^ ")"
@@ -584,8 +605,26 @@ let rec bexpr_to_c = function
   | And (p, q) -> "(" ^ bexpr_to_c p ^ " && " ^ bexpr_to_c q ^ ")"
   | Or (p, q) -> "(" ^ bexpr_to_c p ^ " || " ^ bexpr_to_c q ^ ")"
 
-let bexpr_to_annotation = function
-  | bexpr -> bexpr_to_c bexpr
+let rec bexpr_to_annotation = function
+  | True -> "1"
+  | False -> "0"
+  | Forall (bindings, body) ->
+      "forall("
+      ^ String.concat ", " (List.map quantified_var_to_c bindings)
+      ^ "). "
+      ^ bexpr_to_annotation body
+  | Eq (a, b) -> "(" ^ expr_to_c a ^ " == " ^ expr_to_c b ^ ")"
+  | Neq (a, b) -> "(" ^ expr_to_c a ^ " != " ^ expr_to_c b ^ ")"
+  | Lt (a, b) -> "(" ^ expr_to_c a ^ " < " ^ expr_to_c b ^ ")"
+  | Le (a, b) -> "(" ^ expr_to_c a ^ " <= " ^ expr_to_c b ^ ")"
+  | Gt (a, b) -> "(" ^ expr_to_c a ^ " > " ^ expr_to_c b ^ ")"
+  | Ge (a, b) -> "(" ^ expr_to_c a ^ " >= " ^ expr_to_c b ^ ")"
+  | Not p -> "(!" ^ bexpr_to_annotation p ^ ")"
+  | And (p, q) -> "(" ^ bexpr_to_annotation p ^ " && " ^ bexpr_to_annotation q ^ ")"
+  | Or (Not premise, conclusion) ->
+      "(" ^ bexpr_to_annotation premise ^ " ==> " ^ bexpr_to_annotation conclusion
+      ^ ")"
+  | Or (p, q) -> "(" ^ bexpr_to_annotation p ^ " || " ^ bexpr_to_annotation q ^ ")"
 
 let indent n = String.make (n * 2) ' '
 
@@ -624,12 +663,46 @@ let record_def_to_c record =
 let sort_uniq_strings names =
   List.sort_uniq String.compare names
 
-let contract_to_c = function
+let empty_contract = {
+  ghosts = [];
+  require = [];
+  guarantee = [];
+  safety = [];
+}
+
+let contract_is_empty contract =
+  contract.ghosts = []
+  && contract.require = []
+  && contract.guarantee = []
+  && contract.safety = []
+
+let merge_contracts left right =
+  {
+    ghosts = left.ghosts @ right.ghosts;
+    require = left.require @ right.require;
+    guarantee = left.guarantee @ right.guarantee;
+    safety = left.safety @ right.safety;
+  }
+
+let contract_to_c function_name = function
   | None -> ""
   | Some contract ->
-      "/* @Require " ^ contract.require ^ "\n"
-      ^ " * @Guarantee " ^ contract.guarantee ^ "\n"
-      ^ " * @Safety " ^ contract.safety ^ "\n"
+      let ghost_lines =
+        List.map
+          (fun ghost ->
+            " * @Ghost " ^ c_type_to_c ghost.ghost_type ^ " " ^ ghost.ghost_name
+            ^ " = " ^ ghost.ghost_value ^ "\n")
+          contract.ghosts
+      in
+      let clause_lines tag clauses =
+        List.map (fun clause -> " * " ^ tag ^ " " ^ clause ^ "\n") clauses
+      in
+      "/* @Contract " ^ function_name ^ "\n"
+      ^ String.concat ""
+          (ghost_lines
+          @ clause_lines "@Require" contract.require
+          @ clause_lines "@Guarantee" contract.guarantee
+          @ clause_lines "@Safety" contract.safety)
       ^ " */\n"
 
 let zero_literal_for_type = function
@@ -777,6 +850,12 @@ let rec vars_in_expr = function
 
 let rec vars_in_bexpr = function
   | True | False -> []
+  | Forall (bindings, body) ->
+      let bound_names = List.map (fun binding -> binding.quant_name) bindings in
+      List.filter
+        (fun name ->
+          not (List.exists (fun bound_name -> String.equal name bound_name) bound_names))
+        (vars_in_bexpr body)
   | Eq (left, right)
   | Neq (left, right)
   | Lt (left, right)
@@ -848,7 +927,7 @@ let function_def_to_c fn =
     |> String.concat ""
   in
   let body = stmt_to_c ~indent_level:1 ~return_type:fn.return_type fn.body in
-  contract_to_c fn.contract
+  contract_to_c fn.name fn.contract
   ^ signature ^ " {\n"
   ^ unused_params
   ^ local_decls
@@ -895,6 +974,7 @@ let helper_prototypes p =
   in
   let rec helpers_in_bexpr acc = function
     | True | False -> acc
+    | Forall (_, body) -> helpers_in_bexpr acc body
     | Eq (left, right)
     | Neq (left, right)
     | Lt (left, right)

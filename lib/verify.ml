@@ -145,6 +145,17 @@ let expr_env_for_function (program : program) (fn : function_def) =
     function_sigs = build_function_sigs program;
   }
 
+let extend_expr_env_with_quantified_bindings env bindings =
+  {
+    env with
+    var_types =
+      List.fold_left
+        (fun var_types (binding : quantified_var) ->
+          (binding.quant_name, binding.quant_type) :: var_types)
+        env.var_types
+        bindings;
+  }
+
 let lookup_var_type env name =
   lookup_assoc name env.var_types
 
@@ -198,6 +209,14 @@ let rec expr_to_ir env = function
 let rec bexpr_to_ir env = function
   | True -> Ir.True
   | False -> Ir.False
+  | Forall (bindings, body) ->
+      let env = extend_expr_env_with_quantified_bindings env bindings in
+      Ir.mk_forall
+        (List.map
+           (fun (binding : quantified_var) ->
+             binding.quant_name, sort_of_c_type binding.quant_type)
+           bindings)
+        (bexpr_to_ir env body)
   | Eq (left, right) -> Ir.Eq (expr_to_ir env left, expr_to_ir env right)
   | Neq (left, right) -> Ir.Neq (expr_to_ir env left, expr_to_ir env right)
   | Lt (left, right) -> Ir.Lt (expr_to_ir env left, expr_to_ir env right)
@@ -231,7 +250,7 @@ let make_vc name function_name kind formula =
     |> List.map (fun name -> { label = name; term = Ir.Var name })
   in
   let app_queries =
-    Ir.collect_apps formula
+    Ir.collect_queryable_apps formula
     |> List.map (fun (_, term) ->
            { label = Ir.int_expr_to_pretty term; term })
   in
@@ -643,6 +662,8 @@ let rec apps_in_expr env acc = function
 
 let rec apps_in_bexpr env acc = function
   | True | False -> acc
+  | Forall (bindings, body) ->
+      apps_in_bexpr (extend_expr_env_with_quantified_bindings env bindings) acc body
   | Eq (left, right)
   | Neq (left, right)
   | Lt (left, right)
@@ -772,6 +793,22 @@ let rec symbolic_expr env = function
 let rec symbolic_bexpr env = function
   | True -> Ir.True
   | False -> Ir.False
+  | Forall (bindings, body) ->
+      let env =
+        List.filter
+          (fun (name, _value) ->
+            not
+              (List.exists
+                 (fun (binding : quantified_var) -> String.equal name binding.quant_name)
+                 bindings))
+          env
+      in
+      Ir.mk_forall
+        (List.map
+           (fun (binding : quantified_var) ->
+             binding.quant_name, sort_of_c_type binding.quant_type)
+           bindings)
+        (symbolic_bexpr env body)
   | Eq (left, right) ->
       Ir.Eq (symbolic_expr env left, symbolic_expr env right)
   | Neq (left, right) ->
@@ -866,6 +903,8 @@ let rec eval_formula model = function
       (match eval_formula model left, eval_formula model right with
       | Some left, Some right -> Some ((not left) || right)
       | _ -> None)
+  | Ir.Forall _ ->
+      None
   | Ir.Eq (left, right) ->
       (match eval_int_expr model left, eval_int_expr model right with
       | Some left, Some right -> Some (left = right)

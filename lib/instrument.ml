@@ -17,6 +17,14 @@ let parse_contract_bexpr context source =
   | Parser.Error ->
       Error (Printf.sprintf "parse error in %s at %s" context (position lexbuf))
 
+let parse_contract_expr context source =
+  let lexbuf = Lexing.from_string source in
+  try Ok (Parser.contract_expr_eof Lexer.read lexbuf) with
+  | Lexer.Syntax_error msg ->
+      Error (Printf.sprintf "%s in %s at %s" msg context (position lexbuf))
+  | Parser.Error ->
+      Error (Printf.sprintf "parse error in %s at %s" context (position lexbuf))
+
 let rec seq_of_list = function
   | [] -> Skip
   | [stmt] -> stmt
@@ -38,6 +46,11 @@ let assoc_opt key bindings =
     (fun (name, value) ->
       if String.equal name key then Some value else None)
     bindings
+
+let ( let* ) result f =
+  match result with
+  | Ok value -> f value
+  | Error _ as error -> error
 
 let rec substitute_expr bindings = function
   | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ as expr -> expr
@@ -64,6 +77,17 @@ let rec substitute_expr bindings = function
 let rec substitute_bexpr bindings = function
   | True -> True
   | False -> False
+  | Forall (quantified, body) ->
+      let bindings =
+        List.filter
+          (fun (name, _value) ->
+            not
+              (List.exists
+                 (fun (binding : quantified_var) -> String.equal name binding.quant_name)
+                 quantified))
+          bindings
+      in
+      Forall (quantified, substitute_bexpr bindings body)
   | Eq (left, right) ->
       Eq (substitute_expr bindings left, substitute_expr bindings right)
   | Neq (left, right) ->
@@ -100,6 +124,10 @@ let rec expr_has_var target = function
 
 let rec bexpr_has_var target = function
   | True | False -> false
+  | Forall (bindings, body) ->
+      if List.exists (fun (binding : quantified_var) -> String.equal binding.quant_name target) bindings
+      then false
+      else bexpr_has_var target body
   | Eq (left, right)
   | Neq (left, right)
   | Lt (left, right)
@@ -110,6 +138,295 @@ let rec bexpr_has_var target = function
   | Not inner -> bexpr_has_var target inner
   | And (left, right) | Or (left, right) ->
       bexpr_has_var target left || bexpr_has_var target right
+
+type ghost_env = {
+  scalar_bindings : (string * expr) list;
+  bool_bindings : (string * bexpr) list;
+  ghost_names : string list;
+}
+
+let empty_ghost_env ghost_names = {
+  scalar_bindings = [];
+  bool_bindings = [];
+  ghost_names;
+}
+
+let rec substitute_expr_with_ghosts scalar_bindings bool_bindings = function
+  | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ as expr -> Ok expr
+  | Var name ->
+      (match assoc_opt name scalar_bindings with
+      | Some value -> Ok value
+      | None ->
+          (match assoc_opt name bool_bindings with
+          | Some _ ->
+              Error
+                (Printf.sprintf
+                   "boolean ghost `%s` was used where a scalar expression was expected"
+                   name)
+          | None -> Ok (Var name)))
+  | AddrOf inner ->
+      let* inner = substitute_expr_with_ghosts scalar_bindings bool_bindings inner in
+      Ok (AddrOf inner)
+  | Index (base, index) ->
+      let* base = substitute_expr_with_ghosts scalar_bindings bool_bindings base in
+      let* index =
+        substitute_expr_with_ghosts scalar_bindings bool_bindings index
+      in
+      Ok (Index (base, index))
+  | Deref inner ->
+      let* inner = substitute_expr_with_ghosts scalar_bindings bool_bindings inner in
+      Ok (Deref inner)
+  | Field (base, field) ->
+      let* base = substitute_expr_with_ghosts scalar_bindings bool_bindings base in
+      Ok (Field (base, field))
+  | Add (left, right) ->
+      let* left = substitute_expr_with_ghosts scalar_bindings bool_bindings left in
+      let* right =
+        substitute_expr_with_ghosts scalar_bindings bool_bindings right
+      in
+      Ok (Add (left, right))
+  | Sub (left, right) ->
+      let* left = substitute_expr_with_ghosts scalar_bindings bool_bindings left in
+      let* right =
+        substitute_expr_with_ghosts scalar_bindings bool_bindings right
+      in
+      Ok (Sub (left, right))
+  | Mul (left, right) ->
+      let* left = substitute_expr_with_ghosts scalar_bindings bool_bindings left in
+      let* right =
+        substitute_expr_with_ghosts scalar_bindings bool_bindings right
+      in
+      Ok (Mul (left, right))
+  | Div (left, right) ->
+      let* left = substitute_expr_with_ghosts scalar_bindings bool_bindings left in
+      let* right =
+        substitute_expr_with_ghosts scalar_bindings bool_bindings right
+      in
+      Ok (Div (left, right))
+  | Mod (left, right) ->
+      let* left = substitute_expr_with_ghosts scalar_bindings bool_bindings left in
+      let* right =
+        substitute_expr_with_ghosts scalar_bindings bool_bindings right
+      in
+      Ok (Mod (left, right))
+  | FuncCall (name, args) ->
+      let rec loop acc = function
+        | [] -> Ok (List.rev acc)
+        | arg :: rest ->
+            let* arg =
+              substitute_expr_with_ghosts scalar_bindings bool_bindings arg
+            in
+            loop (arg :: acc) rest
+      in
+      let* args = loop [] args in
+      Ok (FuncCall (name, args))
+
+let bool_truthiness_binding bool_bindings positive left right =
+  let matched_name =
+    match left, right with
+    | Var name, Int 0
+    | Int 0, Var name ->
+        Some name
+    | _ ->
+        None
+  in
+  match matched_name with
+  | None -> None
+  | Some name ->
+      Option.map
+        (fun binding -> if positive then binding else Not binding)
+        (assoc_opt name bool_bindings)
+
+let remove_shadowed_bindings names bindings =
+  List.filter
+    (fun (name, _value) ->
+      not (List.exists (fun shadowed -> String.equal name shadowed) names))
+    bindings
+
+let rec substitute_bexpr_with_ghosts scalar_bindings bool_bindings = function
+  | True -> Ok True
+  | False -> Ok False
+  | Forall (bindings, body) ->
+      let bound_names =
+        List.map (fun (binding : quantified_var) -> binding.quant_name) bindings
+      in
+      let scalar_bindings = remove_shadowed_bindings bound_names scalar_bindings in
+      let bool_bindings = remove_shadowed_bindings bound_names bool_bindings in
+      let* body = substitute_bexpr_with_ghosts scalar_bindings bool_bindings body in
+      Ok (Forall (bindings, body))
+  | Eq (left, right) ->
+      (match bool_truthiness_binding bool_bindings false left right with
+      | Some binding -> Ok binding
+      | None ->
+          let* left =
+            substitute_expr_with_ghosts scalar_bindings bool_bindings left
+          in
+          let* right =
+            substitute_expr_with_ghosts scalar_bindings bool_bindings right
+          in
+          Ok (Eq (left, right)))
+  | Neq (left, right) ->
+      (match bool_truthiness_binding bool_bindings true left right with
+      | Some binding -> Ok binding
+      | None ->
+          let* left =
+            substitute_expr_with_ghosts scalar_bindings bool_bindings left
+          in
+          let* right =
+            substitute_expr_with_ghosts scalar_bindings bool_bindings right
+          in
+          Ok (Neq (left, right)))
+  | Lt (left, right) ->
+      let* left = substitute_expr_with_ghosts scalar_bindings bool_bindings left in
+      let* right = substitute_expr_with_ghosts scalar_bindings bool_bindings right in
+      Ok (Lt (left, right))
+  | Le (left, right) ->
+      let* left = substitute_expr_with_ghosts scalar_bindings bool_bindings left in
+      let* right = substitute_expr_with_ghosts scalar_bindings bool_bindings right in
+      Ok (Le (left, right))
+  | Gt (left, right) ->
+      let* left = substitute_expr_with_ghosts scalar_bindings bool_bindings left in
+      let* right = substitute_expr_with_ghosts scalar_bindings bool_bindings right in
+      Ok (Gt (left, right))
+  | Ge (left, right) ->
+      let* left = substitute_expr_with_ghosts scalar_bindings bool_bindings left in
+      let* right = substitute_expr_with_ghosts scalar_bindings bool_bindings right in
+      Ok (Ge (left, right))
+  | Not inner ->
+      let* inner = substitute_bexpr_with_ghosts scalar_bindings bool_bindings inner in
+      Ok (Not inner)
+  | And (left, right) ->
+      let* left = substitute_bexpr_with_ghosts scalar_bindings bool_bindings left in
+      let* right =
+        substitute_bexpr_with_ghosts scalar_bindings bool_bindings right
+      in
+      Ok (And (left, right))
+  | Or (left, right) ->
+      let* left = substitute_bexpr_with_ghosts scalar_bindings bool_bindings left in
+      let* right =
+        substitute_bexpr_with_ghosts scalar_bindings bool_bindings right
+      in
+      Ok (Or (left, right))
+
+let unresolved_ghost_name_in_expr ghost_env expr =
+  List.find_opt (fun name -> expr_has_var name expr) ghost_env.ghost_names
+
+let unresolved_ghost_name_in_bexpr ghost_env bexpr =
+  List.find_opt (fun name -> bexpr_has_var name bexpr) ghost_env.ghost_names
+
+let ghost_context (contract_fn : contracted_function) (ghost : ghost_binding) =
+  Printf.sprintf "@Ghost `%s` for `%s`" ghost.ghost_name contract_fn.name
+
+let instantiate_ghost_binding
+    (contract_fn : contracted_function)
+    base_scalar_bindings
+    ghost_env
+    (ghost : ghost_binding) =
+  if String.equal ghost.ghost_name "result" then
+    Error
+      (Printf.sprintf
+         "@Ghost for `%s` cannot use the reserved name `result`"
+         contract_fn.name)
+  else if Option.is_some (assoc_opt ghost.ghost_name base_scalar_bindings) then
+    Error
+      (Printf.sprintf
+         "@Ghost `%s` for `%s` conflicts with an existing binding"
+         ghost.ghost_name
+         contract_fn.name)
+  else if Option.is_some (assoc_opt ghost.ghost_name ghost_env.scalar_bindings)
+          || Option.is_some (assoc_opt ghost.ghost_name ghost_env.bool_bindings)
+  then
+    Error
+      (Printf.sprintf
+         "duplicate @Ghost `%s` for `%s`"
+         ghost.ghost_name
+         contract_fn.name)
+  else
+    let scalar_bindings = base_scalar_bindings @ ghost_env.scalar_bindings in
+    match ghost.ghost_type with
+    | TBool ->
+        let* bexpr =
+          parse_contract_bexpr (ghost_context contract_fn ghost) ghost.ghost_value
+        in
+        let* bexpr =
+          substitute_bexpr_with_ghosts
+            scalar_bindings
+            ghost_env.bool_bindings
+            bexpr
+        in
+        if bexpr_has_var "result" bexpr then
+          Error
+            (Printf.sprintf
+               "@Ghost `%s` for `%s` references `result`, but ghosts are evaluated at function entry"
+               ghost.ghost_name
+               contract_fn.name)
+        else
+          (match unresolved_ghost_name_in_bexpr ghost_env bexpr with
+          | Some name ->
+              Error
+                (Printf.sprintf
+                   "@Ghost `%s` for `%s` references unresolved ghost `%s`"
+                   ghost.ghost_name
+                   contract_fn.name
+                   name)
+          | None ->
+              Ok
+                {
+                  ghost_env with
+                  bool_bindings =
+                    ghost_env.bool_bindings @ [ ghost.ghost_name, bexpr ];
+                })
+    | TInt | TFloat | TDouble | TChar ->
+        let* expr =
+          parse_contract_expr (ghost_context contract_fn ghost) ghost.ghost_value
+        in
+        let* expr =
+          substitute_expr_with_ghosts scalar_bindings ghost_env.bool_bindings expr
+        in
+        if expr_has_var "result" expr then
+          Error
+            (Printf.sprintf
+               "@Ghost `%s` for `%s` references `result`, but ghosts are evaluated at function entry"
+               ghost.ghost_name
+               contract_fn.name)
+        else
+          (match unresolved_ghost_name_in_expr ghost_env expr with
+          | Some name ->
+              Error
+                (Printf.sprintf
+                   "@Ghost `%s` for `%s` references unresolved ghost `%s`"
+                   ghost.ghost_name
+                   contract_fn.name
+                   name)
+          | None ->
+              Ok
+                {
+                  ghost_env with
+                  scalar_bindings =
+                    ghost_env.scalar_bindings @ [ ghost.ghost_name, expr ];
+                })
+    | TVoid | TRecord _ | TPointer _ | TArray _ | TReference _ | TConstReference _ ->
+        Error
+          (Printf.sprintf
+             "unsupported @Ghost type `%s` for `%s`; only scalar ghost types are supported"
+             (c_type_to_c ghost.ghost_type)
+             contract_fn.name)
+
+let instantiate_ghost_bindings
+    (contract_fn : contracted_function)
+    base_scalar_bindings =
+  let ghost_names =
+    List.map (fun (ghost : ghost_binding) -> ghost.ghost_name) contract_fn.contract.ghosts
+  in
+  let rec loop ghost_env = function
+    | [] -> Ok ghost_env
+    | ghost :: rest ->
+        let* ghost_env =
+          instantiate_ghost_binding contract_fn base_scalar_bindings ghost_env ghost
+        in
+        loop ghost_env rest
+  in
+  loop (empty_ghost_env ghost_names) contract_fn.contract.ghosts
 
 let flatten_imports (imports : header_import list) : contracted_function list =
   List.concat_map
@@ -265,7 +582,9 @@ let instantiate_contract_clause
     (contract_fn : contracted_function)
     kind
     text
-    bindings =
+    scalar_bindings
+    bool_bindings
+    ghost_env =
   match
     parse_contract_bexpr
       (Printf.sprintf "%s contract for `%s`" kind contract_fn.name)
@@ -273,36 +592,61 @@ let instantiate_contract_clause
   with
   | Error msg -> Error msg
   | Ok bexpr ->
-      let bexpr = substitute_bexpr bindings bexpr in
-      Memory_safety.lower_contract_bexpr memory_env bexpr
+      let* bexpr =
+        substitute_bexpr_with_ghosts scalar_bindings bool_bindings bexpr
+      in
+      (match unresolved_ghost_name_in_bexpr ghost_env bexpr with
+      | Some name ->
+          Error
+            (Printf.sprintf
+               "%s contract for `%s` references unresolved ghost `%s`"
+               kind
+               contract_fn.name
+               name)
+      | None ->
+          Memory_safety.lower_contract_bexpr memory_env bexpr)
 
 let rec instantiate_contracts
     (memory_env : Memory_safety.contract_env)
     (contract_fn : contracted_function)
     kind
     texts
-    bindings =
+    scalar_bindings
+    bool_bindings
+    ghost_env =
   match texts with
   | [] -> Ok []
   | text :: rest ->
       (match
-         instantiate_contract_clause memory_env contract_fn kind text bindings
+         instantiate_contract_clause
+           memory_env
+           contract_fn
+           kind
+           text
+           scalar_bindings
+           bool_bindings
+           ghost_env
        with
       | Error _ as error -> error
       | Ok clause ->
-          (match instantiate_contracts memory_env contract_fn kind rest bindings with
+          (match
+             instantiate_contracts
+               memory_env
+               contract_fn
+               kind
+               rest
+               scalar_bindings
+               bool_bindings
+               ghost_env
+           with
           | Error _ as error -> error
           | Ok rest -> Ok (clause :: rest)))
-
-let ( let* ) result f =
-  match result with
-  | Ok value -> f value
-  | Error _ as error -> error
 
 type current_contract = {
   memory_env : Memory_safety.contract_env;
   contract_fn : contracted_function;
   param_bindings : (string * expr) list;
+  ghost_env : ghost_env;
 }
 
 let build_current_contract
@@ -310,7 +654,48 @@ let build_current_contract
     (contract_fn : contracted_function)
     (params : param list) =
   let* param_bindings = bind_definition_params contract_fn params in
-  Ok { memory_env; contract_fn; param_bindings }
+  let* ghost_env = instantiate_ghost_bindings contract_fn param_bindings in
+  Ok { memory_env; contract_fn; param_bindings; ghost_env }
+
+let entry_scalar_bindings current =
+  current.param_bindings @ current.ghost_env.scalar_bindings
+
+let scalar_bindings_with_result current result =
+  ("result", result) :: entry_scalar_bindings current
+
+let substitute_current_expr current expr =
+  let* expr =
+    substitute_expr_with_ghosts
+      (entry_scalar_bindings current)
+      current.ghost_env.bool_bindings
+      expr
+  in
+  match unresolved_ghost_name_in_expr current.ghost_env expr with
+  | Some name ->
+      Error
+        (Printf.sprintf
+           "expression in `%s` references unresolved ghost `%s`"
+           current.contract_fn.name
+           name)
+  | None ->
+      Ok expr
+
+let substitute_current_bexpr current bexpr =
+  let* bexpr =
+    substitute_bexpr_with_ghosts
+      (entry_scalar_bindings current)
+      current.ghost_env.bool_bindings
+      bexpr
+  in
+  match unresolved_ghost_name_in_bexpr current.ghost_env bexpr with
+  | Some name ->
+      Error
+        (Printf.sprintf
+           "condition in `%s` references unresolved ghost `%s`"
+           current.contract_fn.name
+           name)
+  | None ->
+      Ok bexpr
 
 let param_types params =
   List.map (fun param -> param.param_type) params
@@ -342,7 +727,10 @@ let effective_contract
 let instantiate_void_guarantee current =
   let* guarantees =
     instantiate_contracts current.memory_env current.contract_fn "@Guarantee"
-      current.contract_fn.contract.guarantee current.param_bindings
+      current.contract_fn.contract.guarantee
+      (entry_scalar_bindings current)
+      current.ghost_env.bool_bindings
+      current.ghost_env
   in
   if List.exists (bexpr_has_var "result") guarantees then
     Error
@@ -354,7 +742,10 @@ let instantiate_void_guarantee current =
 
 let instantiate_current_safety current =
   instantiate_contracts current.memory_env current.contract_fn "@Safety"
-    current.contract_fn.contract.safety current.param_bindings
+    current.contract_fn.contract.safety
+    (entry_scalar_bindings current)
+    current.ghost_env.bool_bindings
+    current.ghost_env
 
 let instantiate_step_safety current =
   let* safety = instantiate_current_safety current in
@@ -379,7 +770,9 @@ let instantiate_void_safety current =
 let instantiate_current_safety_with_result current result =
   instantiate_contracts current.memory_env current.contract_fn "@Safety"
     current.contract_fn.contract.safety
-    (("result", result) :: current.param_bindings)
+    (scalar_bindings_with_result current result)
+    current.ghost_env.bool_bindings
+    current.ghost_env
 
 let assert_clauses origin clauses =
   List.map (fun clause -> Assert (origin, clause)) clauses
@@ -435,21 +828,29 @@ let rec instrument_expr
                    contract_fn.name)
           | _ ->
               let* bindings = bind_params contract_fn args in
+              let* ghost_env = instantiate_ghost_bindings contract_fn bindings in
               let result_name, state = fresh_name contract_fn.return_type state in
               let result_expr = Var result_name in
               let* require =
                 instantiate_contracts memory_env contract_fn "@Require"
-                  contract_fn.contract.require bindings
+                  contract_fn.contract.require
+                  (bindings @ ghost_env.scalar_bindings)
+                  ghost_env.bool_bindings
+                  ghost_env
               in
               let* safety =
                 instantiate_contracts memory_env contract_fn "@Safety"
                   contract_fn.contract.safety
-                  (("result", result_expr) :: bindings)
+                  ([ ("result", result_expr) ] @ bindings @ ghost_env.scalar_bindings)
+                  ghost_env.bool_bindings
+                  ghost_env
               in
               let* guarantee =
                 instantiate_contracts memory_env contract_fn "@Guarantee"
                   contract_fn.contract.guarantee
-                  (("result", result_expr) :: bindings)
+                  ([ ("result", result_expr) ] @ bindings @ ghost_env.scalar_bindings)
+                  ghost_env.bool_bindings
+                  ghost_env
               in
               Ok
                 ( prefix
@@ -490,6 +891,12 @@ and instrument_bexpr
     bexpr =
   match bexpr with
   | True | False -> Ok ([], bexpr, state)
+  | Forall (bindings, body) ->
+      let* prefix, body, state = instrument_bexpr memory_env env state body in
+      if prefix <> [] then
+        Error "instrumented calls inside quantified formulas are unsupported"
+      else
+        Ok ([], Forall (bindings, body), state)
   | Eq (left, right) ->
       instrument_expr_comparison memory_env env state left right (fun l r -> Eq (l, r))
   | Neq (left, right) ->
@@ -536,6 +943,11 @@ and instrument_stmt
   | Block _ | LocalDecl _ ->
       Error "unresolved local syntax reached contract instrumentation"
   | Assign (name, expr) ->
+      let* expr =
+        match current_contract with
+        | None -> Ok expr
+        | Some current -> substitute_current_expr current expr
+      in
       let* prefix, expr, state = instrument_expr memory_env env state expr in
       (match current_contract with
       | None -> Ok (seq_of_list (prefix @ [ Assign (name, expr) ]), state)
@@ -543,6 +955,16 @@ and instrument_stmt
           let* stmt = append_safety_assert current (prefix @ [ Assign (name, expr) ]) in
           Ok (stmt, state))
   | Store (ptr, value) ->
+      let* ptr =
+        match current_contract with
+        | None -> Ok ptr
+        | Some current -> substitute_current_expr current ptr
+      in
+      let* value =
+        match current_contract with
+        | None -> Ok value
+        | Some current -> substitute_current_expr current value
+      in
       let* ptr_prefix, ptr, state = instrument_expr memory_env env state ptr in
       let* value_prefix, value, state = instrument_expr memory_env env state value in
       (match current_contract with
@@ -553,6 +975,21 @@ and instrument_stmt
           in
           Ok (stmt, state))
   | ArrayAssign (base, index, value) ->
+      let* base =
+        match current_contract with
+        | None -> Ok base
+        | Some current -> substitute_current_expr current base
+      in
+      let* index =
+        match current_contract with
+        | None -> Ok index
+        | Some current -> substitute_current_expr current index
+      in
+      let* value =
+        match current_contract with
+        | None -> Ok value
+        | Some current -> substitute_current_expr current value
+      in
       let* base_prefix, base, state = instrument_expr memory_env env state base in
       let* index_prefix, index, state = instrument_expr memory_env env state index in
       let* value_prefix, value, state = instrument_expr memory_env env state value in
@@ -569,6 +1006,16 @@ and instrument_stmt
           in
           Ok (stmt, state))
   | FieldAssign (base, field, value) ->
+      let* base =
+        match current_contract with
+        | None -> Ok base
+        | Some current -> substitute_current_expr current base
+      in
+      let* value =
+        match current_contract with
+        | None -> Ok value
+        | Some current -> substitute_current_expr current value
+      in
       let* base_prefix, base, state = instrument_expr memory_env env state base in
       let* value_prefix, value, state = instrument_expr memory_env env state value in
       (match current_contract with
@@ -581,6 +1028,11 @@ and instrument_stmt
           in
           Ok (stmt, state))
   | Assume cond ->
+      let* cond =
+        match current_contract with
+        | None -> Ok cond
+        | Some current -> substitute_current_bexpr current cond
+      in
       let* prefix, cond, state = instrument_bexpr memory_env env state cond in
       (match current_contract with
       | None -> Ok (seq_of_list (prefix @ [ Assume cond ]), state)
@@ -588,6 +1040,11 @@ and instrument_stmt
           let* stmt = append_safety_assert current (prefix @ [ Assume cond ]) in
           Ok (stmt, state))
   | Assert (origin, cond) ->
+      let* cond =
+        match current_contract with
+        | None -> Ok cond
+        | Some current -> substitute_current_bexpr current cond
+      in
       let* prefix, cond, state = instrument_bexpr memory_env env state cond in
       (match current_contract with
       | None -> Ok (seq_of_list (prefix @ [ Assert (origin, cond) ]), state)
@@ -601,6 +1058,11 @@ and instrument_stmt
         match value with
         | None -> Ok ([], None, state)
         | Some expr ->
+            let* expr =
+              match current_contract with
+              | None -> Ok expr
+              | Some current -> substitute_current_expr current expr
+            in
             let* prefix, expr, state = instrument_expr memory_env env state expr in
             Ok (prefix, Some expr, state)
       in
@@ -617,7 +1079,9 @@ and instrument_stmt
             | Some result ->
                 instantiate_contracts current.memory_env current.contract_fn "@Guarantee"
                   current.contract_fn.contract.guarantee
-                  (("result", result) :: current.param_bindings)
+                  (scalar_bindings_with_result current result)
+                  current.ghost_env.bool_bindings
+                  current.ghost_env
             | None -> instantiate_void_guarantee current
           in
           Ok
@@ -633,6 +1097,11 @@ and instrument_stmt
       in
       Ok (seq_of_list stmts, state)
   | If (cond, then_branch, else_branch) ->
+      let* cond =
+        match current_contract with
+        | None -> Ok cond
+        | Some current -> substitute_current_bexpr current cond
+      in
       let* prefix, cond, state = instrument_bexpr memory_env env state cond in
       let* then_branch, state =
         instrument_stmt memory_env env current_contract state then_branch
@@ -649,6 +1118,19 @@ and instrument_stmt
           in
           Ok (stmt, state))
   | While (invariant, cond, body) ->
+      let* invariant =
+        match current_contract, invariant with
+        | _, None -> Ok None
+        | None, Some invariant -> Ok (Some invariant)
+        | Some current, Some invariant ->
+            let* invariant = substitute_current_bexpr current invariant in
+            Ok (Some invariant)
+      in
+      let* cond =
+        match current_contract with
+        | None -> Ok cond
+        | Some current -> substitute_current_bexpr current cond
+      in
       let* prefix, cond, state = instrument_bexpr memory_env env state cond in
       if prefix <> [] then
         Error "instrumented calls inside `while` conditions are unsupported"
@@ -660,6 +1142,11 @@ and instrument_stmt
             let* stmt = append_safety_assert current [ While (invariant, cond, body) ] in
             Ok (stmt, state))
   | Free ptr ->
+      let* ptr =
+        match current_contract with
+        | None -> Ok ptr
+        | Some current -> substitute_current_expr current ptr
+      in
       let* prefix, ptr, state = instrument_expr memory_env env state ptr in
       (match current_contract with
       | None -> Ok (seq_of_list (prefix @ [ Free ptr ]), state)
@@ -713,8 +1200,14 @@ let instrument_function
         instrument_stmt memory_env env (Some current) state fn.body
       in
       let* require =
-        instantiate_contracts memory_env contract_fn "@Require" contract_fn.contract.require
-          current.param_bindings
+        instantiate_contracts
+          memory_env
+          contract_fn
+          "@Require"
+          contract_fn.contract.require
+          (entry_scalar_bindings current)
+          current.ghost_env.bool_bindings
+          current.ghost_env
       in
       let body = seq_of_list (assume_clauses require @ [ body ]) in
       let* body =

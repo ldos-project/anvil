@@ -45,6 +45,7 @@ rule read = parse
   | "namespace"         { NAMESPACE_KW }
   | "true"              { TRUE_KW }
   | "false"             { FALSE_KW }
+  | "forall"            { FORALL_KW }
   | "main"              { MAIN_KW }
   | "void"              { VOID_KW }
   | "if"                { IF_KW }
@@ -54,6 +55,7 @@ rule read = parse
   | "free"              { FREE_KW }
   | "&&"                { AND }
   | "||"                { OR }
+  | "==>"               { IMPLIES }
   | "::"                { SCOPE }
   | "->"                { ARROW }
   | "+="                { PLUSEQ }

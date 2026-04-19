@@ -147,6 +147,7 @@ let parse_param text =
 
 type pending_contract = {
   target_name : string option;
+  ghosts : ghost_binding list;
   require : string list;
   guarantee : string list;
   safety : string list;
@@ -170,18 +171,61 @@ type function_signature = {
 
 let empty_pending_contract = {
   target_name = None;
+  ghosts = [];
   require = [];
   guarantee = [];
   safety = [];
 }
 
 let pending_has_clauses contract =
-  contract.require <> []
+  contract.ghosts <> []
+  || contract.require <> []
   || contract.guarantee <> []
   || contract.safety <> []
 
+let supported_ghost_type = function
+  | TInt | TFloat | TDouble | TChar | TBool -> true
+  | TVoid | TRecord _ | TPointer _ | TArray _ | TReference _ | TConstReference _ ->
+      false
+
+let parse_ghost_binding line_number header_path value =
+  let eq_index =
+    match find_substring ~sub:"=" value with
+    | Some index -> index
+    | None ->
+        fail "expected `=` in @Ghost in %s at line %d" header_path line_number
+  in
+  let lhs = String.sub value 0 eq_index |> String.trim in
+  let rhs =
+    String.sub value (eq_index + 1) (String.length value - eq_index - 1)
+    |> String.trim
+  in
+  if rhs = "" then
+    fail "empty @Ghost initializer in %s at line %d" header_path line_number;
+  match split_last_identifier lhs with
+  | Some (type_part, name) when type_part <> "" ->
+      let ghost_type = parse_c_type type_part in
+      if not (supported_ghost_type ghost_type) then
+        fail
+          "unsupported @Ghost type `%s` in %s at line %d; only scalar ghost types are supported"
+          (c_type_to_c ghost_type)
+          header_path
+          line_number;
+      { ghost_type; ghost_name = name; ghost_value = rhs }
+  | _ ->
+      fail "unsupported @Ghost declaration in %s at line %d" header_path line_number
+
+let has_duplicate_ghost name ghosts =
+  List.exists (fun ghost -> String.equal ghost.ghost_name name) ghosts
+
+let pending_has_content contract =
+  contract.require <> []
+  || contract.guarantee <> []
+  || contract.safety <> []
+  || contract.ghosts <> []
+
 let has_pending_contract (contract : pending_contract) =
-  Option.is_some contract.target_name || pending_has_clauses contract
+  Option.is_some contract.target_name || pending_has_content contract
 
 let take_tag_value ~tag line =
   if starts_with ~prefix:tag line then
@@ -220,6 +264,16 @@ let append_contract_field line_number header_path (contract : pending_contract) 
       { contract with safety = contract.safety @ [ value ] }
   | _ -> contract
 
+let append_ghost_binding line_number header_path (contract : pending_contract) value =
+  let ghost = parse_ghost_binding line_number header_path value in
+  if has_duplicate_ghost ghost.ghost_name contract.ghosts then
+    fail
+      "duplicate @Ghost `%s` in %s at line %d"
+      ghost.ghost_name
+      header_path
+      line_number;
+  { contract with ghosts = contract.ghosts @ [ ghost ] }
+
 let consume_comment_line (contract : pending_contract) ~header_path ~line_number raw_line =
   let trimmed = String.trim raw_line in
   let trimmed =
@@ -231,18 +285,22 @@ let consume_comment_line (contract : pending_contract) ~header_path ~line_number
   | Some value ->
       set_contract_target line_number header_path contract value
   | None ->
-      (match take_tag_value ~tag:"@Require" trimmed with
+      (match take_tag_value ~tag:"@Ghost" trimmed with
       | Some value ->
-          append_contract_field line_number header_path contract "@Require" value
+          append_ghost_binding line_number header_path contract value
       | None ->
-          (match take_tag_value ~tag:"@Guarantee" trimmed with
+          (match take_tag_value ~tag:"@Require" trimmed with
           | Some value ->
-              append_contract_field line_number header_path contract "@Guarantee" value
+              append_contract_field line_number header_path contract "@Require" value
           | None ->
-              (match take_tag_value ~tag:"@Safety" trimmed with
+              (match take_tag_value ~tag:"@Guarantee" trimmed with
               | Some value ->
-                  append_contract_field line_number header_path contract "@Safety" value
-              | None -> contract)))
+                  append_contract_field line_number header_path contract "@Guarantee" value
+              | None ->
+                  (match take_tag_value ~tag:"@Safety" trimmed with
+                  | Some value ->
+                      append_contract_field line_number header_path contract "@Safety" value
+                  | None -> contract))))
 
 let consume_comment_text (contract : pending_contract) ~header_path ~line_number text =
   String.split_on_char '\n' text
@@ -252,10 +310,10 @@ let consume_comment_text (contract : pending_contract) ~header_path ~line_number
        contract
 
 let materialize_contract_block ~header_path ~line_number (pending : pending_contract) =
-  if Option.is_some pending.target_name && not (pending_has_clauses pending) then
+  if Option.is_some pending.target_name && not (pending_has_content pending) then
     let name = Option.value pending.target_name ~default:"<unknown>" in
     fail "empty contract block for function `%s` in %s at line %d" name header_path line_number
-  else if not (pending_has_clauses pending) then
+  else if not (pending_has_content pending) then
     None
   else
     Some
@@ -263,6 +321,7 @@ let materialize_contract_block ~header_path ~line_number (pending : pending_cont
         target_name = pending.target_name;
         contract =
           {
+            ghosts = pending.ghosts;
             require = pending.require;
             guarantee = pending.guarantee;
             safety = pending.safety;

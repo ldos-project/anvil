@@ -160,6 +160,7 @@ let rec uses_memory_expr = function
 
 let rec count_malloc_bexpr = function
   | True | False -> 0
+  | Forall (_, body) -> count_malloc_bexpr body
   | Eq (left, right)
   | Neq (left, right)
   | Lt (left, right)
@@ -233,6 +234,7 @@ let rec uses_memory_stmt = function
 
 and uses_memory_bexpr = function
   | True | False -> false
+  | Forall (_, body) -> uses_memory_bexpr body
   | Eq (left, right)
   | Neq (left, right)
   | Lt (left, right)
@@ -252,6 +254,12 @@ let count_malloc_program program =
     program.functions
 
 let contract_mentions_memory_predicates contract =
+  let texts =
+    List.map (fun (ghost : ghost_binding) -> ghost.ghost_value) contract.ghosts
+    @ contract.require
+    @ contract.guarantee
+    @ contract.safety
+  in
   List.exists
     (fun predicate ->
       List.exists
@@ -266,7 +274,7 @@ let contract_mentions_memory_predicates contract =
               else loop (i + 1)
             in
             loop 0))
-        (contract.require @ contract.guarantee @ contract.safety))
+        texts)
     ghost_heap_predicates
 
 let function_mentions_memory_contract fn =
@@ -483,6 +491,25 @@ and lower_reference_expr_list env = function
 let rec lower_reference_bexpr env = function
   | True -> Ok True
   | False -> Ok False
+  | Forall (bindings, body) ->
+      let shadowed_names =
+        List.map (fun (binding : quantified_var) -> binding.quant_name) bindings
+      in
+      let env =
+        {
+          env with
+          reference_bindings =
+            List.filter
+              (fun (name, _) ->
+                not
+                  (List.exists
+                     (fun shadowed -> String.equal name shadowed)
+                     shadowed_names))
+              env.reference_bindings;
+        }
+      in
+      let* body = lower_reference_bexpr env body in
+      Ok (Forall (bindings, body))
   | Eq (left, right) ->
       let* left = lower_reference_expr env left in
       let* right = lower_reference_expr env right in
@@ -678,6 +705,8 @@ type env = {
   records : record_def list;
   scalar_globals : global_def list;
   pointer_globals : (var * c_type) list;
+  quantified_scalars : (var * c_type) list;
+  quantified_pointers : (var * c_type) list;
   function_sigs : (string * (c_type list * c_type)) list;
   malloc_sites : int;
 }
@@ -887,22 +916,51 @@ let shadowable_location env block_id offset width =
       else Some { block_id; offset }
 
 let is_pointer_name env name =
-  Option.is_some (assoc_opt name env.pointer_globals)
+  Option.is_some (assoc_opt name env.quantified_pointers)
+  || Option.is_some (assoc_opt name env.pointer_globals)
 
 let pointer_pointee_type env name =
-  assoc_opt name env.pointer_globals
+  match assoc_opt name env.quantified_pointers with
+  | Some pointee -> Some pointee
+  | None -> assoc_opt name env.pointer_globals
 
 let global_scalar_type env name =
-  List.find_map
-    (fun global ->
-      if String.equal global.global_name name then Some global.global_type else None)
-    env.scalar_globals
+  match assoc_opt name env.quantified_scalars with
+  | Some c_type -> Some c_type
+  | None ->
+      List.find_map
+        (fun global ->
+          if String.equal global.global_name name then Some global.global_type else None)
+        env.scalar_globals
 
 let global_decay_pointee_type env name =
   match global_scalar_type env name with
   | Some (TArray (element_type, _)) -> Some element_type
   | Some c_type -> Some c_type
   | None -> None
+
+let quantified_binding_partition (binding : quantified_var) =
+  match binding.quant_type with
+  | TInt | TFloat | TDouble | TChar | TBool ->
+      `Scalar (binding.quant_name, binding.quant_type)
+  | TPointer pointee ->
+      `Pointer (binding.quant_name, pointee)
+  | TVoid | TRecord _ | TArray _ | TReference _ | TConstReference _ ->
+      failwith
+        (Printf.sprintf
+           "unsupported quantified type `%s` in contract lowering"
+           (c_type_to_c binding.quant_type))
+
+let extend_env_with_quantified_bindings env bindings =
+  List.fold_left
+    (fun env binding ->
+      match quantified_binding_partition binding with
+      | `Scalar binding ->
+          { env with quantified_scalars = binding :: env.quantified_scalars }
+      | `Pointer binding ->
+          { env with quantified_pointers = binding :: env.quantified_pointers })
+    env
+    bindings
 
 let param_as_global (param : param) =
   match param.param_type, param.param_name with
@@ -961,6 +1019,8 @@ let function_env_of_program (program : program) fn malloc_sites =
       pointer_globals_of_program program
       @ pointer_bindings_of_params fn.params
       @ pointer_bindings_of_defs (pointer_globals fn.locals);
+    quantified_scalars = [];
+    quantified_pointers = [];
     function_sigs = build_function_sigs program;
     malloc_sites;
   }
@@ -1625,6 +1685,13 @@ and lower_bexpr env state bexpr =
   match bexpr with
   | True -> Ok ([], True, state)
   | False -> Ok ([], False, state)
+  | Forall (bindings, body) ->
+      let env = extend_env_with_quantified_bindings env bindings in
+      let* prefix, body, state = lower_bexpr env state body in
+      if prefix <> [] then
+        fail "memory operations inside quantified formulas are unsupported"
+      else
+        Ok ([], Forall (bindings, body), state)
   | Eq (left, right) ->
       lower_equality_like env state ~negated:false left right
   | Neq (left, right) ->
@@ -2111,6 +2178,8 @@ let contract_env_of_program (program : program) =
     records = program.records;
     scalar_globals = scalar_globals program.globals;
     pointer_globals = pointer_globals_of_program program;
+    quantified_scalars = [];
+    quantified_pointers = [];
     function_sigs = build_function_sigs program;
     malloc_sites = count_malloc_program program;
   }
@@ -2315,6 +2384,10 @@ let rec lower_contract_bexpr env bexpr =
   match bexpr with
   | True -> Ok True
   | False -> Ok False
+  | Forall (bindings, body) ->
+      let env = extend_env_with_quantified_bindings env bindings in
+      let* body = lower_contract_bexpr env body in
+      Ok (Forall (bindings, body))
   | Not inner ->
       let* inner = lower_contract_bexpr env inner in
       Ok (Not inner)
