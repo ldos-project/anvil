@@ -387,6 +387,233 @@ let assert_named_header_contract_import_handles_partial_contracts () =
                 ("Expected named-header example to verify, got:\n"
                 ^ Verify.format_outcome outcome)))
 
+let assert_multiple_contract_guarded_cases_verify () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n"
+    ^ "#include <stdbool.h>\n\n"
+    ^ "/* @Contract signed_from_bit\n"
+    ^ " * @Guarantee bit ==> result > 0\n"
+    ^ " */\n"
+    ^ "/* @Contract signed_from_bit\n"
+    ^ " * @Guarantee (!bit) ==> result < 0\n"
+    ^ " */\n"
+    ^ "int signed_from_bit(bool bit) {\n"
+    ^ "  if (bit) {\n"
+    ^ "    return 7;\n"
+    ^ "  } else {\n"
+    ^ "    return -3;\n"
+    ^ "  }\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  int pos;\n"
+    ^ "  int neg;\n"
+    ^ "  pos = signed_from_bit(true);\n"
+    ^ "  neg = signed_from_bit(false);\n"
+    ^ "  if (!(pos > 0)) { abort(); }\n"
+    ^ "  if (!(neg < 0)) { abort(); }\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Multiple-contract parse failed: " ^ e)
+  | Ok program ->
+      (match program.functions with
+      | [ fn ] ->
+          (match fn.contract with
+          | Some contract ->
+              if
+                not
+                  (List.equal String.equal contract.guarantee
+                     [ "bit ==> result > 0"; "(!bit) ==> result < 0" ])
+              then
+                failwith
+                  "Expected guarded guarantee clauses to be preserved in order"
+          | None ->
+              failwith "Expected guarded multiple-contract example to attach a contract")
+      | _ ->
+          failwith "Expected exactly one helper in guarded contract example");
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Multiple-contract verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected guarded multiple-contract example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_multiple_contract_guarded_cases_fail () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n"
+    ^ "#include <stdbool.h>\n\n"
+    ^ "/* @Contract signed_from_bit\n"
+    ^ " * @Guarantee bit ==> result > 0\n"
+    ^ " */\n"
+    ^ "/* @Contract signed_from_bit\n"
+    ^ " * @Guarantee (!bit) ==> result < 0\n"
+    ^ " */\n"
+    ^ "int signed_from_bit(bool bit) {\n"
+    ^ "  if (bit) {\n"
+    ^ "    return 7;\n"
+    ^ "  } else {\n"
+    ^ "    return 3;\n"
+    ^ "  }\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Multiple-contract counterexample parse failed: " ^ e)
+  | Ok program ->
+      (match Verify.verify_program program with
+      | Error e ->
+          failwith ("Multiple-contract counterexample verification failed: " ^ e)
+      | Ok (Verify.Counterexample { location; _ }) ->
+          if
+            not
+              (Option.value_map location ~default:false ~f:(String.equal
+                 "`signed_from_bit` could not prove its @Guarantee"))
+          then
+            failwith "Expected guarded guarantee failure location"
+      | Ok outcome ->
+          failwith
+            ("Expected guarded multiple-contract example to fail, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_ghost_contract_roundtrip_and_verification () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n"
+    ^ "#include <stdbool.h>\n\n"
+    ^ "/* @Contract signed_from_bit\n"
+    ^ " * @Ghost bool bit_is_set = bit != 0\n"
+    ^ " * @Guarantee bit_is_set ==> result > 0\n"
+    ^ " * @Guarantee (!bit_is_set) ==> result < 0\n"
+    ^ " */\n"
+    ^ "int signed_from_bit(bool bit) {\n"
+    ^ "  if (bit) {\n"
+    ^ "    return 7;\n"
+    ^ "  } else {\n"
+    ^ "    return -3;\n"
+    ^ "  }\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  int pos;\n"
+    ^ "  int neg;\n"
+    ^ "  pos = signed_from_bit(true);\n"
+    ^ "  neg = signed_from_bit(false);\n"
+    ^ "  if (!(pos > 0)) { abort(); }\n"
+    ^ "  if (!(neg < 0)) { abort(); }\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Ghost-contract parse failed: " ^ e)
+  | Ok program ->
+      (match program.functions with
+      | [ fn ] ->
+          (match fn.contract with
+          | Some contract ->
+              (match contract.ghosts with
+              | [ (ghost : ghost_binding) ] ->
+                  (match ghost.ghost_type with
+                  | TBool -> ()
+                  | _ -> failwith "Expected bool ghost binding");
+                  if not (String.equal ghost.ghost_name "bit_is_set") then
+                    failwith "Expected named ghost binding";
+                  if not (String.equal ghost.ghost_value "bit != 0") then
+                    failwith "Expected ghost initializer text to roundtrip"
+              | _ ->
+                  failwith "Expected exactly one ghost binding on signed_from_bit")
+          | None ->
+              failwith "Expected ghost contract to attach to signed_from_bit")
+      | _ ->
+          failwith "Expected exactly one helper in ghost-contract example");
+      (match parse_program (program_to_c program) with
+      | Error e -> failwith ("Ghost-contract roundtrip failed: " ^ e)
+      | Ok roundtripped ->
+          if not (equal_program program roundtripped) then
+            failwith "Ghost-contract roundtrip mismatch");
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Ghost-contract verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected ghost-contract example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_ghost_contract_counterexample () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n"
+    ^ "#include <stdbool.h>\n\n"
+    ^ "/* @Contract signed_from_bit\n"
+    ^ " * @Ghost bool bit_is_set = bit != 0\n"
+    ^ " * @Guarantee bit_is_set ==> result > 0\n"
+    ^ " * @Guarantee (!bit_is_set) ==> result < 0\n"
+    ^ " */\n"
+    ^ "int signed_from_bit(bool bit) {\n"
+    ^ "  if (bit) {\n"
+    ^ "    return 7;\n"
+    ^ "  } else {\n"
+    ^ "    return 3;\n"
+    ^ "  }\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Ghost-contract counterexample parse failed: " ^ e)
+  | Ok program ->
+      (match Verify.verify_program program with
+      | Error e ->
+          failwith ("Ghost-contract counterexample verification failed: " ^ e)
+      | Ok (Verify.Counterexample { location; _ }) ->
+          if
+            not
+              (Option.value_map location ~default:false ~f:(String.equal
+                 "`signed_from_bit` could not prove its @Guarantee"))
+          then
+            failwith "Expected ghost-contract guarantee failure location"
+      | Ok outcome ->
+          failwith
+            ("Expected ghost-contract example to fail, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_ghost_loop_invariant_verification () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n\n"
+    ^ "/* @Contract count_down\n"
+    ^ " * @Ghost int start = x\n"
+    ^ " * @Require x >= 0\n"
+    ^ " * @Guarantee result == 0\n"
+    ^ " * @Safety start >= 0\n"
+    ^ " */\n"
+    ^ "int count_down(int x) {\n"
+    ^ "  /* @Invariant start >= 0 && x >= 0 */\n"
+    ^ "  while ((x > 0)) {\n"
+    ^ "    x = (x - 1);\n"
+    ^ "  }\n"
+    ^ "  return x;\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  return count_down(3);\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Ghost invariant parse failed: " ^ e)
+  | Ok program ->
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Ghost invariant verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected ghost invariant example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
 let assert_verifier_reports_counterexample () =
   let source =
     "#include <stdlib.h>\n"
@@ -1385,6 +1612,371 @@ let assert_reference_header_import_roundtrip () =
               if not (equal_program program roundtripped) then
                 failwith "Reference header import roundtrip mismatch"))
 
+let assert_z3_ir_forall_printing_and_free_vars () =
+  let module Ir = Z3_ir in
+  let formula =
+    Ir.Forall
+      ( [ "x", Ir.Int ]
+      , Ir.Implies
+          ( Ir.Ge (Ir.Var "x", Ir.Int_lit 0)
+          , Ir.Eq
+              (Ir.App ("f", [ Ir.Var "x" ]), Ir.Add [ Ir.Var "y"; Ir.Int_lit 1 ])
+          ) )
+  in
+  let expected_smt =
+    "(forall ((x Int)) (=> (>= x 0) (= (f x) (+ y 1))))"
+  in
+  let actual_smt = Ir.formula_to_smt formula in
+  if not (String.equal actual_smt expected_smt) then
+    failwith
+      ("Unexpected quantified SMT output:\nexpected: "
+      ^ expected_smt
+      ^ "\nactual: "
+      ^ actual_smt);
+  let free_vars = Ir.collect_vars formula in
+  if not (List.equal String.equal free_vars [ "y" ]) then
+    failwith
+      ("Unexpected quantified free vars: "
+      ^ String.concat ~sep:", " free_vars)
+
+let assert_z3_ir_forall_substitution_avoids_capture () =
+  let module Ir = Z3_ir in
+  let formula =
+    Ir.Forall ([ "x", Ir.Int ], Ir.Eq (Ir.Var "y", Ir.Var "x"))
+  in
+  match Ir.subst_formula "y" (Ir.Var "x") formula with
+  | Ir.Forall ([ fresh, Ir.Int ], Ir.Eq (Ir.Var substituted, Ir.Var renamed)) ->
+      if not (String.equal substituted "x") then
+        failwith "Expected substitution to replace the free variable";
+      if String.equal fresh "x" then
+        failwith "Expected quantified binder to be alpha-renamed";
+      if not (String.equal renamed fresh) then
+        failwith "Expected renamed binder to thread through the body"
+  | rewritten ->
+      failwith
+        ("Unexpected quantified substitution result: "
+        ^ Ir.formula_to_pretty rewritten)
+
+let assert_z3_ir_forall_queryable_apps_exclude_bound_terms () =
+  let module Ir = Z3_ir in
+  let formula =
+    Ir.And
+      [ Ir.Eq (Ir.App ("top", [ Ir.Var "y" ]), Ir.Int_lit 0)
+      ; Ir.Forall
+          ( [ "x", Ir.Int ]
+          , Ir.Eq
+              (Ir.App ("f", [ Ir.Var "x" ]), Ir.App ("g", [ Ir.Int_lit 0 ]))
+          )
+      ]
+  in
+  let all_apps =
+    Ir.collect_apps formula
+    |> List.map ~f:fst
+    |> List.sort ~compare:String.compare
+  in
+  if not (List.equal String.equal all_apps [ "f"; "g"; "top" ]) then
+    failwith
+      ("Unexpected quantified app collection: "
+      ^ String.concat ~sep:", " all_apps);
+  let queryable_apps =
+    Ir.collect_queryable_apps formula
+    |> List.map ~f:fst
+    |> List.sort ~compare:String.compare
+  in
+  if not (List.equal String.equal queryable_apps [ "g"; "top" ]) then
+    failwith
+      ("Unexpected quantified queryable app collection: "
+      ^ String.concat ~sep:", " queryable_apps)
+
+let assert_z3_ir_forall_runs_in_z3 () =
+  let module Ir = Z3_ir in
+  let quantified =
+    Ir.Forall
+      ( [ "x", Ir.Int ]
+      , Ir.Eq
+          ( Ir.Add [ Ir.Var "x"; Ir.Int_lit 1 ]
+          , Ir.Add [ Ir.Int_lit 1; Ir.Var "x" ] ) )
+  in
+  match Verify.run_z3 [ Ir.Assert (Ir.mk_not quantified); Ir.Check_sat ] with
+  | Error message ->
+      failwith ("Z3 rejected quantified script: " ^ message)
+  | Ok output ->
+      (match Verify.sat_result_of_output output with
+      | Verify.Unsat -> ()
+      | Verify.Sat ->
+          failwith "Expected quantified arithmetic tautology to be unsat when negated"
+      | Verify.Unknown ->
+          failwith "Z3 reported unknown for quantified arithmetic tautology")
+
+let assert_quantified_contract_bexpr_roundtrip () =
+  let source =
+    "forall(int i, int* p). (((i >= 0) && (i <= 4)) ==> (is_null(p) || !is_null(p)))"
+  in
+  match parse_contract_bexpr "quantified test" source with
+  | Error message ->
+      failwith ("Quantified contract parse failed: " ^ message)
+  | Ok bexpr ->
+      let rendered = bexpr_to_annotation bexpr in
+      (match parse_contract_bexpr "quantified roundtrip" rendered with
+      | Error message ->
+          failwith ("Quantified contract roundtrip parse failed: " ^ message)
+      | Ok roundtripped ->
+          if not (Poly.equal roundtripped bexpr) then
+            failwith
+              ("Quantified contract roundtrip mismatch:\ninput="
+              ^ source
+              ^ "\nrendered="
+              ^ rendered))
+
+let assert_quantified_contract_verification () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n\n"
+    ^ "/* @Contract bump\n"
+    ^ " * @Guarantee forall(int i). (((i >= 0) && (i <= x)) ==> (result > i))\n"
+    ^ " * @Guarantee forall(int* p). (is_null(p) || !is_null(p))\n"
+    ^ " */\n"
+    ^ "int bump(int x) {\n"
+    ^ "  return (x + 1);\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Quantified contract program parse failed: " ^ e)
+  | Ok program ->
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Quantified contract verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected quantified contract example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_quantified_contract_counterexample () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n\n"
+    ^ "/* @Contract bump_bad\n"
+    ^ " * @Guarantee forall(int i). (((i >= 0) && (i <= x)) ==> (result > i))\n"
+    ^ " */\n"
+    ^ "int bump_bad(int x) {\n"
+    ^ "  return x;\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Quantified counterexample parse failed: " ^ e)
+  | Ok program ->
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Quantified counterexample verification failed: " ^ e)
+      | Ok Verify.Verified ->
+          failwith "Expected quantified contract example to produce a counterexample"
+      | Ok (Verify.Counterexample counterexample) ->
+          if not (String.is_substring counterexample.condition ~substring:"forall") then
+            failwith
+              ("Expected quantified condition in counterexample, got:\n"
+              ^ counterexample.condition)
+      | Ok outcome ->
+          failwith
+            ("Expected quantified contract counterexample, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_theorem_contract_roundtrip_and_verification () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n\n"
+    ^ "/* @Contract compare_int\n"
+    ^ " * @Guarantee (x <= y) ==> (result <= 0)\n"
+    ^ " * @Guarantee (result <= 0) ==> (x <= y)\n"
+    ^ " * @Guarantee (y <= x) ==> (result >= 0)\n"
+    ^ " * @Guarantee (result >= 0) ==> (y <= x)\n"
+    ^ " * @Guarantee (x == y) ==> (result == 0)\n"
+    ^ " * @Guarantee (result == 0) ==> (x == y)\n"
+    ^ " * @Theorem forall(int x). compare_int(x, x) = 0\n"
+    ^ " * @Theorem forall(int x, int y). (compare_int(x, y) = 0) ==> (x = y)\n"
+    ^ " * @Theorem forall(int x, int y, int z). (((compare_int(x, y) <= 0) && (compare_int(y, z) <= 0)) ==> (compare_int(x, z) <= 0))\n"
+    ^ " */\n"
+    ^ "int compare_int(int x, int y) {\n"
+    ^ "  if (x < y) {\n"
+    ^ "    return -1;\n"
+    ^ "  }\n"
+    ^ "  if (y < x) {\n"
+    ^ "    return 1;\n"
+    ^ "  }\n"
+    ^ "  return 0;\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Theorem contract parse failed: " ^ e)
+  | Ok program ->
+      (match parse_program (program_to_c program) with
+      | Error e -> failwith ("Theorem contract roundtrip failed: " ^ e)
+      | Ok roundtripped ->
+          if not (equal_program program roundtripped) then
+            failwith "Theorem contract roundtrip mismatch");
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Theorem contract verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected theorem contract example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_theorem_counterexample_reports_location () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n\n"
+    ^ "/* @Contract id\n"
+    ^ " * @Guarantee result = x\n"
+    ^ " * @Theorem forall(int x). id(x) = 1\n"
+    ^ " */\n"
+    ^ "int id(int x) {\n"
+    ^ "  return x;\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Theorem counterexample parse failed: " ^ e)
+  | Ok program ->
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Theorem counterexample verification failed: " ^ e)
+      | Ok Verify.Verified ->
+          failwith "Expected theorem counterexample example to fail"
+      | Ok (Verify.Counterexample counterexample) ->
+          if
+            not
+              (Option.value_map
+                 counterexample.location
+                 ~default:false
+                 ~f:(String.equal "`id` could not prove @Theorem 1"))
+          then
+            failwith "Expected @Theorem violation location";
+          if not (String.is_substring counterexample.condition ~substring:"forall") then
+            failwith
+              ("Expected quantified theorem condition in counterexample, got:\n"
+              ^ counterexample.condition)
+      | Ok outcome ->
+          failwith
+            ("Expected theorem counterexample, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_imported_theorem_is_reused_modularly () =
+  let header_path = Stdlib.Filename.temp_file "anvil_theorem_import" ".h" in
+  Fun.protect
+    ~finally:(fun () ->
+      try Stdlib.Sys.remove header_path with
+      | _ -> ())
+    (fun () ->
+      Out_channel.write_all header_path
+        ~data:
+          "/* @Contract bump\n\
+           * @Theorem forall(int x). bump(x) > x\n\
+           */\n\
+           int bump(int x);\n";
+      let base_dir = Stdlib.Filename.dirname header_path in
+      let include_name = Stdlib.Filename.basename header_path in
+      let source =
+        "#include \"" ^ include_name ^ "\"\n"
+        ^ "#include <stdlib.h>\n"
+        ^ "#include <stdio.h>\n\n"
+        ^ "/* @Contract use_bump\n"
+        ^ " * @Guarantee result = bump(x)\n"
+        ^ " * @Theorem forall(int x). use_bump(x) > x\n"
+        ^ " */\n"
+        ^ "int use_bump(int x) {\n"
+        ^ "  int y;\n"
+        ^ "  y = bump(x);\n"
+        ^ "  return y;\n"
+        ^ "}\n\n"
+        ^ "int main(void) {\n"
+        ^ "  return 0;\n"
+        ^ "}\n"
+      in
+      match parse_program ~base_dir source with
+      | Error e -> failwith ("Imported theorem parse failed: " ^ e)
+      | Ok program ->
+          (match Verify.verify_program program with
+          | Error e -> failwith ("Imported theorem verification failed: " ^ e)
+          | Ok Verify.Verified -> ()
+          | Ok outcome ->
+              failwith
+                ("Expected imported theorem example to verify, got:\n"
+                ^ Verify.format_outcome outcome)))
+
+let assert_header_theorem_on_local_definition_is_checked () =
+  let header_path = Stdlib.Filename.temp_file "anvil_theorem_local" ".h" in
+  Fun.protect
+    ~finally:(fun () ->
+      try Stdlib.Sys.remove header_path with
+      | _ -> ())
+    (fun () ->
+      Out_channel.write_all header_path
+        ~data:
+          "/* @Contract id\n\
+           * @Theorem forall(int x). id(x) = 1\n\
+           */\n\
+           int id(int x);\n";
+      let base_dir = Stdlib.Filename.dirname header_path in
+      let include_name = Stdlib.Filename.basename header_path in
+      let source =
+        "#include \"" ^ include_name ^ "\"\n"
+        ^ "#include <stdlib.h>\n"
+        ^ "#include <stdio.h>\n\n"
+        ^ "int id(int x) {\n"
+        ^ "  return x;\n"
+        ^ "}\n\n"
+        ^ "int main(void) {\n"
+        ^ "  return 0;\n"
+        ^ "}\n"
+      in
+      match parse_program ~base_dir source with
+      | Error e -> failwith ("Header theorem/local parse failed: " ^ e)
+      | Ok program ->
+          (match Verify.verify_program program with
+          | Error e ->
+              failwith ("Header theorem/local verification failed: " ^ e)
+          | Ok Verify.Verified ->
+              failwith "Expected header theorem on local definition to fail"
+          | Ok (Verify.Counterexample { location; condition; _ }) ->
+              if
+                not
+                  (Option.value_map
+                     location
+                     ~default:false
+                     ~f:(String.equal "`id` could not prove @Theorem 1"))
+              then
+                failwith "Expected local-header theorem violation location";
+              if not (String.is_substring condition ~substring:"forall") then
+                failwith
+                  ("Expected quantified theorem condition, got:\n" ^ condition)
+          | Ok outcome ->
+              failwith
+                ("Expected header theorem/local failure, got:\n"
+                ^ Verify.format_outcome outcome)))
+
+let assert_comparator_total_order_example_verifies () =
+  let path = "examples/comparator_total_order.c" in
+  let source = In_channel.read_all path in
+  match parse_program ~base_dir:"examples" ~source_name:path source with
+  | Error e -> failwith ("Comparator example parse failed: " ^ e)
+  | Ok program ->
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Comparator example verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected comparator example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
 let assert_strict_mode_accepts_initialized_scalar_program () =
   let source =
     "#include <stdlib.h>\n"
@@ -1461,6 +2053,11 @@ let () =
   assert_local_contract_roundtrip_and_instrumentation ();
   assert_named_contract_roundtrip_and_verification ();
   assert_named_header_contract_import_handles_partial_contracts ();
+  assert_multiple_contract_guarded_cases_verify ();
+  assert_multiple_contract_guarded_cases_fail ();
+  assert_ghost_contract_roundtrip_and_verification ();
+  assert_ghost_contract_counterexample ();
+  assert_ghost_loop_invariant_verification ();
   assert_verifier_reports_counterexample ();
   assert_counterexample_reports_require_location ();
   assert_counterexample_reports_guarantee_location ();
@@ -1485,6 +2082,18 @@ let () =
   assert_reference_roundtrip_and_verification ();
   assert_const_reference_write_rejected ();
   assert_reference_header_import_roundtrip ();
+  assert_z3_ir_forall_printing_and_free_vars ();
+  assert_z3_ir_forall_substitution_avoids_capture ();
+  assert_z3_ir_forall_queryable_apps_exclude_bound_terms ();
+  assert_z3_ir_forall_runs_in_z3 ();
+  assert_quantified_contract_bexpr_roundtrip ();
+  assert_quantified_contract_verification ();
+  assert_quantified_contract_counterexample ();
+  assert_theorem_contract_roundtrip_and_verification ();
+  assert_theorem_counterexample_reports_location ();
+  assert_imported_theorem_is_reused_modularly ();
+  assert_header_theorem_on_local_definition_is_checked ();
+  assert_comparator_total_order_example_verifies ();
   assert_strict_mode_accepts_initialized_scalar_program ();
   assert_strict_mode_rejects_uninitialized_local ();
   assert_strict_mode_rejects_globals ();

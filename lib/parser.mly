@@ -84,6 +84,15 @@ let array_type element_type size =
   | TReference _ | TConstReference _ ->
       fail "arrays of references are unsupported"
 
+let ensure_quantified_type_supported c_type =
+  match c_type with
+  | TInt | TFloat | TDouble | TChar | TBool | TPointer _ ->
+      c_type
+  | TVoid | TRecord _ | TArray _ | TReference _ | TConstReference _ ->
+      fail
+        "quantified variables must have a scalar or pointer type, got `%s`"
+        (c_type_to_c c_type)
+
 let make_function ?contract ~name ~return_type ~params body =
   { name; return_type; params; locals = []; contract; body }
 
@@ -210,11 +219,15 @@ let build_program items =
 %token <string> DOUBLE_LIT
 %token <int> CHAR_LIT
 %token <string> IDENT
-%token INT_KW FLOAT_KW DOUBLE_KW CHAR_KW BOOL_KW CONST_KW MAIN_KW VOID_KW STRUCT_KW CLASS_KW NAMESPACE_KW IF_KW ELSE_KW WHILE_KW RETURN_KW FREE_KW TRUE_KW FALSE_KW
+%token INT_KW FLOAT_KW DOUBLE_KW CHAR_KW BOOL_KW CONST_KW MAIN_KW VOID_KW STRUCT_KW CLASS_KW NAMESPACE_KW IF_KW ELSE_KW WHILE_KW RETURN_KW FREE_KW TRUE_KW FALSE_KW FORALL_KW
 %token LPAREN RPAREN LBRACE RBRACE LBRACKET RBRACKET SEMI COMMA AMP DOT ARROW SCOPE
 %token PLUS MINUS STAR SLASH PERCENT
-%token ASSIGN PLUSEQ MINUSEQ EQEQ NEQ LT LE GT GE NOT AND OR
+%token ASSIGN PLUSEQ MINUSEQ EQEQ NEQ LT LE GT GE NOT AND OR IMPLIES
 %token EOF
+
+%right IMPLIES
+%left OR
+%left AND
 
 %start <Ast.program> program
 %start <Ast.expr> contract_expr_eof
@@ -382,12 +395,30 @@ contract_nonparen_primary_expr:
   | name = qualified_ident
       { Var name }
 
+contract_quantified_type:
+  | base = nonvoid_type stars = pointer_stars
+      { ensure_quantified_type_supported (pointer_type base stars) }
+  | VOID_KW STAR stars = pointer_stars
+      { ensure_quantified_type_supported (pointer_type TVoid (stars + 1)) }
+
+contract_quantified_binding:
+  | quant_type = contract_quantified_type name = IDENT
+      { { quant_type; quant_name = name } }
+
 contract_bexpr:
-  | value = contract_or_bexpr
+  | value = contract_implies_bexpr
       { value }
+
+contract_implies_bexpr:
+  | value = contract_or_bexpr
+      %prec IMPLIES
+      { value }
+  | left = contract_or_bexpr IMPLIES right = contract_implies_bexpr
+      { Or (Not left, right) }
 
 contract_or_bexpr:
   | value = contract_and_bexpr
+      %prec OR
       { value }
   | left = contract_or_bexpr OR right = contract_and_bexpr
       { Or (left, right) }
@@ -401,10 +432,14 @@ contract_and_bexpr:
 contract_not_bexpr:
   | value = contract_atom_bexpr
       { value }
+  | FORALL_KW LPAREN bindings = separated_nonempty_list(COMMA, contract_quantified_binding) RPAREN DOT value = contract_bexpr
+      { Forall (bindings, value) }
   | NOT value = contract_not_bexpr
       { Not value }
 
 contract_cmp_tail:
+  | ASSIGN right = contract_expr
+      { fun left -> Eq (left, right) }
   | EQEQ right = contract_expr
       { fun left -> Eq (left, right) }
   | NEQ right = contract_expr

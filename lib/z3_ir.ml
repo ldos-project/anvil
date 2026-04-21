@@ -21,6 +21,7 @@ type formula =
   | And of formula list
   | Or of formula list
   | Implies of formula * formula
+  | Forall of (string * sort) list * formula
   | Eq of int_expr * int_expr
   | Neq of int_expr * int_expr
   | Lt of int_expr * int_expr
@@ -46,6 +47,12 @@ let sort_to_smt = function
 
 let parens head args =
   "(" ^ String.concat " " (head :: args) ^ ")"
+
+let quantified_binding_to_smt (name, sort) =
+  "(" ^ name ^ " " ^ sort_to_smt sort ^ ")"
+
+let quantified_binding_to_pretty (name, sort) =
+  name ^ ":" ^ sort_to_smt sort
 
 let rec int_expr_to_smt = function
   | Int_lit n when n < 0 -> parens "-" [string_of_int (-n)]
@@ -80,6 +87,13 @@ let rec formula_to_smt = function
   | Or parts -> parens "or" (List.map formula_to_smt parts)
   | Implies (left, right) ->
       parens "=>" [formula_to_smt left; formula_to_smt right]
+  | Forall ([], body) ->
+      formula_to_smt body
+  | Forall (bindings, body) ->
+      parens "forall"
+        [ "(" ^ String.concat " " (List.map quantified_binding_to_smt bindings) ^ ")"
+        ; formula_to_smt body
+        ]
   | Eq (left, right) ->
       parens "=" [int_expr_to_smt left; int_expr_to_smt right]
   | Neq (left, right) ->
@@ -159,6 +173,11 @@ let mk_implies left right =
   | formula, False -> mk_not formula
   | _ -> Implies (left, right)
 
+let mk_forall bindings body =
+  match bindings with
+  | [] -> body
+  | _ -> Forall (bindings, body)
+
 let rec subst_int_expr var replacement = function
   | Int_lit _ as expr -> expr
   | Real_lit _ as expr -> expr
@@ -178,7 +197,69 @@ let rec subst_int_expr var replacement = function
   | App (name, args) ->
       App (name, List.map (subst_int_expr var replacement) args)
 
-let rec subst_formula var replacement = function
+let add_bound_names set bindings =
+  List.fold_left
+    (fun acc (name, _sort) -> String_set.add name acc)
+    set
+    bindings
+
+let rec all_var_names_in_int_expr acc = function
+  | Int_lit _ | Real_lit _ -> acc
+  | Var name -> String_set.add name acc
+  | Add exprs | Mul exprs ->
+      List.fold_left all_var_names_in_int_expr acc exprs
+  | Sub (left, right) | Div (left, right) | Mod (left, right) ->
+      all_var_names_in_int_expr (all_var_names_in_int_expr acc left) right
+  | App (_, args) ->
+      List.fold_left all_var_names_in_int_expr acc args
+
+and all_var_names_in_formula acc = function
+  | True | False -> acc
+  | Not inner -> all_var_names_in_formula acc inner
+  | And formulas | Or formulas ->
+      List.fold_left all_var_names_in_formula acc formulas
+  | Implies (left, right) ->
+      all_var_names_in_formula (all_var_names_in_formula acc left) right
+  | Forall (bindings, body) ->
+      all_var_names_in_formula (add_bound_names acc bindings) body
+  | Eq (left, right)
+  | Neq (left, right)
+  | Lt (left, right)
+  | Le (left, right)
+  | Gt (left, right)
+  | Ge (left, right) ->
+      all_var_names_in_int_expr (all_var_names_in_int_expr acc left) right
+
+and fresh_quantified_name used_names base =
+  let rec loop index =
+    let candidate = Printf.sprintf "%s__q%d" base index in
+    if String_set.mem candidate used_names then loop (index + 1) else candidate
+  in
+  loop 1
+
+and alpha_rename_quantified_bindings replacement_vars bindings body =
+  let used_names =
+    add_bound_names
+      (all_var_names_in_formula replacement_vars body)
+      bindings
+  in
+  let rec loop acc current_body used_names = function
+    | [] -> List.rev acc, current_body
+    | ((name, sort) as binding) :: rest ->
+        if String_set.mem name replacement_vars then
+          let fresh = fresh_quantified_name used_names name in
+          let renamed_body = subst_formula name (Var fresh) current_body in
+          loop
+            ((fresh, sort) :: acc)
+            renamed_body
+            (String_set.add fresh used_names)
+            rest
+        else
+          loop (binding :: acc) current_body (String_set.add name used_names) rest
+  in
+  loop [] body used_names bindings
+
+and subst_formula var replacement = function
   | True -> True
   | False -> False
   | Not inner -> mk_not (subst_formula var replacement inner)
@@ -188,6 +269,15 @@ let rec subst_formula var replacement = function
       mk_implies
         (subst_formula var replacement left)
         (subst_formula var replacement right)
+  | Forall (bindings, body) ->
+      if List.exists (fun (name, _sort) -> String.equal name var) bindings then
+        Forall (bindings, body)
+      else
+        let replacement_vars = all_var_names_in_int_expr String_set.empty replacement in
+        let bindings, body =
+          alpha_rename_quantified_bindings replacement_vars bindings body
+        in
+        mk_forall bindings (subst_formula var replacement body)
   | Eq (left, right) ->
       Eq (subst_int_expr var replacement left, subst_int_expr var replacement right)
   | Neq (left, right) ->
@@ -218,6 +308,15 @@ let rec vars_in_formula acc = function
       List.fold_left vars_in_formula acc formulas
   | Implies (left, right) ->
       vars_in_formula (vars_in_formula acc left) right
+  | Forall (bindings, body) ->
+      let body_vars = vars_in_formula String_set.empty body in
+      let body_vars =
+        List.fold_left
+          (fun acc (name, _sort) -> String_set.remove name acc)
+          body_vars
+          bindings
+      in
+      String_set.union acc body_vars
   | Eq (left, right)
   | Neq (left, right)
   | Lt (left, right)
@@ -248,6 +347,8 @@ let rec apps_in_formula acc = function
       List.fold_left apps_in_formula acc formulas
   | Implies (left, right) ->
       apps_in_formula (apps_in_formula acc left) right
+  | Forall (_, body) ->
+      apps_in_formula acc body
   | Eq (left, right)
   | Neq (left, right)
   | Lt (left, right)
@@ -258,6 +359,57 @@ let rec apps_in_formula acc = function
 
 let collect_apps formula =
   apps_in_formula String_map.empty formula
+  |> String_map.bindings
+  |> List.map (fun (_, value) -> value)
+
+let rec int_expr_mentions_bound_var bound = function
+  | Int_lit _ | Real_lit _ -> false
+  | Var name -> String_set.mem name bound
+  | Add exprs | Mul exprs ->
+      List.exists (int_expr_mentions_bound_var bound) exprs
+  | Sub (left, right) | Div (left, right) | Mod (left, right) ->
+      int_expr_mentions_bound_var bound left || int_expr_mentions_bound_var bound right
+  | App (_, args) ->
+      List.exists (int_expr_mentions_bound_var bound) args
+
+let rec queryable_apps_in_int_expr bound acc = function
+  | Int_lit _ | Real_lit _ | Var _ -> acc
+  | Add exprs | Mul exprs ->
+      List.fold_left (queryable_apps_in_int_expr bound) acc exprs
+  | Sub (left, right) | Div (left, right) | Mod (left, right) ->
+      queryable_apps_in_int_expr bound
+        (queryable_apps_in_int_expr bound acc left)
+        right
+  | App (name, args) as expr ->
+      let acc =
+        List.fold_left (queryable_apps_in_int_expr bound) acc args
+      in
+      if int_expr_mentions_bound_var bound expr then acc
+      else String_map.add (int_expr_to_smt expr) (name, expr) acc
+
+let rec queryable_apps_in_formula bound acc = function
+  | True | False -> acc
+  | Not inner -> queryable_apps_in_formula bound acc inner
+  | And formulas | Or formulas ->
+      List.fold_left (queryable_apps_in_formula bound) acc formulas
+  | Implies (left, right) ->
+      queryable_apps_in_formula bound
+        (queryable_apps_in_formula bound acc left)
+        right
+  | Forall (bindings, body) ->
+      queryable_apps_in_formula (add_bound_names bound bindings) acc body
+  | Eq (left, right)
+  | Neq (left, right)
+  | Lt (left, right)
+  | Le (left, right)
+  | Gt (left, right)
+  | Ge (left, right) ->
+      queryable_apps_in_int_expr bound
+        (queryable_apps_in_int_expr bound acc left)
+        right
+
+let collect_queryable_apps formula =
+  queryable_apps_in_formula String_set.empty String_map.empty formula
   |> String_map.bindings
   |> List.map (fun (_, value) -> value)
 
@@ -322,6 +474,13 @@ let rec formula_to_pretty = function
       "(" ^ String.concat " || " (List.map formula_to_pretty formulas) ^ ")"
   | Implies (left, right) ->
       "(" ^ formula_to_pretty left ^ " => " ^ formula_to_pretty right ^ ")"
+  | Forall ([], body) ->
+      formula_to_pretty body
+  | Forall (bindings, body) ->
+      "forall "
+      ^ String.concat ", " (List.map quantified_binding_to_pretty bindings)
+      ^ ". "
+      ^ formula_to_pretty body
   | Eq (left, right) ->
       "(" ^ int_expr_to_pretty left ^ " == " ^ int_expr_to_pretty right ^ ")"
   | Neq (left, right) ->

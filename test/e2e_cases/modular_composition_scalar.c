@@ -1,4 +1,5 @@
 /* EXPECT: PASS */
+/* VERIFY: PASS */
 #include "modular_stub_contracts.h"
 #include <stdlib.h>
 #include <stdio.h>

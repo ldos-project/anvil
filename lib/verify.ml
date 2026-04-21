@@ -11,6 +11,7 @@ type query = {
 
 type vc_kind =
   | Entry
+  | Theorem of int
   | Loop_preservation of int
   | Loop_exit of int
 
@@ -68,6 +69,11 @@ type replay_state =
 
 let fail fmt = Printf.ksprintf failwith fmt
 
+let ( let* ) result f =
+  match result with
+  | Ok value -> f value
+  | Error _ as error -> error
+
 let read_all in_channel =
   let buffer = Buffer.create 1024 in
   let chunk = Bytes.create 4096 in
@@ -123,12 +129,16 @@ let build_function_sigs (program : program) =
       (fun (header : header_import) -> header.functions)
       program.imports
     |> List.map (fun (fn : contracted_function) ->
-           fn.name, (List.map (fun param -> param.param_type) fn.params, fn.return_type))
+           ( fn.name
+           , ( List.map (fun param -> lower_reference_type param.param_type) fn.params
+             , lower_reference_type fn.return_type ) ))
   in
   let locals =
     List.map
       (fun (fn : function_def) ->
-        fn.name, (List.map (fun param -> param.param_type) fn.params, fn.return_type))
+        ( fn.name
+        , ( List.map (fun param -> lower_reference_type param.param_type) fn.params
+          , lower_reference_type fn.return_type ) ))
       (program.functions @ [ program.main ])
   in
   imported @ locals
@@ -143,6 +153,17 @@ let expr_env_for_function (program : program) (fn : function_def) =
             Option.map (fun name -> name, param.param_type) param.param_name)
           fn.params;
     function_sigs = build_function_sigs program;
+  }
+
+let extend_expr_env_with_quantified_bindings env bindings =
+  {
+    env with
+    var_types =
+      List.fold_left
+        (fun var_types (binding : quantified_var) ->
+          (binding.quant_name, binding.quant_type) :: var_types)
+        env.var_types
+        bindings;
   }
 
 let lookup_var_type env name =
@@ -198,6 +219,14 @@ let rec expr_to_ir env = function
 let rec bexpr_to_ir env = function
   | True -> Ir.True
   | False -> Ir.False
+  | Forall (bindings, body) ->
+      let env = extend_expr_env_with_quantified_bindings env bindings in
+      Ir.mk_forall
+        (List.map
+           (fun (binding : quantified_var) ->
+             binding.quant_name, sort_of_c_type binding.quant_type)
+           bindings)
+        (bexpr_to_ir env body)
   | Eq (left, right) -> Ir.Eq (expr_to_ir env left, expr_to_ir env right)
   | Neq (left, right) -> Ir.Neq (expr_to_ir env left, expr_to_ir env right)
   | Lt (left, right) -> Ir.Lt (expr_to_ir env left, expr_to_ir env right)
@@ -231,7 +260,7 @@ let make_vc name function_name kind formula =
     |> List.map (fun name -> { label = name; term = Ir.Var name })
   in
   let app_queries =
-    Ir.collect_apps formula
+    Ir.collect_queryable_apps formula
     |> List.map (fun (_, term) ->
            { label = Ir.int_expr_to_pretty term; term })
   in
@@ -242,6 +271,277 @@ let add_vc state kind name formula =
     state with
     vcs_rev = make_vc name state.function_name kind formula :: state.vcs_rev;
   }
+
+let synthetic_param_name index =
+  Printf.sprintf "__anvil_contract_arg_%d" index
+
+let named_contract_params (contract_fn : contracted_function) =
+  List.mapi
+    (fun index (param : param) ->
+      {
+        param with
+        param_name =
+          Some
+            (Option.value
+               param.param_name
+               ~default:(synthetic_param_name index));
+      })
+    contract_fn.params
+
+let synthetic_function_for_contract (contract_fn : contracted_function) =
+  {
+    name = contract_fn.name;
+    return_type = contract_fn.return_type;
+    params = named_contract_params contract_fn;
+    locals = [];
+    contract = None;
+    body = Skip;
+  }
+
+let summary_sort_supported c_type =
+  match lower_reference_type c_type with
+  | TInt | TFloat | TDouble | TChar | TBool | TPointer _ -> true
+  | TVoid -> true
+  | TRecord _ | TArray _ | TReference _ | TConstReference _ -> false
+
+let contract_summary_supported (contract_fn : contracted_function) =
+  summary_sort_supported contract_fn.return_type
+  && List.for_all
+       (fun (param : param) -> summary_sort_supported param.param_type)
+       contract_fn.params
+
+let quantified_bindings_of_params params =
+  List.filter_map
+    (fun (param : param) ->
+      Option.map
+        (fun name ->
+          {
+            quant_type = lower_reference_type param.param_type;
+            quant_name = name;
+          })
+        param.param_name)
+    params
+
+let wrap_formula_with_bindings bindings formula =
+  match bindings with
+  | [] -> formula
+  | _ ->
+      Ir.mk_forall
+        (List.map
+           (fun (binding : quantified_var) ->
+             binding.quant_name, sort_of_c_type binding.quant_type)
+           bindings)
+        formula
+
+let instantiate_summary_clauses
+    (program : program)
+    malloc_sites
+    (contract_fn : contracted_function) =
+  if not (contract_summary_supported contract_fn) then
+    Ok []
+  else
+    let synthetic_fn = synthetic_function_for_contract contract_fn in
+    let memory_env =
+      Memory_safety.function_env_of_program program synthetic_fn malloc_sites
+    in
+    let* current =
+      Instrument.build_current_contract memory_env contract_fn synthetic_fn.params
+    in
+    let expr_env = expr_env_for_function program synthetic_fn in
+    let quantified_bindings =
+      quantified_bindings_of_params synthetic_fn.params
+    in
+    let* clauses =
+      match contract_fn.return_type with
+      | TVoid ->
+          let* guarantee = Instrument.instantiate_void_guarantee current in
+          let* safety = Instrument.instantiate_void_safety current in
+          Ok (guarantee @ safety)
+      | _ ->
+          let args =
+            List.map
+              (fun (param : param) ->
+                match param.param_name with
+                | Some name -> Var name
+                | None -> fail "missing synthetic parameter name")
+              synthetic_fn.params
+          in
+          let result = FuncCall (contract_fn.name, args) in
+          let scalar_bindings =
+            Instrument.scalar_bindings_with_result current result
+          in
+          let* guarantee =
+            Instrument.instantiate_contracts
+              memory_env
+              contract_fn
+              "@Guarantee"
+              contract_fn.contract.guarantee
+              scalar_bindings
+              current.ghost_env.bool_bindings
+              current.ghost_env
+          in
+          let* safety =
+            Instrument.instantiate_contracts
+              memory_env
+              contract_fn
+              "@Safety"
+              contract_fn.contract.safety
+              scalar_bindings
+              current.ghost_env.bool_bindings
+              current.ghost_env
+          in
+          Ok (guarantee @ safety)
+    in
+    Ok
+      (List.map
+         (fun clause ->
+           contract_fn.name,
+           wrap_formula_with_bindings quantified_bindings (bexpr_to_ir expr_env clause))
+         clauses)
+
+let theorem_vcs_for_function
+    (program : program)
+    malloc_sites
+    (fn : function_def)
+    (contract_fn : contracted_function) =
+  if contract_fn.contract.theorem = [] then
+    Ok []
+  else if not (contract_summary_supported contract_fn) then
+    Error
+      (Printf.sprintf
+         "theorem clauses for `%s` require scalar, pointer, or reference-lowered signatures"
+         contract_fn.name)
+  else
+    let synthetic_fn = synthetic_function_for_contract contract_fn in
+    let memory_env =
+      Memory_safety.function_env_of_program program synthetic_fn malloc_sites
+    in
+    let* current =
+      Instrument.build_current_contract memory_env contract_fn synthetic_fn.params
+    in
+    let* clauses =
+      Instrument.instantiate_contracts
+        memory_env
+        contract_fn
+        "@Theorem"
+        contract_fn.contract.theorem
+        (Instrument.entry_scalar_bindings current)
+        current.ghost_env.bool_bindings
+        current.ghost_env
+    in
+    if List.exists (Instrument.bexpr_has_var "result") clauses then
+      Error
+        (Printf.sprintf
+           "@Theorem for `%s` references `result`; use @Guarantee for per-call postconditions"
+           contract_fn.name)
+    else
+      let expr_env = expr_env_for_function program synthetic_fn in
+      Ok
+        (List.mapi
+           (fun index clause ->
+             make_vc
+               (Printf.sprintf "%s: theorem %d" fn.name (index + 1))
+               fn.name
+               (Theorem (index + 1))
+               (bexpr_to_ir expr_env clause))
+           clauses)
+
+let theorem_assumptions_for_contract
+    (program : program)
+    malloc_sites
+    (contract_fn : contracted_function) =
+  if contract_fn.contract.theorem = [] then
+    Ok []
+  else if not (contract_summary_supported contract_fn) then
+    Error
+      (Printf.sprintf
+         "theorem clauses for `%s` require scalar, pointer, or reference-lowered signatures"
+         contract_fn.name)
+  else
+    let synthetic_fn = synthetic_function_for_contract contract_fn in
+    let memory_env =
+      Memory_safety.function_env_of_program program synthetic_fn malloc_sites
+    in
+    let* current =
+      Instrument.build_current_contract memory_env contract_fn synthetic_fn.params
+    in
+    let* clauses =
+      Instrument.instantiate_contracts
+        memory_env
+        contract_fn
+        "@Theorem"
+        contract_fn.contract.theorem
+        (Instrument.entry_scalar_bindings current)
+        current.ghost_env.bool_bindings
+        current.ghost_env
+    in
+    if List.exists (Instrument.bexpr_has_var "result") clauses then
+      Error
+        (Printf.sprintf
+           "@Theorem for `%s` references `result`; use @Guarantee for per-call postconditions"
+           contract_fn.name)
+    else
+      let expr_env = expr_env_for_function program synthetic_fn in
+      Ok
+        (List.map
+           (fun clause ->
+             contract_fn.name, bexpr_to_ir expr_env clause)
+           clauses)
+
+let defined_function_names (program : program) =
+  List.map (fun (fn : function_def) -> fn.name) (program.functions @ [ program.main ])
+
+let contract_summary_for_program (program : program) =
+  let* contract_env =
+    Instrument.build_contract_env program.imports (program.functions @ [ program.main ])
+  in
+  let malloc_sites = (Memory_safety.contract_env_of_program program).malloc_sites in
+  let defined_names = defined_function_names program in
+  let rec summary_loop acc = function
+    | [] -> Ok (List.rev acc)
+    | (_name, contract_fn) :: rest ->
+        let* formulas =
+          instantiate_summary_clauses program malloc_sites contract_fn
+        in
+        summary_loop (List.rev_append formulas acc) rest
+  in
+  let rec imported_theorem_loop acc = function
+    | [] -> Ok (List.rev acc)
+    | (header : header_import) :: rest ->
+        let imported_functions =
+          List.filter
+            (fun (fn : imported_function) ->
+              not (List.exists (String.equal fn.name) defined_names))
+            header.functions
+        in
+        let rec loop_functions acc = function
+          | [] ->
+              imported_theorem_loop acc rest
+          | contract_fn :: tail ->
+              let* formulas =
+                theorem_assumptions_for_contract program malloc_sites contract_fn
+              in
+              loop_functions (List.rev_append formulas acc) tail
+        in
+        loop_functions acc imported_functions
+  in
+  let rec theorem_loop acc = function
+    | [] -> Ok (List.rev acc)
+    | fn :: rest ->
+        (match Instrument.effective_contract contract_env fn with
+        | Error _ as error -> error
+        | Ok None ->
+            theorem_loop acc rest
+        | Ok (Some contract_fn) ->
+            let* vcs =
+              theorem_vcs_for_function program malloc_sites fn contract_fn
+            in
+            theorem_loop (List.rev_append vcs acc) rest)
+  in
+  let* assumptions = summary_loop [] contract_env in
+  let* imported_theorem_assumptions = imported_theorem_loop [] program.imports in
+  let* theorem_vcs = theorem_loop [] (program.functions @ [ program.main ]) in
+  Ok (assumptions @ imported_theorem_assumptions, theorem_vcs)
 
 let rec wp_stmt env state stmt post =
   match stmt with
@@ -496,7 +796,7 @@ let signature_sorts_of_name (program : program) name arity =
       | None ->
           Ok (List.init arity (fun _ -> Ir.Int), Ir.Int))
 
-let declarations_for_vc program vc extra_queries =
+let declarations_for_vc program assumptions vc extra_queries =
   let ( let* ) result f =
     match result with
     | Ok value -> f value
@@ -505,18 +805,32 @@ let declarations_for_vc program vc extra_queries =
   let vars =
     List.fold_left
       (fun acc query -> vars_in_ir_expr acc query.term)
-      (Ir.collect_vars vc.formula |> List.fold_left (fun acc name -> String_set.add name acc) String_set.empty)
+      (List.fold_left
+         (fun acc assumption ->
+           Ir.collect_vars assumption
+           |> List.fold_left (fun acc name -> String_set.add name acc) acc)
+         (Ir.collect_vars vc.formula
+          |> List.fold_left (fun acc name -> String_set.add name acc) String_set.empty)
+         assumptions)
       extra_queries
     |> String_set.elements
   in
   let apps =
     List.fold_left
       (fun acc query -> apps_in_ir_expr acc query.term)
-      (Ir.collect_apps vc.formula
-       |> List.fold_left
-            (fun acc (name, expr) ->
-              String_map.add (Ir.int_expr_to_pretty expr) (name, expr) acc)
-            String_map.empty)
+      (List.fold_left
+         (fun acc assumption ->
+           Ir.collect_apps assumption
+           |> List.fold_left
+                (fun acc (name, expr) ->
+                  String_map.add (Ir.int_expr_to_pretty expr) (name, expr) acc)
+                acc)
+         (Ir.collect_apps vc.formula
+          |> List.fold_left
+               (fun acc (name, expr) ->
+                 String_map.add (Ir.int_expr_to_pretty expr) (name, expr) acc)
+               String_map.empty)
+         assumptions)
       extra_queries
     |> String_map.bindings
     |> List.map snd
@@ -574,19 +888,20 @@ let declarations_for_vc program vc extra_queries =
         in
         Ok (consts @ funs)
 
-let sat_query_commands vc declarations =
+let sat_query_commands assumptions vc declarations =
   declarations
+  @ List.map (fun formula -> Ir.Assert formula) assumptions
   @ [ Ir.Assert (Ir.mk_not vc.formula); Ir.Check_sat ]
 
-let model_query_commands vc declarations queries =
-  sat_query_commands vc declarations
+let model_query_commands assumptions vc declarations queries =
+  sat_query_commands assumptions vc declarations
   @ List.map (fun query -> Ir.Get_value query.term) queries
 
-let query_model vc declarations queries =
+let query_model assumptions vc declarations queries =
   match
     run_z3
       (Ir.Set_option (":produce-models", "true")
-      :: model_query_commands vc declarations queries)
+      :: model_query_commands assumptions vc declarations queries)
   with
   | Error message -> Error message
   | Ok output ->
@@ -643,6 +958,8 @@ let rec apps_in_expr env acc = function
 
 let rec apps_in_bexpr env acc = function
   | True | False -> acc
+  | Forall (bindings, body) ->
+      apps_in_bexpr (extend_expr_env_with_quantified_bindings env bindings) acc body
   | Eq (left, right)
   | Neq (left, right)
   | Lt (left, right)
@@ -772,6 +1089,22 @@ let rec symbolic_expr env = function
 let rec symbolic_bexpr env = function
   | True -> Ir.True
   | False -> Ir.False
+  | Forall (bindings, body) ->
+      let env =
+        List.filter
+          (fun (name, _value) ->
+            not
+              (List.exists
+                 (fun (binding : quantified_var) -> String.equal name binding.quant_name)
+                 bindings))
+          env
+      in
+      Ir.mk_forall
+        (List.map
+           (fun (binding : quantified_var) ->
+             binding.quant_name, sort_of_c_type binding.quant_type)
+           bindings)
+        (symbolic_bexpr env body)
   | Eq (left, right) ->
       Ir.Eq (symbolic_expr env left, symbolic_expr env right)
   | Neq (left, right) ->
@@ -866,6 +1199,8 @@ let rec eval_formula model = function
       (match eval_formula model left, eval_formula model right with
       | Some left, Some right -> Some ((not left) || right)
       | _ -> None)
+  | Ir.Forall _ ->
+      None
   | Ir.Eq (left, right) ->
       (match eval_int_expr model left, eval_int_expr model right with
       | Some left, Some right -> Some (left = right)
@@ -952,6 +1287,12 @@ let describe_assert_origin = function
 let describe_vc (vc : verification_condition) =
   match vc.kind with
   | Entry -> None
+  | Theorem theorem_id ->
+      Some
+        (Printf.sprintf
+           "`%s` could not prove @Theorem %d"
+           vc.function_name
+           theorem_id)
   | Loop_preservation loop_id ->
       Some
         (Printf.sprintf
@@ -972,7 +1313,11 @@ let locate_violation (program : program) (vc : verification_condition) model =
       | Replay_violation (origin, condition, env) ->
           Some (describe_assert_origin origin, Ir.formula_to_pretty condition, env)
       | _ -> None)
-  | _ -> None
+  | Entry, None
+  | Theorem _, _
+  | Loop_preservation _, _
+  | Loop_exit _, _ ->
+      None
 
 let current_var_expr env name =
   match lookup_env env name with
@@ -1094,12 +1439,23 @@ let program_bindings_for_counterexample
 let check_vc
     (original_program : program)
     (instrumented_program : program)
+    assumptions
     (vc : verification_condition) =
+  let assumptions =
+    match vc.kind with
+    | Theorem _ ->
+        List.map snd assumptions
+    | Entry | Loop_preservation _ | Loop_exit _ ->
+        List.filter_map
+          (fun (owner, formula) ->
+            if String.equal owner vc.function_name then None else Some formula)
+          assumptions
+  in
   let queries = queries_for_vc instrumented_program vc in
-  match declarations_for_vc instrumented_program vc queries with
+  match declarations_for_vc instrumented_program assumptions vc queries with
   | Error message -> Error message
   | Ok declarations ->
-      (match run_z3 (sat_query_commands vc declarations) with
+      (match run_z3 (sat_query_commands assumptions vc declarations) with
       | Error message -> Error message
       | Ok output ->
           match sat_result_of_output output with
@@ -1113,7 +1469,7 @@ let check_vc
                         reason = "z3 returned unknown";
                       }))
           | Sat ->
-              (match query_model vc declarations queries with
+              (match query_model assumptions vc declarations queries with
               | Error message -> Error message
               | Ok bindings ->
                   let model = model_map_of_bindings bindings in
@@ -1145,15 +1501,18 @@ let check_vc
                           }))))
 
 let verify_instrumented_program original_program program =
+  let* assumptions, theorem_vcs =
+    contract_summary_for_program original_program
+  in
   let rec loop = function
     | [] -> Ok Verified
     | vc :: rest ->
-        (match check_vc original_program program vc with
+        (match check_vc original_program program assumptions vc with
         | Error _ as error -> error
         | Ok None -> loop rest
         | Ok (Some outcome) -> Ok outcome)
   in
-  loop (vcs_for_program program)
+  loop (vcs_for_program program @ theorem_vcs)
 
 let verify_program program =
   match Instrument.instrument_program program with

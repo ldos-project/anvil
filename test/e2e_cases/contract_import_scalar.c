@@ -1,4 +1,5 @@
 /* EXPECT: PASS */
+/* VERIFY: PASS */
 #include "scalar_contracts.h"
 #include <stdlib.h>
 #include <stdio.h>

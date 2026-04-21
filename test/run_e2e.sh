@@ -31,10 +31,15 @@ for file in "$cases_dir"/*.c; do
   total=$((total + 1))
   name=$(basename "$file")
   include_dir=$(dirname "$file")
-  expected=$(sed -En '1s@/\* EXPECT: (PASS|FAIL) \*/@\1@p' "$file")
+  expected_parse=$(sed -En '1s@/\* EXPECT: (PASS|FAIL) \*/@\1@p' "$file")
+  expected_verify=$(sed -En '2s@/\* VERIFY: (PASS|FAIL) \*/@\1@p' "$file")
 
-  if [ -z "$expected" ]; then
+  if [ -z "$expected_parse" ]; then
     failures+=("$name (missing EXPECT comment)")
+    continue
+  fi
+  if [ -z "$expected_verify" ]; then
+    failures+=("$name (missing VERIFY comment)")
     continue
   fi
 
@@ -44,20 +49,31 @@ for file in "$cases_dir"/*.c; do
     continue
   fi
 
-  actual="FAIL"
+  actual_parse="FAIL"
   if ANVIL_SKIP_BUILD=1 "$anvil_bin" "$file" \
     >"$tmpdir/$name.anvil.c" 2>"$tmpdir/$name.anvil.stderr"; then
     if gcc -std=c11 -Wall -Wextra -Werror -I"$include_dir" -c "$tmpdir/$name.anvil.c" \
       -o "$tmpdir/$name.anvil.o" \
       >"$tmpdir/$name.anvil-gcc.stdout" 2>"$tmpdir/$name.anvil-gcc.stderr"; then
-      actual="PASS"
+      actual_parse="PASS"
     fi
   fi
 
-  if [ "$actual" = "$expected" ]; then
+  actual_verify="FAIL"
+  if ANVIL_SKIP_BUILD=1 "$anvil_bin" --verify "$file" \
+    >"$tmpdir/$name.verify.stdout" 2>"$tmpdir/$name.verify.stderr"; then
+    actual_verify="PASS"
+  fi
+
+  if [ "$actual_parse" = "$expected_parse" ] && [ "$actual_verify" = "$expected_verify" ]; then
     passed=$((passed + 1))
   else
-    failures+=("$name (expected $expected, got $actual)")
+    if [ "$actual_parse" != "$expected_parse" ]; then
+      failures+=("$name (parse expected $expected_parse, got $actual_parse)")
+    fi
+    if [ "$actual_verify" != "$expected_verify" ]; then
+      failures+=("$name (verify expected $expected_verify, got $actual_verify)")
+    fi
   fi
 done
 
