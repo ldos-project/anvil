@@ -1,4 +1,5 @@
 _build/
+/anvil
 
 # OCaml / Dune local files
 .merlin

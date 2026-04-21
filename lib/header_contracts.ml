@@ -150,6 +150,7 @@ type pending_contract = {
   ghosts : ghost_binding list;
   require : string list;
   guarantee : string list;
+  theorem : string list;
   safety : string list;
 }
 
@@ -174,6 +175,7 @@ let empty_pending_contract = {
   ghosts = [];
   require = [];
   guarantee = [];
+  theorem = [];
   safety = [];
 }
 
@@ -181,6 +183,7 @@ let pending_has_clauses contract =
   contract.ghosts <> []
   || contract.require <> []
   || contract.guarantee <> []
+  || contract.theorem <> []
   || contract.safety <> []
 
 let supported_ghost_type = function
@@ -221,6 +224,7 @@ let has_duplicate_ghost name ghosts =
 let pending_has_content contract =
   contract.require <> []
   || contract.guarantee <> []
+  || contract.theorem <> []
   || contract.safety <> []
   || contract.ghosts <> []
 
@@ -260,6 +264,8 @@ let append_contract_field line_number header_path (contract : pending_contract) 
       { contract with require = contract.require @ [ value ] }
   | "@Guarantee" ->
       { contract with guarantee = contract.guarantee @ [ value ] }
+  | "@Theorem" ->
+      { contract with theorem = contract.theorem @ [ value ] }
   | "@Safety" ->
       { contract with safety = contract.safety @ [ value ] }
   | _ -> contract
@@ -297,10 +303,14 @@ let consume_comment_line (contract : pending_contract) ~header_path ~line_number
               | Some value ->
                   append_contract_field line_number header_path contract "@Guarantee" value
               | None ->
-                  (match take_tag_value ~tag:"@Safety" trimmed with
+                  (match take_tag_value ~tag:"@Theorem" trimmed with
                   | Some value ->
-                      append_contract_field line_number header_path contract "@Safety" value
-                  | None -> contract))))
+                      append_contract_field line_number header_path contract "@Theorem" value
+                  | None ->
+                      (match take_tag_value ~tag:"@Safety" trimmed with
+                      | Some value ->
+                          append_contract_field line_number header_path contract "@Safety" value
+                      | None -> contract)))))
 
 let consume_comment_text (contract : pending_contract) ~header_path ~line_number text =
   String.split_on_char '\n' text
@@ -324,6 +334,7 @@ let materialize_contract_block ~header_path ~line_number (pending : pending_cont
             ghosts = pending.ghosts;
             require = pending.require;
             guarantee = pending.guarantee;
+            theorem = pending.theorem;
             safety = pending.safety;
           };
       }

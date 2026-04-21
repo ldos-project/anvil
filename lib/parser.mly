@@ -438,6 +438,8 @@ contract_not_bexpr:
       { Not value }
 
 contract_cmp_tail:
+  | ASSIGN right = contract_expr
+      { fun left -> Eq (left, right) }
   | EQEQ right = contract_expr
       { fun left -> Eq (left, right) }
   | NEQ right = contract_expr

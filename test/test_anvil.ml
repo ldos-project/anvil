@@ -1785,6 +1785,184 @@ let assert_quantified_contract_counterexample () =
             ("Expected quantified contract counterexample, got:\n"
             ^ Verify.format_outcome outcome))
 
+let assert_theorem_contract_roundtrip_and_verification () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n\n"
+    ^ "/* @Contract compare_int\n"
+    ^ " * @Guarantee (x <= y) ==> (result <= 0)\n"
+    ^ " * @Guarantee (result <= 0) ==> (x <= y)\n"
+    ^ " * @Guarantee (y <= x) ==> (result >= 0)\n"
+    ^ " * @Guarantee (result >= 0) ==> (y <= x)\n"
+    ^ " * @Guarantee (x == y) ==> (result == 0)\n"
+    ^ " * @Guarantee (result == 0) ==> (x == y)\n"
+    ^ " * @Theorem forall(int x). compare_int(x, x) = 0\n"
+    ^ " * @Theorem forall(int x, int y). (compare_int(x, y) = 0) ==> (x = y)\n"
+    ^ " * @Theorem forall(int x, int y, int z). (((compare_int(x, y) <= 0) && (compare_int(y, z) <= 0)) ==> (compare_int(x, z) <= 0))\n"
+    ^ " */\n"
+    ^ "int compare_int(int x, int y) {\n"
+    ^ "  if (x < y) {\n"
+    ^ "    return -1;\n"
+    ^ "  }\n"
+    ^ "  if (y < x) {\n"
+    ^ "    return 1;\n"
+    ^ "  }\n"
+    ^ "  return 0;\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Theorem contract parse failed: " ^ e)
+  | Ok program ->
+      (match parse_program (program_to_c program) with
+      | Error e -> failwith ("Theorem contract roundtrip failed: " ^ e)
+      | Ok roundtripped ->
+          if not (equal_program program roundtripped) then
+            failwith "Theorem contract roundtrip mismatch");
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Theorem contract verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected theorem contract example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_theorem_counterexample_reports_location () =
+  let source =
+    "#include <stdlib.h>\n"
+    ^ "#include <stdio.h>\n\n"
+    ^ "/* @Contract id\n"
+    ^ " * @Guarantee result = x\n"
+    ^ " * @Theorem forall(int x). id(x) = 1\n"
+    ^ " */\n"
+    ^ "int id(int x) {\n"
+    ^ "  return x;\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Theorem counterexample parse failed: " ^ e)
+  | Ok program ->
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Theorem counterexample verification failed: " ^ e)
+      | Ok Verify.Verified ->
+          failwith "Expected theorem counterexample example to fail"
+      | Ok (Verify.Counterexample counterexample) ->
+          if
+            not
+              (Option.value_map
+                 counterexample.location
+                 ~default:false
+                 ~f:(String.equal "`id` could not prove @Theorem 1"))
+          then
+            failwith "Expected @Theorem violation location";
+          if not (String.is_substring counterexample.condition ~substring:"forall") then
+            failwith
+              ("Expected quantified theorem condition in counterexample, got:\n"
+              ^ counterexample.condition)
+      | Ok outcome ->
+          failwith
+            ("Expected theorem counterexample, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_imported_theorem_is_reused_modularly () =
+  let header_path = Stdlib.Filename.temp_file "anvil_theorem_import" ".h" in
+  Fun.protect
+    ~finally:(fun () ->
+      try Stdlib.Sys.remove header_path with
+      | _ -> ())
+    (fun () ->
+      Out_channel.write_all header_path
+        ~data:
+          "/* @Contract bump\n\
+           * @Theorem forall(int x). bump(x) > x\n\
+           */\n\
+           int bump(int x);\n";
+      let base_dir = Stdlib.Filename.dirname header_path in
+      let include_name = Stdlib.Filename.basename header_path in
+      let source =
+        "#include \"" ^ include_name ^ "\"\n"
+        ^ "#include <stdlib.h>\n"
+        ^ "#include <stdio.h>\n\n"
+        ^ "/* @Contract use_bump\n"
+        ^ " * @Guarantee result = bump(x)\n"
+        ^ " * @Theorem forall(int x). use_bump(x) > x\n"
+        ^ " */\n"
+        ^ "int use_bump(int x) {\n"
+        ^ "  int y;\n"
+        ^ "  y = bump(x);\n"
+        ^ "  return y;\n"
+        ^ "}\n\n"
+        ^ "int main(void) {\n"
+        ^ "  return 0;\n"
+        ^ "}\n"
+      in
+      match parse_program ~base_dir source with
+      | Error e -> failwith ("Imported theorem parse failed: " ^ e)
+      | Ok program ->
+          (match Verify.verify_program program with
+          | Error e -> failwith ("Imported theorem verification failed: " ^ e)
+          | Ok Verify.Verified -> ()
+          | Ok outcome ->
+              failwith
+                ("Expected imported theorem example to verify, got:\n"
+                ^ Verify.format_outcome outcome)))
+
+let assert_header_theorem_on_local_definition_is_checked () =
+  let header_path = Stdlib.Filename.temp_file "anvil_theorem_local" ".h" in
+  Fun.protect
+    ~finally:(fun () ->
+      try Stdlib.Sys.remove header_path with
+      | _ -> ())
+    (fun () ->
+      Out_channel.write_all header_path
+        ~data:
+          "/* @Contract id\n\
+           * @Theorem forall(int x). id(x) = 1\n\
+           */\n\
+           int id(int x);\n";
+      let base_dir = Stdlib.Filename.dirname header_path in
+      let include_name = Stdlib.Filename.basename header_path in
+      let source =
+        "#include \"" ^ include_name ^ "\"\n"
+        ^ "#include <stdlib.h>\n"
+        ^ "#include <stdio.h>\n\n"
+        ^ "int id(int x) {\n"
+        ^ "  return x;\n"
+        ^ "}\n\n"
+        ^ "int main(void) {\n"
+        ^ "  return 0;\n"
+        ^ "}\n"
+      in
+      match parse_program ~base_dir source with
+      | Error e -> failwith ("Header theorem/local parse failed: " ^ e)
+      | Ok program ->
+          (match Verify.verify_program program with
+          | Error e ->
+              failwith ("Header theorem/local verification failed: " ^ e)
+          | Ok Verify.Verified ->
+              failwith "Expected header theorem on local definition to fail"
+          | Ok (Verify.Counterexample { location; condition; _ }) ->
+              if
+                not
+                  (Option.value_map
+                     location
+                     ~default:false
+                     ~f:(String.equal "`id` could not prove @Theorem 1"))
+              then
+                failwith "Expected local-header theorem violation location";
+              if not (String.is_substring condition ~substring:"forall") then
+                failwith
+                  ("Expected quantified theorem condition, got:\n" ^ condition)
+          | Ok outcome ->
+              failwith
+                ("Expected header theorem/local failure, got:\n"
+                ^ Verify.format_outcome outcome)))
+
 let assert_comparator_total_order_example_verifies () =
   let path = "examples/comparator_total_order.c" in
   let source = In_channel.read_all path in
@@ -1911,6 +2089,10 @@ let () =
   assert_quantified_contract_bexpr_roundtrip ();
   assert_quantified_contract_verification ();
   assert_quantified_contract_counterexample ();
+  assert_theorem_contract_roundtrip_and_verification ();
+  assert_theorem_counterexample_reports_location ();
+  assert_imported_theorem_is_reused_modularly ();
+  assert_header_theorem_on_local_definition_is_checked ();
   assert_comparator_total_order_example_verifies ();
   assert_strict_mode_accepts_initialized_scalar_program ();
   assert_strict_mode_rejects_uninitialized_local ();

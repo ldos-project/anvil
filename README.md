@@ -1,10 +1,10 @@
 # Anvil
 
-Anvil is a small verifier for a restricted C-like language, meant to be banged on by Vulcan.
+Anvil is a small verifier for a restricted C / C++-flavored language, meant to be banged on by Vulcan.
 
 It can:
 
-- parse and pretty-print a restricted set of C programs in the supported subset;
+- parse, resolve, and pretty-print a restricted core language plus a small C++-style frontend fragment;
 - instrument contracts into explicit `Assume` and `Assert` checks;
 - generate verification conditions with weakest preconditions;
 - ask Z3 for a counterexample to the negated VC; and
@@ -43,6 +43,18 @@ The `./anvil` wrapper will build `./bin/main.exe` automatically unless `ANVIL_SK
 
 ## Command Line
 
+Show help:
+
+```bash
+./anvil -h
+```
+
+Enable the strict memory-free surface fragment:
+
+```bash
+./anvil --strict program.c
+```
+
 Pretty-print the instrumented program:
 
 ```bash
@@ -53,6 +65,48 @@ Verify a program with Z3:
 
 ```bash
 ./anvil --verify program.c
+```
+
+Whole-program C++-flavored example with a highlighted scoring hook:
+
+```bash
+./anvil --verify examples/vulcan_listener_scoring.cpp
+```
+
+Multiple-contract guarded-case example:
+
+```bash
+./anvil --verify examples/multi_contract_sign.c
+```
+
+Buggy guarded-case example that should produce a counterexample:
+
+```bash
+./anvil --verify examples/multi_contract_sign_bad.c
+```
+
+Ghost-binding contract example:
+
+```bash
+./anvil --verify examples/ghost_contract_sign.c
+```
+
+Buggy ghost-binding example that should produce a counterexample:
+
+```bash
+./anvil --verify examples/ghost_contract_sign_bad.c
+```
+
+Comparator total-order proof example:
+
+```bash
+./anvil --verify examples/comparator_total_order.c
+```
+
+Quantified contract example:
+
+```bash
+./anvil --verify examples/quantified_contract_bump.c
 ```
 
 Read from standard input:
@@ -72,38 +126,90 @@ When you run:
 Anvil:
 
 1. parses the input program;
-2. loads function contracts from local `#include "file.h"` headers;
-3. loads the same contract syntax from implemented functions in `.c` files;
-4. attaches any `@Invariant` comments to the following `while` loop;
-5. instruments contracts into `Assume` and `Assert` statements;
-6. lowers pointer operations and ghost-heap contract predicates into scalar ghost state when needed;
-7. computes weakest preconditions for each function;
-8. asks Z3 whether the negation of each VC is satisfiable; and
-9. reports success or a counterexample.
+2. resolves namespaces, classes, methods, references, and overloads into the core representation;
+3. loads function contracts from local `#include "file.h"` headers;
+4. loads the same contract syntax from implemented functions in the input source file, whether it is named `.c` or `.cpp`;
+5. attaches any `@Invariant` comments to the following `while` loop;
+6. instruments contracts into `Assume` and `Assert` statements;
+7. lowers pointer, array, and shadow-memory obligations plus ghost-heap predicates into scalar ghost state when needed;
+8. computes weakest preconditions for each function;
+9. asks Z3 whether the negation of each VC is satisfiable; and
+10. reports success or a counterexample.
 
 If Z3 cannot find a model for the negated VC, the program is reported as verified.
 
 If Z3 can find a model, Anvil prints the failing verification condition and the model values it found.
 
+## Highlighting An Evolvable Scoring Hook
+
+The example at `examples/vulcan_listener_scoring.cpp` shows the workflow for a policy-style program where:
+
+- the whole program is verified;
+- a scoring helper is visually marked with `EVOLVE-BLOCK-START` / `EVOLVE-BLOCK-END`; and
+- the interesting proof obligations are written as contracts on that scoring helper.
+
+Those `EVOLVE-BLOCK` comments are currently documentary only.
+They are meant to spotlight the code a synthesis or editing loop would change, while `./anvil --verify` still checks the full file.
+
+## Strict Mode
+
+Pass `--strict` to reject surface syntax that directly manipulates memory.
+
+In strict mode, Anvil rejects:
+
+- pointer types and reference types;
+- array types and array indexing;
+- address-of, dereference, and `->` syntax; and
+- `free`.
+
+Strict mode also requires variables to be explicitly initialized:
+
+- local declarations like `int x;` are rejected; and
+- top-level globals are rejected, since the current surface syntax does not support initialized global declarations.
+
+This is a syntactic restriction layer on top of ordinary parsing and verification.
+For example, both of these are valid entry points:
+
+```bash
+./anvil --strict program.c
+./anvil --strict --verify program.c
+```
+
 ## Function Contracts
 
-Anvil understands three function contract annotations:
+Anvil understands five function contract clause kinds:
 
+- `@Ghost`
 - `@Require`
 - `@Guarantee`
+- `@Theorem`
 - `@Safety`
 
-These can appear either:
+Contracts are written in comments with an explicit function target:
 
-- before a declaration in a local header included with `#include "..."`; or
-- before a function definition in a `.c` file.
+- `@Contract function_name`
+
+Multiple contract blocks for the same function are merged conjunctively.
+Within those blocks, repeated `@Ghost`, `@Require`, `@Guarantee`, `@Theorem`, and `@Safety` lines are also merged conjunctively.
+Each clause kind is optional: if a function has no clauses of a given kind, Anvil adds no obligation or assumption for that kind.
+
+These comments can appear at top level either:
+
+- in a local header included with `#include "..."`; or
+- in the current source file, including `.c` and `.cpp` inputs.
+
+When `@Contract function_name` is present, Anvil associates the block with that function by name rather than by physical adjacency.
+
+The older shorthand without `@Contract ...`, placed immediately before the declaration or definition, is still accepted for compatibility.
 
 ### Example: Contract In A Header
 
 ```c
-/* @Require x >= 0
+/* @Contract inc
+ * @Ghost int baseline = x
+ * @Require x >= 0
  * @Guarantee result > x
- * @Safety x <= 10
+ * @Safety baseline <= 10
  */
 int inc(int x);
 ```
@@ -131,9 +237,11 @@ int main(void) {
 
 int x;
 
-/* @Require y >= 0
+/* @Contract inc
+ * @Ghost int baseline = y
+ * @Require y >= 0
  * @Guarantee result > y
- * @Safety y >= 0
+ * @Safety baseline >= 0
  */
 int inc(int y) {
   return (y + 1);
@@ -149,21 +257,165 @@ int main(void) {
 
 At a call to a contracted function, Anvil checks:
 
-- `@Require` as a caller obligation;
-- `@Guarantee` as a post-call assumption; and
-- `@Safety` as a post-call assumption.
+- each `@Ghost` binding once at function entry;
+- each `@Require` clause as a caller obligation;
+- each `@Guarantee` clause as a post-call assumption; and
+- imported `@Theorem` clauses on external functions as reusable assumptions; and
+- each `@Safety` clause as a post-call assumption.
 
 Inside a contracted function body, Anvil treats:
 
-- `@Require` as an entry assumption;
-- `@Guarantee` as an assertion at each `return`; and
-- `@Safety` as a proof obligation that must hold after every command.
+- each `@Ghost` binding as an immutable verifier-only name fixed at entry;
+- each `@Require` clause as an entry assumption;
+- each `@Guarantee` clause as an assertion at each `return`; and
+- each `@Theorem` clause as a separate global proof obligation for the function; and
+- each `@Safety` clause as a proof obligation that must hold after every command.
 
 Use `result` inside `@Guarantee` to refer to the returned value.
+Use `@Theorem` for global laws about a function, such as quantified order properties of `compare(x, y)`.
+`@Theorem` clauses should not mention `result`; they are about function applications like `f(x)` rather than the current return site.
+
+Example of a split contract:
+
+```c
+/* @Contract inc
+ * @Ghost int baseline = x
+ */
+/* @Contract inc
+ * @Require x >= 0
+ */
+/* @Contract inc
+ * @Guarantee result >= x
+ */
+/* @Contract inc
+ * @Safety x <= 10
+ */
+int inc(int x);
+```
+
+Example of guarded cases with multiple contract blocks:
+
+```c
+/* @Contract signed_from_bit
+ * @Guarantee bit ==> result > 0
+ */
+/* @Contract signed_from_bit
+ * @Guarantee (!bit) ==> result < 0
+ */
+int signed_from_bit(bool bit) {
+  if (bit) {
+    return 7;
+  } else {
+    return -3;
+  }
+}
+```
+
+This works because contract clauses are conjunctive.
+The first clause says that when `bit` is true the result must be positive, and the second says that when `bit` is false the result must be negative.
+Contract comments and loop invariants also accept implication sugar: `premise ==> obligation`.
+It is parsed only in annotation syntax and desugars to `!premise || obligation`.
+Contract comments also accept either `=` or `==` for equality.
+
+Example with a ghost binding:
+
+```c
+/* @Contract signed_from_bit
+ * @Ghost bool bit_is_set = bit != 0
+ * @Guarantee bit_is_set ==> result > 0
+ * @Guarantee (!bit_is_set) ==> result < 0
+ */
+int signed_from_bit(bool bit) {
+  if (bit) {
+    return 7;
+  } else {
+    return -3;
+  }
+}
+```
+
+`@Ghost` bindings are evaluated at function entry and are immutable afterward.
+They are useful for naming derived facts once and reusing them across `@Require`, `@Guarantee`, `@Safety`, and loop invariants.
+This first implementation supports scalar ghost types: `int`, `float`, `double`, `char`, and `bool`.
+
+Contracts and loop invariants may also use universal quantification.
+The syntax is:
+
+```c
+forall(int i, int* p). formula
+```
+
+Each quantified variable must carry an explicit type annotation.
+The current implementation supports scalar binder types `int`, `float`, `double`, `char`, and `bool`, plus pointer binder types such as `int*`, `void*`, and `struct node*`.
+Bare record values, arrays, and reference types are not supported as quantified binders.
+
+Example:
+
+```c
+/* @Contract bump
+ * @Guarantee forall(int i). (((i >= 0) && (i <= x)) ==> (result > i))
+ * @Guarantee forall(int* p). (is_null(p) || !is_null(p))
+ */
+int bump(int x) {
+  return (x + 1);
+}
+```
+
+The first quantified clause says that every integer between `0` and `x` is strictly below the returned value.
+The second shows that quantified pointer variables are also allowed, provided they are explicitly typed.
+
+Example of a theorem-style comparator specification:
+
+```c
+/* @Contract compare_int
+ * @Guarantee (x <= y) ==> (result <= 0)
+ * @Guarantee (result <= 0) ==> (x <= y)
+ * @Guarantee (y <= x) ==> (result >= 0)
+ * @Guarantee (result >= 0) ==> (y <= x)
+ * @Guarantee (x == y) ==> (result == 0)
+ * @Guarantee (result == 0) ==> (x == y)
+ * @Theorem forall(int x). compare_int(x, x) = 0
+ * @Theorem forall(int x, int y). (compare_int(x, y) = 0) ==> (x = y)
+ * @Theorem forall(int x, int y, int z). (((compare_int(x, y) <= 0) && (compare_int(y, z) <= 0)) ==> (compare_int(x, z) <= 0))
+ */
+int compare_int(int x, int y) {
+  if (x < y) {
+    return -1;
+  }
+  if (y < x) {
+    return 1;
+  }
+  return 0;
+}
+```
+
+Anvil proves these `@Theorem` clauses from the ordinary `@Guarantee` / `@Safety` summaries of contracted functions.
+This is the intended way to write concise quantified laws over calls such as `compare_int(x, y)` without manually building a separate proof harness function.
+When a theorem comes from an imported header for a function with no local definition in the current translation unit, Anvil treats it as a trusted modular assumption for the client file.
+When the function is defined locally, Anvil instead checks the theorem against that local definition and does not feed it back in as an assumption while verifying the same translation unit.
 
 `@Safety` is intended to describe a state property that is preserved throughout execution.
 Operationally, Anvil assumes it after a contracted call, and proves it inside a contracted implementation.
 In practice, `@Safety` should be written as a state invariant rather than as a property of `result`.
+
+## Records, Classes, And Namespaces
+
+Anvil supports a small structural-data and C++-flavored frontend fragment:
+
+- `struct` declarations with scalar, pointer, fixed-size array, and nested record fields;
+- field access with `x.f` and pointer field access with `p->f`;
+- `class` declarations as frontend sugar for a record plus methods; and
+- `namespace` blocks with `::` qualified references.
+
+Method calls like `obj.put(7)` and `ptr->get()` are resolved statically before verification.
+The pretty-printer emits flattened C rather than the original `class` / `namespace` syntax, so names become forms like `math__ns__Pair` and `Counter__put`.
+
+This is still a minimal C++-style fragment:
+
+- no inheritance
+- no constructors or destructors
+- no templates
+- no virtual dispatch
 
 ## Overloading And Type-Directed Dispatch
 
@@ -262,12 +514,19 @@ int main(void) {
 Because `@Safety` is checked after every command inside a contracted implementation, `@Safety heap_ok()` means "no invalid memory action has happened so far on this path."
 At a call to a contracted function, that same `@Safety` fact is assumed afterward, just like a guarantee.
 
-Anvil currently uses a fixed `sizeof(int) = 4` byte model for memory.
-So `malloc(n)` is interpreted in bytes, `*p` and `*p = v` require 4 readable bytes, and `p + 1` advances by 4 bytes.
+Anvil uses a fixed byte-size model for the supported first-order types:
+
+- `int` and `float`: 4 bytes
+- `double`: 8 bytes
+- `char` and `bool`: 1 byte
+- pointers: 8 bytes
+
+Record and array sizes are computed from those modeled field and element sizes.
+`malloc(n)` is interpreted in bytes, a read or write through `T*` consumes `sizeof(T)` modeled bytes, and `p + 1` advances by that same modeled object size.
 
 When Anvil sees pointer syntax or ghost-heap predicates, it lowers memory into ghost state:
 
-- each pointer global is represented as a `(block, offset)` pair;
+- each pointer variable is represented as a `(block, offset)` pair;
 - each `malloc` site gets ghost variables for allocation size and liveness;
 - loads become uninterpreted `__anvil_load(block, offset)` values; and
 - invalid read, write, or `free` operations flip a sticky ghost flag used by `heap_ok()`.
@@ -282,8 +541,8 @@ Anvil currently recognizes these built-in predicate calls in contracts:
 - `heap_ok()`: no earlier memory operation on the current path has been marked invalid.
 - `valid_read(p, n)`: the range starting at pointer `p` with width `n` bytes lies inside a readable live block.
 - `valid_write(p, n)`: currently the same check as `valid_read(p, n)`.
-- `allocated(p)`: pointer `p` designates at least one readable `int` cell, currently 4 bytes.
-- `live(p)`: the block named by `p` is live. Integer globals are always live.
+- `allocated(p)`: pointer `p` designates at least one readable cell of its modeled pointee type.
+- `live(p)`: the block named by `p` is live. Scalar globals are always live.
 - `can_free(p)`: `p` is null or the base address of a live allocation.
 - `same_block(p, q)`: `p` and `q` refer to the same block.
 - `is_null(p)`: `p` is the null pointer.
@@ -292,20 +551,17 @@ These predicates are lowered into ordinary scalar formulas before weakest-precon
 
 ## Arrays
 
-Anvil now supports fixed-size global arrays of scalar element types:
+Anvil supports fixed-size arrays in globals, locals, and record or class fields.
 
-- `int`
-- `float`
-- `double`
-- `char`
-- `bool`
+The existing verifier handles scalar element arrays directly, and also supports record-valued arrays when access continues down to scalar leaves, such as `node.leaves[1].value`.
 
 The surface syntax includes:
 
 - declarations like `int xs[4];`
 - indexed reads like `xs[i]` and `p[i]`
 - indexed writes like `xs[i] = e;`
-- indexed addresses like `&xs[i]`
+- indexed addresses like `&xs[i]`; and
+- nested field/index combinations like `node.leaves[1].value`
 
 Example:
 
@@ -330,9 +586,10 @@ Array accesses are lowered into the same ghost-heap model as pointer arithmetic,
 
 Current limitations:
 
-- arrays must be global, fixed-size declarations
-- array elements must be scalar (no arrays of pointers or nested arrays yet)
+- arrays must be fixed-size declarations
+- nested arrays are unsupported
 - array parameters and array return types are not supported yet
+- globals and locals with pointer-element arrays are currently rejected
 
 ## Loop Invariants
 
@@ -385,21 +642,28 @@ The accepted language is intentionally small.
 
 Supported today:
 
-- global scalar variables of type `int`, `float`, `double`, `char`, and `bool`
-- global pointer variables to those scalar types, such as `int *p;` and `double *q;`
-- function-local scalar, pointer, and fixed-size array declarations
+- global scalar, record, pointer, and fixed-size array variables
+- function-local scalar, record, pointer, and fixed-size array declarations
 - nested block scopes with local-variable shadowing
-- scalar-valued functions over `int`, `float`, `double`, `char`, `bool`, plus `void`
+- `struct` definitions with scalar, pointer, fixed-size array, and nested record fields
+- `class` definitions with methods
+- `namespace` blocks and `::` qualified names
+- scalar-valued and `void` functions and methods
 - local helper function definitions before `main`
 - local header imports with `#include "file.h"`
+- exact-match overload resolution for free functions and methods
+- reference parameters `T&` and `const T&`
 - integer, float, double, char, and bool literals
 - variables
-- address-of for scalar globals and local array elements such as `&x` and `&xs[0]`
+- field access such as `x.f` and pointer field access such as `p->f`
+- method calls such as `obj.m(...)` and `ptr->m(...)`
+- address-of for addressable lvalues such as `&x`, `&xs[0]`, and `&node.leaf`
 - pointer dereference reads such as `*p`
 - pointer dereference writes such as `*(p + 1) = 7;`
 - array reads and writes such as `xs[i]` and `xs[i] = 7;`
 - `malloc(n)` and `free(p)`
 - function calls
+- compound assignments `+=` and `-=`
 - arithmetic expressions such as `(x + 1)` and `(x - 1)`
 - comparisons such as `(x >= 0)` and `(x == y)`
 - boolean connectives in conditions and contracts
@@ -464,6 +728,7 @@ Without `--verify`, Anvil prints the instrumented C program:
 ```
 
 This is useful if you want to inspect the inserted checks directly.
+If the input uses classes, namespaces, references, or overloads, the emitted program is their desugared C form with flattened names and explicit lowered calls.
 
 For example, a contracted local function call becomes a sequence like:
 
@@ -474,19 +739,25 @@ For example, a contracted local function call becomes a sequence like:
 
 ## Current Limitations
 
-- Pointer safety support is currently a proof-of-concept for global scalar pointers.
-- Pointer parameters and pointer return values in function definitions are currently unsupported.
-- Reference parameters are supported, but only for scalar and record types.
-- Contracts may mention reference parameters, but post-state reasoning about an arbitrary referenced cell is still limited by the current shadow-memory model.
-- Address-of is only supported for scalar globals.
+- Pointer safety support is currently a shadow-memory proof-of-concept rather than a full symbolic heap.
 - Memory safety is opt-in through contracts such as `@Safety heap_ok()`. Pointer operations alone do not add user-visible proof obligations.
+- Pointer parameters are supported, but pointer return values are currently unsupported in the verifier's memory lowering.
+- Pointer-to-pointer operations, nested arrays, and direct dereference of `void*` are unsupported in the current memory model.
+- By-value record parameters, array parameters, and pointer / array / record / reference return types are unsupported in the verifier.
+- Reference parameters are supported, but only for scalar and record types.
+- General `const` surface syntax is not modeled beyond `const T&`; for example, `const T*` is currently rejected.
+- Contracts may mention reference parameters, but post-state reasoning about an arbitrary referenced cell is still limited by the current shadow-memory model.
 - Memory contents are not modeled precisely yet: loads become uninterpreted values, while the ghost-heap predicates cover bounds, liveness, null, and invalid free conditions.
 - `malloc` uses an allocation-site abstraction rather than a full heap model.
 - `float` and `double` are verified with an idealized real-valued encoding rather than IEEE-754 semantics.
+- `@Ghost` currently supports only scalar ghost types, and ghost initializers are fixed at function entry rather than being mutable state.
 - Instrumentation of contracted `void` calls is currently unsupported.
-- Instrumented calls inside `&&`, `||`, or `while` conditions are currently unsupported.
-- Verification models function calls in formulas as uninterpreted functions in Z3.
+- Instrumented calls inside quantified formulas, `&&`, `||`, or `while` conditions are currently unsupported.
+- Translation mode does not currently lower instrumented quantified assertions and assumptions into compilable C; quantified examples are best used with `--verify`.
+- Verification models function calls in formulas as uninterpreted functions in Z3, but contracted functions also contribute universally quantified summary axioms from `@Guarantee` and `@Safety`.
+- Imported `@Theorem` clauses are reusable assumptions for external functions, but locally checked `@Theorem` clauses are not currently fed back in as additional assumptions inside the same translation unit.
 - Only local quoted includes are used for contract imports: `#include "file.h"`.
+- Named `@Contract foo` blocks must resolve to a unique function during contract loading; overloaded same-name targets are currently rejected as ambiguous.
 
 ## Examples In This Repository
 
@@ -494,8 +765,12 @@ Useful examples live in `test/e2e_cases/`:
 
 - `contract_import_scalar.c`
 - `contract_local_scalar.c`
+- `contract_multiple_guards.c`
+- `ghost_contract_sign.c`
 - `modular_composition_scalar.c`
 - `modular_composition_memory.c`
+- `modular_theorem_import.c`
+- `modular_theorem_local_definition.c`
 - `memory_safe_int_expression.c`
 - `memory_safe_float_expression.c`
 - `memory_safe_double_expression.c`
@@ -512,6 +787,18 @@ Useful examples live in `test/e2e_cases/`:
 - `pointer_address_of_global.c`
 
 The unit and property tests live in `test/test_anvil.ml`.
+
+Larger hand-written examples live in `examples/`:
+
+- `comparator_total_order.c`
+- `ghost_contract_sign.c`
+- `ghost_contract_sign_bad.c`
+- `multi_contract_sign.c`
+- `multi_contract_sign_bad.c`
+- `quantified_contract_bump.c`
+- `quantified_contract_bump_bad.c`
+- `vulcan_listener_scoring.cpp`
+- `policysmith_dispatch_policy.cpp`
 
 ## Development Checks
 

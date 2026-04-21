@@ -1,4 +1,5 @@
 /* EXPECT: PASS */
+/* VERIFY: FAIL */
 #include "modular_memory_stub_contracts.h"
 #include <stdlib.h>
 #include <stdio.h>

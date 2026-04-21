@@ -50,6 +50,7 @@ type contract = {
   ghosts : ghost_binding list;
   require : string list;
   guarantee : string list;
+  theorem : string list;
   safety : string list;
 }
 
@@ -667,6 +668,7 @@ let empty_contract = {
   ghosts = [];
   require = [];
   guarantee = [];
+  theorem = [];
   safety = [];
 }
 
@@ -674,6 +676,7 @@ let contract_is_empty contract =
   contract.ghosts = []
   && contract.require = []
   && contract.guarantee = []
+  && contract.theorem = []
   && contract.safety = []
 
 let merge_contracts left right =
@@ -681,6 +684,7 @@ let merge_contracts left right =
     ghosts = left.ghosts @ right.ghosts;
     require = left.require @ right.require;
     guarantee = left.guarantee @ right.guarantee;
+    theorem = left.theorem @ right.theorem;
     safety = left.safety @ right.safety;
   }
 
@@ -702,6 +706,7 @@ let contract_to_c function_name = function
           (ghost_lines
           @ clause_lines "@Require" contract.require
           @ clause_lines "@Guarantee" contract.guarantee
+          @ clause_lines "@Theorem" contract.theorem
           @ clause_lines "@Safety" contract.safety)
       ^ " */\n"
 

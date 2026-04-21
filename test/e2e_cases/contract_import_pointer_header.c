@@ -1,4 +1,5 @@
 /* EXPECT: PASS */
+/* VERIFY: FAIL */
 #include "pointer_contracts.h"
 #include <stdlib.h>
 #include <stdio.h>

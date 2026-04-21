@@ -1,8 +1,8 @@
 /* Comparator proof example.
  *
- * The quantified contract proves that integer <= is a total order.
- * The comparator contract identifies compare_int(x, y) <= 0 with x <= y.
- * The proof harness then lifts those quantified order laws to the comparator.
+ * Ordinary @Guarantee clauses give a per-call summary of the comparator.
+ * @Theorem clauses then state the global order laws concisely in terms of
+ * compare_int(...) itself.
  */
 
 #include <stdlib.h>
@@ -15,6 +15,11 @@
  * @Guarantee (result >= 0) ==> (y <= x)
  * @Guarantee (x == y) ==> (result == 0)
  * @Guarantee (result == 0) ==> (x == y)
+ * @Theorem forall(int x). compare_int(x, x) = 0
+ * @Theorem forall(int x, int y). (compare_int(x, y) = 0) ==> (x = y)
+ * @Theorem forall(int x, int y). ((compare_int(x, y) <= 0) || (compare_int(y, x) <= 0))
+ * @Theorem forall(int x, int y). (((compare_int(x, y) <= 0) && (compare_int(y, x) <= 0)) ==> (x = y))
+ * @Theorem forall(int x, int y, int z). (((compare_int(x, y) <= 0) && (compare_int(y, z) <= 0)) ==> (compare_int(x, z) <= 0))
  */
 int compare_int(int x, int y) {
   if (x < y) {
@@ -22,49 +27,6 @@ int compare_int(int x, int y) {
   }
   if (y < x) {
     return 1;
-  }
-  return 0;
-}
-
-/* @Contract prove_int_le_total_order
- * @Guarantee forall(int a, int b). ((a <= b) || (b <= a))
- * @Guarantee forall(int a, int b). (((a <= b) && (b <= a)) ==> (a == b))
- * @Guarantee forall(int a, int b, int c). (((a <= b) && (b <= c)) ==> (a <= c))
- */
-int prove_int_le_total_order(void) {
-  return 0;
-}
-
-int prove_compare_total_order(int a, int b, int c) {
-  int order_theorem;
-  int aa;
-  int ab;
-  int ba;
-  int bc;
-  int ac;
-
-  order_theorem = prove_int_le_total_order();
-
-  aa = compare_int(a, a);
-  ab = compare_int(a, b);
-  ba = compare_int(b, a);
-  bc = compare_int(b, c);
-  ac = compare_int(a, c);
-
-  if (!(aa == 0)) {
-    abort();
-  }
-  if (!((order_theorem == 0) || (order_theorem != 0))) {
-    abort();
-  }
-  if (!((ab <= 0) || (ba <= 0))) {
-    abort();
-  }
-  if (!(!((ab <= 0) && (ba <= 0)) || (a == b))) {
-    abort();
-  }
-  if (!(!((ab <= 0) && (bc <= 0)) || (ac <= 0))) {
-    abort();
   }
   return 0;
 }

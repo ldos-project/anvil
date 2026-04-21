@@ -2380,6 +2380,9 @@ let lower_predicate env name args =
   | _ ->
       fail "unknown ghost-heap predicate `%s`" name
 
+let is_ghost_heap_predicate name =
+  List.exists (String.equal name) ghost_heap_predicates
+
 let rec lower_contract_bexpr env bexpr =
   match bexpr with
   | True -> Ok True
@@ -2400,10 +2403,17 @@ let rec lower_contract_bexpr env bexpr =
       let* right = lower_contract_bexpr env right in
       Ok (Or (left, right))
   | Neq (FuncCall (name, args), Int 0)
-  | Eq (FuncCall (name, args), Int 1) ->
+    when is_ghost_heap_predicate name ->
+      lower_predicate env name args
+  | Eq (FuncCall (name, args), Int 1)
+    when is_ghost_heap_predicate name ->
       lower_predicate env name args
   | Eq (FuncCall (name, args), Int 0)
-  | Neq (FuncCall (name, args), Int 1) ->
+    when is_ghost_heap_predicate name ->
+      let* formula = lower_predicate env name args in
+      Ok (Not formula)
+  | Neq (FuncCall (name, args), Int 1)
+    when is_ghost_heap_predicate name ->
       let* formula = lower_predicate env name args in
       Ok (Not formula)
   | Eq (left, right) ->

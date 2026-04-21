@@ -1,4 +1,5 @@
 /* EXPECT: PASS */
+/* VERIFY: PASS */
 #include "missing_safety_contracts.h"
 #include <stdlib.h>
 #include <stdio.h>
