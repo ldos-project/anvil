@@ -43,6 +43,9 @@ rule read = parse
   | "struct"            { STRUCT_KW }
   | "class"             { CLASS_KW }
   | "namespace"         { NAMESPACE_KW }
+  | "auto"              { AUTO_KW }
+  | "static_cast"       { STATIC_CAST_KW }
+  | "for"               { FOR_KW }
   | "true"              { TRUE_KW }
   | "false"             { FALSE_KW }
   | "forall"            { FORALL_KW }
@@ -53,13 +56,18 @@ rule read = parse
   | "while"             { WHILE_KW }
   | "return"            { RETURN_KW }
   | "free"              { FREE_KW }
+  | "std::function"     { stdfunction_angle (Buffer.create 32) 0 lexbuf }
   | "&&"                { AND }
   | "||"                { OR }
   | "==>"               { IMPLIES }
   | "::"                { SCOPE }
   | "->"                { ARROW }
+  | "++"                { INCR }
+  | "--"                { DECR }
   | "+="                { PLUSEQ }
   | "-="                { MINUSEQ }
+  | "*="                { STAREQ }
+  | "/="                { SLASHEQ }
   | "=="                { EQEQ }
   | "!="                { NEQ }
   | "<="                { LE }
@@ -84,6 +92,8 @@ rule read = parse
   | ']'                 { RBRACKET }
   | ';'                 { SEMI }
   | ','                 { COMMA }
+  | '?'                 { QUESTION }
+  | ':'                 { COLON }
   | '&'                 { AMP }
   | '.'                 { DOT }
   | '+'                 { PLUS }
@@ -105,6 +115,24 @@ and skip_line = parse
   | '\n'                { Lexing.new_line lexbuf }
   | eof                 { () }
   | _                   { skip_line lexbuf }
+
+(* Consume the `<...>` template argument of a `std::function` type as one
+   opaque token. Tracks angle-bracket depth so nested templates like
+   `std::function<double(int)>` are captured whole. The captured text is
+   unused downstream (the type is treated opaquely), but we keep it for
+   diagnostics. *)
+and stdfunction_angle buffer depth = parse
+  | '<'                 { Buffer.add_char buffer '<';
+                          stdfunction_angle buffer (depth + 1) lexbuf }
+  | '>'                 { Buffer.add_char buffer '>';
+                          if depth <= 1 then STDFUNCTION_TYPE (Buffer.contents buffer)
+                          else stdfunction_angle buffer (depth - 1) lexbuf }
+  | '\n'                { Lexing.new_line lexbuf;
+                          Buffer.add_char buffer '\n';
+                          stdfunction_angle buffer depth lexbuf }
+  | eof                 { raise_syntax "unterminated `std::function<...>` type" }
+  | _ as c              { Buffer.add_char buffer c;
+                          stdfunction_angle buffer depth lexbuf }
 
 and block_comment = parse
   | "*/"                { () }

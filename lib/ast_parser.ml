@@ -1488,3 +1488,24 @@ let parse_program
       Error msg
   | Parser.Error ->
       Error (Printf.sprintf "parse error at %s" (position lexbuf))
+
+(* The safety gate for an evolve block: parse it with the dedicated
+   `evolve_program` grammar, resolve only the type names it needs, then run
+   the strict memory-free syntax check. This deliberately stops BEFORE method
+   resolution and instrumentation — the gate is a purely syntactic guarantee
+   that the candidate uses no pointers, arrays, address-of, dereference,
+   `->`, `new`/`malloc`/`free`. It needs no library stubs because strict mode
+   runs before any name/type resolution that would require them. *)
+let gate_evolve_block ?(source_name = "<evolve>") source =
+  let lexbuf = Lexing.from_string source in
+  try
+    let program = Parser.evolve_program Lexer.read lexbuf in
+    let program = resolve_program_type_names program in
+    Strict_syntax.validate_program program
+  with
+  | Lexer.Syntax_error msg ->
+      Error (Printf.sprintf "%s in %s at %s" msg source_name (position lexbuf))
+  | Failure msg ->
+      Error (Printf.sprintf "%s in %s" msg source_name)
+  | Parser.Error ->
+      Error (Printf.sprintf "parse error in %s at %s" source_name (position lexbuf))

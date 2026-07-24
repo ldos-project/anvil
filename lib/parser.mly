@@ -184,6 +184,130 @@ let build_class class_name members =
   Top_record { record_name = class_name; fields = List.rev fields_rev }
   :: List.rev methods_rev
 
+(* ----------------------------------------------------------------------- *)
+(* Evolve-block desugaring.                                                  *)
+(*                                                                           *)
+(* The evolve block the LLM writes (listener attachments + a `score_fn`      *)
+(* lambda) uses value-level constructs the core language lacks: comparisons  *)
+(* and `&&`/`||`/`!` used as values, the ternary `?:`, `static_cast`,        *)
+(* bounded `for`, and `{a, b}` initializer lists as call arguments.          *)
+(*                                                                           *)
+(* Rather than grow the core AST (and every pass that matches on it), the    *)
+(* evolve grammar desugars all of these into the EXISTING `expr`/`stmt`      *)
+(* nodes. Boolean/comparison/ternary results become opaque intrinsic         *)
+(* `FuncCall`s, so `strict_syntax` still recurses into every operand and the *)
+(* memory-safety gate sees the whole program. Unsafe constructs (`*`, `&`,   *)
+(* `[]`, `->`) are kept as their real AST nodes (`Deref`/`AddrOf`/`Index`/   *)
+(* `Field (Deref _, _)`) precisely so strict mode rejects them with a clear  *)
+(* message instead of a generic parse error.                                 *)
+(* ----------------------------------------------------------------------- *)
+
+let anvil_intrinsic name args = FuncCall (name, args)
+
+let val_cmp op left right =
+  let name =
+    match op with
+    | `Eq -> "__anvil_eq"
+    | `Neq -> "__anvil_neq"
+    | `Lt -> "__anvil_lt"
+    | `Le -> "__anvil_le"
+    | `Gt -> "__anvil_gt"
+    | `Ge -> "__anvil_ge"
+  in
+  anvil_intrinsic name [left; right]
+
+let val_and left right = anvil_intrinsic "__anvil_and" [left; right]
+let val_or left right = anvil_intrinsic "__anvil_or" [left; right]
+let val_not inner = anvil_intrinsic "__anvil_not" [inner]
+let val_ite cond then_value else_value =
+  anvil_intrinsic "__anvil_ite" [cond; then_value; else_value]
+let val_list items = anvil_intrinsic "__anvil_list" items
+
+(* A value used where the core language wants a `bexpr` (if/while/for
+   conditions). Desugaring conditions to `Neq (e, 0)` keeps the entire
+   condition expression visible to the strict scan. *)
+let value_as_cond expr = Neq (expr, Int 0)
+
+let zero_of_type = function
+  | TDouble -> DoubleLit "0.0"
+  | TFloat -> FloatLit "0.0f"
+  | TChar -> CharLit 0
+  | TBool -> BoolLit false
+  | _ -> Int 0
+
+(* An uninitialized scalar local is memory-safe (no pointer/heap involved),
+   so the gate admits it by supplying a synthetic zero initializer. This is
+   only used for the safety gate, which does not reason about reads of
+   uninitialized values. *)
+let evolve_local_decl local_type name init =
+  let init =
+    match init with
+    | Some _ -> init
+    | None -> Some (zero_of_type local_type)
+  in
+  make_local_decl local_type name init
+
+(* An expression evaluated for effect (e.g. a listener attachment
+   `store_cfg.add_listeners(...)`). The core language has no expression
+   statement, so bind it to a discard name; strict still scans the
+   expression. *)
+let evolve_effect_stmt expr = Assign ("__anvil_discard", expr)
+
+let evolve_compound combine lhs rhs = assignment_stmt lhs (combine lhs rhs)
+
+let evolve_for ~init ~cond ~step body =
+  seq_of_list [ init; While (None, value_as_cond cond, seq_of_list [ body; step ]) ]
+
+(* The `for` bound must be a compile-time constant so the loop is provably
+   bounded. We accept a comparison where at least one operand is a literal
+   (optionally negated) numeric bound; the other operand is the induction
+   variable. *)
+let is_const_bound = function
+  | Int _ | FloatLit _ | DoubleLit _ | CharLit _ -> true
+  | Sub (Int 0, (Int _ | FloatLit _ | DoubleLit _ | CharLit _)) -> true
+  | _ -> false
+
+let ensure_one_const_bound left right =
+  if is_const_bound left || is_const_bound right then ()
+  else
+    fail
+      "strict for-loops require a compile-time constant bound, got `%s ? %s`"
+      (expr_to_c left) (expr_to_c right)
+
+type evolve_item =
+  | Evolve_effect of stmt
+  | Evolve_score of function_def
+
+(* Assemble the parsed evolve block into a whole program: the `score_fn`
+   becomes a top-level function and the loose listener statements become the
+   body of a synthesized `main`. A trivial `score_fn` is synthesized if the
+   block declares none, so listener-only fragments are still well-formed and
+   gated. *)
+let build_evolve_program items =
+  let effects_rev, score_fns_rev =
+    List.fold_left
+      (fun (effects_rev, score_fns_rev) -> function
+        | None -> effects_rev, score_fns_rev
+        | Some (Evolve_effect stmt) -> stmt :: effects_rev, score_fns_rev
+        | Some (Evolve_score fn) -> effects_rev, fn :: score_fns_rev)
+      ([], [])
+      items
+  in
+  let effects = List.rev effects_rev in
+  let score_fns = List.rev score_fns_rev in
+  let main =
+    make_function ~name:"main" ~return_type:TInt ~params:[]
+      (Block (effects @ [ Return (Some (Int 0)) ]))
+  in
+  let functions =
+    match score_fns with
+    | [] ->
+        [ make_function ~name:"score_fn" ~return_type:TDouble ~params:[]
+            (Block [ Return (Some (DoubleLit "0.0")) ]) ]
+    | _ -> score_fns
+  in
+  { imports = []; records = []; globals = []; functions; main }
+
 let build_program items =
   let rec loop records_rev globals_rev functions_rev main = function
     | [] ->
@@ -220,7 +344,10 @@ let build_program items =
 %token <int> CHAR_LIT
 %token <string> IDENT
 %token INT_KW FLOAT_KW DOUBLE_KW CHAR_KW BOOL_KW CONST_KW MAIN_KW VOID_KW STRUCT_KW CLASS_KW NAMESPACE_KW IF_KW ELSE_KW WHILE_KW RETURN_KW FREE_KW TRUE_KW FALSE_KW FORALL_KW
+%token AUTO_KW STATIC_CAST_KW FOR_KW
+%token <string> STDFUNCTION_TYPE
 %token LPAREN RPAREN LBRACE RBRACE LBRACKET RBRACKET SEMI COMMA AMP DOT ARROW SCOPE
+%token QUESTION COLON INCR DECR STAREQ SLASHEQ
 %token PLUS MINUS STAR SLASH PERCENT
 %token ASSIGN PLUSEQ MINUSEQ EQEQ NEQ LT LE GT GE NOT AND OR IMPLIES
 %token EOF
@@ -230,6 +357,7 @@ let build_program items =
 %left AND
 
 %start <Ast.program> program
+%start <Ast.program> evolve_program
 %start <Ast.expr> contract_expr_eof
 %start <Ast.bexpr> contract_bexpr_eof
 %start <Ast.bexpr> bexpr_eof
@@ -907,3 +1035,296 @@ nonparen_primary_expr:
       { FuncCall (name, args) }
   | name = qualified_ident
       { Var name }
+
+(* ======================================================================= *)
+(* Evolve-block grammar.                                                     *)
+(*                                                                           *)
+(* A separate start symbol with its own value-expression and statement       *)
+(* nonterminals (all prefixed `val_`/`evolve_`). It is reachable only from   *)
+(* `evolve_program`, so it cannot perturb the core `program` grammar. Every  *)
+(* production desugars into the existing AST (see the header helpers), so no *)
+(* downstream pass changes. The grammar is intentionally permissive about    *)
+(* SAFE constructs and preserves UNSAFE ones (`*`,`&`,`[]`,`->`,arrays) as   *)
+(* their real AST nodes so `--strict` rejects them precisely.                *)
+(* ======================================================================= *)
+
+evolve_program:
+  | items = list(evolve_item) EOF
+      { build_evolve_program items }
+
+(* Each top-level item is either the score-function definition or a statement
+   evaluated for effect (a listener attachment). `None` is an empty `;`. *)
+evolve_item:
+  | score = evolve_score_fn
+      { Some (Evolve_score score) }
+  | stmt = evolve_toplevel_stmt
+      { Some (Evolve_effect stmt) }
+
+(* The score function in any of the shapes the demo emits:
+     auto score_fn = [&](params) -> double { body };
+     std::function<...> score_fn = [&](params) -> double { body };
+   The `double score_fn(params) { body }` plain-function form is handled by
+   evolve_toplevel_stmt's leading-type case is NOT — it is parsed here so the
+   block is treated as a function body. *)
+evolve_score_fn:
+  | AUTO_KW name = IDENT ASSIGN body = evolve_lambda SEMI
+      { let (return_type, params, block) = body in
+        make_function ~name ~return_type ~params block }
+  | STDFUNCTION_TYPE name = IDENT ASSIGN body = evolve_lambda SEMI
+      { let (return_type, params, block) = body in
+        make_function ~name ~return_type ~params block }
+  | return_type = scalar_type name = IDENT LPAREN params = evolve_param_list RPAREN block = evolve_block
+      { make_function ~name ~return_type ~params block }
+
+evolve_lambda:
+  | LBRACKET AMP RBRACKET LPAREN params = evolve_param_list RPAREN ARROW return_type = evolve_ret_type block = evolve_block
+      { (return_type, params, block) }
+  | LBRACKET RBRACKET LPAREN params = evolve_param_list RPAREN ARROW return_type = evolve_ret_type block = evolve_block
+      { (return_type, params, block) }
+
+(* Top-level statements in the evolve block are listener attachments (method
+   calls evaluated for effect) and empty `;`. Anything richer belongs inside
+   the score function. *)
+evolve_toplevel_stmt:
+  | SEMI
+      { Skip }
+  | expr = val_expr SEMI
+      { evolve_effect_stmt expr }
+
+(* The feature_store parameter is passed by value here; the C++ build restores
+   the reference via a `#define`. Anvil accepts a leading `const` on the
+   by-value record param and treats it as a plain record. *)
+evolve_param_list:
+  | { [] }
+  | VOID_KW
+      { [] }
+  | first = evolve_param rest = evolve_param_tail
+      { first :: rest }
+
+evolve_param_tail:
+  | { [] }
+  | COMMA next = evolve_param rest = evolve_param_tail
+      { next :: rest }
+
+evolve_param:
+  | base = evolve_value_type name = IDENT
+      { { param_type = base; param_name = Some name } }
+  | CONST_KW base = evolve_value_type name = IDENT
+      { { param_type = base; param_name = Some name } }
+
+evolve_ret_type:
+  | base = evolve_value_type
+      { base }
+
+evolve_value_type:
+  | base = scalar_type
+      { base }
+  | name = qualified_ident
+      { TRecord name }
+  | STRUCT_KW name = qualified_ident
+      { TRecord name }
+
+evolve_block:
+  | LBRACE stmts = list(evolve_stmt) RBRACE
+      { seq_of_list stmts }
+
+evolve_stmt:
+  | SEMI
+      { Skip }
+  | block = evolve_block
+      { block }
+  | base = evolve_value_type name = IDENT ASSIGN init = val_expr SEMI
+      { evolve_local_decl base name (Some init) }
+  | base = evolve_value_type name = IDENT SEMI
+      { evolve_local_decl base name None }
+  | AUTO_KW name = IDENT ASSIGN init = val_expr SEMI
+      { (* `auto x = <numeric>` — model as a double scalar local. *)
+        evolve_local_decl TDouble name (Some init) }
+  | lhs = val_postfix_expr ASSIGN rhs = val_expr SEMI
+      { assignment_stmt lhs rhs }
+  | lhs = val_postfix_expr PLUSEQ rhs = val_expr SEMI
+      { evolve_compound (fun l r -> Add (l, r)) lhs rhs }
+  | lhs = val_postfix_expr MINUSEQ rhs = val_expr SEMI
+      { evolve_compound (fun l r -> Sub (l, r)) lhs rhs }
+  | lhs = val_postfix_expr STAREQ rhs = val_expr SEMI
+      { evolve_compound (fun l r -> Mul (l, r)) lhs rhs }
+  | lhs = val_postfix_expr SLASHEQ rhs = val_expr SEMI
+      { evolve_compound (fun l r -> Div (l, r)) lhs rhs }
+  | lhs = val_postfix_expr INCR SEMI
+      { evolve_compound (fun l _ -> Add (l, Int 1)) lhs (Int 1) }
+  | lhs = val_postfix_expr DECR SEMI
+      { evolve_compound (fun l _ -> Sub (l, Int 1)) lhs (Int 1) }
+  | RETURN_KW value = val_expr SEMI
+      { Return (Some value) }
+  | RETURN_KW SEMI
+      { Return None }
+  | IF_KW LPAREN cond = val_expr RPAREN then_branch = evolve_stmt ELSE_KW else_branch = evolve_stmt
+      { If (value_as_cond cond, then_branch, else_branch) }
+  | IF_KW LPAREN cond = val_expr RPAREN then_branch = evolve_stmt
+      { If (value_as_cond cond, then_branch, Skip) }
+  | WHILE_KW LPAREN cond = val_expr RPAREN body = evolve_stmt
+      { While (None, value_as_cond cond, body) }
+  | FOR_KW LPAREN init = evolve_for_init SEMI cond = val_for_cond SEMI step = evolve_for_step RPAREN body = evolve_stmt
+      { evolve_for ~init ~cond ~step body }
+  | expr = val_expr SEMI
+      { evolve_effect_stmt expr }
+
+(* A for-loop condition must compare the induction variable against a
+   compile-time constant so the loop is provably bounded. We require one side
+   of the comparison to be a literal; the other is the (data-dependent)
+   counter. Any non-comparison or non-constant-bounded condition is rejected. *)
+val_for_cond:
+  | left = val_add_expr op = val_cmp_op right = val_add_expr
+      { let _ = ensure_one_const_bound left right in op left right }
+
+%inline val_cmp_op:
+  | EQEQ { fun l r -> val_cmp `Eq l r }
+  | NEQ  { fun l r -> val_cmp `Neq l r }
+  | LT   { fun l r -> val_cmp `Lt l r }
+  | LE   { fun l r -> val_cmp `Le l r }
+  | GT   { fun l r -> val_cmp `Gt l r }
+  | GE   { fun l r -> val_cmp `Ge l r }
+
+evolve_for_init:
+  | base = evolve_value_type name = IDENT ASSIGN init = val_expr
+      { evolve_local_decl base name (Some init) }
+  | lhs = val_postfix_expr ASSIGN rhs = val_expr
+      { assignment_stmt lhs rhs }
+  |
+      { Skip }
+
+evolve_for_step:
+  | lhs = val_postfix_expr INCR
+      { evolve_compound (fun l _ -> Add (l, Int 1)) lhs (Int 1) }
+  | lhs = val_postfix_expr DECR
+      { evolve_compound (fun l _ -> Sub (l, Int 1)) lhs (Int 1) }
+  | lhs = val_postfix_expr PLUSEQ rhs = val_expr
+      { evolve_compound (fun l r -> Add (l, r)) lhs rhs }
+  | lhs = val_postfix_expr MINUSEQ rhs = val_expr
+      { evolve_compound (fun l r -> Sub (l, r)) lhs rhs }
+  | lhs = val_postfix_expr ASSIGN rhs = val_expr
+      { assignment_stmt lhs rhs }
+  |
+      { Skip }
+
+(* Value expressions: a full C-style precedence ladder that folds comparisons
+   and boolean connectives into intrinsic calls so they live in `expr`. *)
+val_expr:
+  | value = val_ternary_expr
+      { value }
+
+val_ternary_expr:
+  | cond = val_or_expr QUESTION t = val_expr COLON e = val_ternary_expr
+      { val_ite cond t e }
+  | value = val_or_expr
+      { value }
+
+val_or_expr:
+  | left = val_or_expr OR right = val_and_expr
+      { val_or left right }
+  | value = val_and_expr
+      { value }
+
+val_and_expr:
+  | left = val_and_expr AND right = val_cmp_expr
+      { val_and left right }
+  | value = val_cmp_expr
+      { value }
+
+val_cmp_expr:
+  | left = val_add_expr EQEQ right = val_add_expr
+      { val_cmp `Eq left right }
+  | left = val_add_expr NEQ right = val_add_expr
+      { val_cmp `Neq left right }
+  | left = val_add_expr LT right = val_add_expr
+      { val_cmp `Lt left right }
+  | left = val_add_expr LE right = val_add_expr
+      { val_cmp `Le left right }
+  | left = val_add_expr GT right = val_add_expr
+      { val_cmp `Gt left right }
+  | left = val_add_expr GE right = val_add_expr
+      { val_cmp `Ge left right }
+  | value = val_add_expr
+      { value }
+
+val_add_expr:
+  | left = val_add_expr PLUS right = val_mul_expr
+      { Add (left, right) }
+  | left = val_add_expr MINUS right = val_mul_expr
+      { Sub (left, right) }
+  | value = val_mul_expr
+      { value }
+
+val_mul_expr:
+  | left = val_mul_expr STAR right = val_unary_expr
+      { Mul (left, right) }
+  | left = val_mul_expr SLASH right = val_unary_expr
+      { Div (left, right) }
+  | left = val_mul_expr PERCENT right = val_unary_expr
+      { Mod (left, right) }
+  | value = val_unary_expr
+      { value }
+
+val_unary_expr:
+  | MINUS value = val_unary_expr
+      { negate_expr value }
+  | NOT value = val_unary_expr
+      { val_not value }
+  | STAR value = val_unary_expr
+      { Deref value }
+  | AMP value = val_unary_expr
+      { AddrOf value }
+  | LPAREN base = scalar_type RPAREN value = val_unary_expr
+      { (* C-style cast to a scalar type, e.g. `(double)x`. Transparent for
+           safety purposes; the operand is still scanned. Restricted to scalar
+           type keywords so it cannot be confused with a parenthesized
+           expression. *)
+        ignore base; value }
+  | value = val_postfix_expr
+      { value }
+
+val_postfix_expr:
+  | base = val_postfix_expr DOT method_name = IDENT LPAREN args = separated_list(COMMA, val_arg) RPAREN
+      { FuncCall (method_dot_call_name method_name, base :: List.concat args) }
+  | base = val_postfix_expr ARROW method_name = IDENT LPAREN args = separated_list(COMMA, val_arg) RPAREN
+      { FuncCall (method_arrow_call_name method_name, base :: List.concat args) }
+  | base = val_postfix_expr DOT field = IDENT
+      { Field (base, field) }
+  | base = val_postfix_expr ARROW field = IDENT
+      { Field (Deref base, field) }
+  | base = val_postfix_expr LBRACKET index = val_expr RBRACKET
+      { Index (base, index) }
+  | value = val_primary_expr
+      { value }
+
+val_primary_expr:
+  | n = INT_LIT
+      { Int n }
+  | value = FLOAT_LIT
+      { FloatLit value }
+  | value = DOUBLE_LIT
+      { DoubleLit value }
+  | value = CHAR_LIT
+      { CharLit value }
+  | TRUE_KW
+      { BoolLit true }
+  | FALSE_KW
+      { BoolLit false }
+  | STATIC_CAST_KW LT base = evolve_value_type GT LPAREN value = val_expr RPAREN
+      { ignore base; value }
+  | name = qualified_ident LPAREN args = separated_list(COMMA, val_arg) RPAREN
+      { FuncCall (name, List.concat args) }
+  | name = qualified_ident
+      { Var name }
+  | LPAREN value = val_expr RPAREN
+      { value }
+
+(* A call argument is either an ordinary value or a `{a, b, ...}` initializer
+   list (used for listener attachment). The list is folded into an intrinsic
+   so its elements are still scanned by strict mode. Each argument yields a
+   list of exprs (always a singleton) so the call rule can `List.concat`. *)
+val_arg:
+  | value = val_expr
+      { [value] }
+  | LBRACE items = separated_list(COMMA, val_expr) RBRACE
+      { [val_list items] }
