@@ -111,6 +111,12 @@ type stmt =
   | Seq of stmt list
   | If of bexpr * stmt * stmt
   | While of bexpr option * bexpr * stmt
+  (* Only the evolve grammar produces these, and only inside a counted `for`
+     (see `Strict_syntax.validate_loop_control`). Neither can extend a counted
+     loop, so both are inert for the safety gate; the verification pipeline
+     rejects them rather than model them. *)
+  | Break
+  | Continue
   | Assume of bexpr
   | Assert of assert_origin * bexpr
   | Free of expr
@@ -748,6 +754,8 @@ let compound_rhs_suffix target = function
 
 let rec stmt_to_c ~indent_level ~return_type = function
   | Skip -> indent indent_level ^ ";\n"
+  | Break -> indent indent_level ^ "break;\n"
+  | Continue -> indent indent_level ^ "continue;\n"
   | Block stmts ->
       indent indent_level ^ "{\n"
       ^ String.concat ""
@@ -874,7 +882,7 @@ let rec vars_in_bexpr = function
       vars_in_bexpr left @ vars_in_bexpr right
 
 let rec vars_in_stmt = function
-  | Skip -> []
+  | Skip | Break | Continue -> []
   | Block stmts | Seq stmts ->
       List.concat_map vars_in_stmt stmts
   | LocalDecl (_, init) ->
@@ -993,7 +1001,7 @@ let helper_prototypes p =
         helpers_in_bexpr (helpers_in_bexpr acc left) right
   in
   let rec helpers_in_stmt acc = function
-    | Skip -> acc
+    | Skip | Break | Continue -> acc
     | Block stmts ->
         List.fold_left helpers_in_stmt acc stmts
     | LocalDecl (_, init) ->

@@ -546,6 +546,9 @@ let contract_summary_for_program (program : program) =
 let rec wp_stmt env state stmt post =
   match stmt with
   | Skip -> post, state
+  | Break | Continue ->
+      (* Evolve-block only; modelling them as `Skip` here would be unsound. *)
+      failwith "`break`/`continue` reached weakest-precondition generation"
   | Block _ | LocalDecl _ ->
       failwith "unresolved local syntax reached weakest-precondition generation"
   | Assign (name, expr) ->
@@ -973,7 +976,7 @@ let rec apps_in_bexpr env acc = function
       apps_in_bexpr env (apps_in_bexpr env acc left) right
 
 let rec apps_in_stmt env acc = function
-  | Skip -> acc
+  | Skip | Break | Continue -> acc
   | Block stmts ->
       List.fold_left (apps_in_stmt env) acc stmts
   | LocalDecl (_, init) ->
@@ -1235,7 +1238,7 @@ let rec replay_stmt model env fuel stmt =
   else
     match stmt with
     | Skip -> Replay_continue env
-    | Block _ | LocalDecl _ ->
+    | Block _ | LocalDecl _ | Break | Continue ->
         Replay_blocked
     | Assign (name, expr) ->
         Replay_continue (bind_env env name (symbolic_expr env expr))

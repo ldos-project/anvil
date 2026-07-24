@@ -7,7 +7,7 @@ INSTALL_TARGET := /usr/local/bin/anvil
 
 .DEFAULT_GOAL := anvil
 
-.PHONY: all anvil install build clean
+.PHONY: all anvil install build clean test
 
 all: anvil
 
@@ -24,3 +24,7 @@ build:
 clean:
 	dune clean
 	rm -f "$(WRAPPER_TARGET)"
+
+# Shell-driven so it does not need the dev deps `dune runtest` would pull in.
+test: build
+	ANVIL_SKIP_BUILD=1 bash test/run_gate.sh

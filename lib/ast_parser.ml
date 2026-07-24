@@ -36,6 +36,7 @@ let rec normalize_stmt = function
   | Free ptr -> Free ptr
   | Return _ as stmt -> stmt
   | Skip -> Skip
+  | (Break | Continue) as stmt -> stmt
   | Assign _ as stmt -> stmt
 
 let normalize_function fn = { fn with body = normalize_stmt fn.body }
@@ -289,6 +290,7 @@ let resolve_assign_target scopes name =
 let rec resolve_stmt scopes state stmt =
   match stmt with
   | Skip -> Ok (Skip, state, scopes)
+  | (Break | Continue) as stmt -> Ok (stmt, state, scopes)
   | Block stmts ->
       let* stmts, state =
         resolve_stmt_list ([] :: scopes) state stmts
@@ -1145,6 +1147,7 @@ let rec desugar_method_bexpr env current_class = function
 
 let rec desugar_method_stmt env current_class = function
   | Skip -> Skip
+  | (Break | Continue) as stmt -> stmt
   | Block stmts ->
       Block (List.map (desugar_method_stmt env current_class) stmts)
   | LocalDecl _ ->
@@ -1286,6 +1289,7 @@ let rec resolve_value_bexpr env = function
 
 let rec resolve_value_stmt env = function
   | Skip -> Skip
+  | (Break | Continue) as stmt -> stmt
   | Block stmts ->
       Block (List.map (resolve_value_stmt env) stmts)
   | LocalDecl _ ->
@@ -1360,7 +1364,7 @@ let resolve_program_values program =
 
 let rec attach_loop_invariants_stmt source_name invariants stmt =
   match stmt with
-  | Skip | LocalDecl _ | Assign _ | Store _ | ArrayAssign _ | FieldAssign _ | Assume _ | Assert _ | Free _ | Return _ ->
+  | Skip | Break | Continue | LocalDecl _ | Assign _ | Store _ | ArrayAssign _ | FieldAssign _ | Assume _ | Assert _ | Free _ | Return _ ->
       stmt, invariants
   | Block stmts ->
       let stmts, invariants =
@@ -1501,7 +1505,9 @@ let gate_evolve_block ?(source_name = "<evolve>") source =
   try
     let program = Parser.evolve_program Lexer.read lexbuf in
     let program = resolve_program_type_names program in
-    Strict_syntax.validate_program program
+    let* () = Strict_syntax.validate_program program in
+    let* () = Strict_syntax.validate_loop_control program in
+    Strict_syntax.validate_no_recursion program
   with
   | Lexer.Syntax_error msg ->
       Error (Printf.sprintf "%s in %s at %s" msg source_name (position lexbuf))

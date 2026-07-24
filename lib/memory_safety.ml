@@ -174,7 +174,7 @@ let rec count_malloc_bexpr = function
       count_malloc_bexpr left + count_malloc_bexpr right
 
 let rec count_malloc_stmt = function
-  | Skip -> 0
+  | Skip | Break | Continue -> 0
   | Block stmts ->
       List.fold_left (fun acc stmt -> acc + count_malloc_stmt stmt) 0 stmts
   | LocalDecl (_, init) ->
@@ -208,7 +208,7 @@ let rec count_malloc_stmt = function
   | Return (Some value) -> count_malloc_expr value
 
 let rec uses_memory_stmt = function
-  | Skip -> false
+  | Skip | Break | Continue -> false
   | Block stmts ->
       List.exists uses_memory_stmt stmts
   | LocalDecl (_, init) ->
@@ -548,6 +548,8 @@ let rec lower_reference_bexpr env = function
 
 let rec lower_reference_stmt env = function
   | Skip -> Ok Skip
+  | Break | Continue ->
+      fail "`break`/`continue` reached reference lowering"
   | Block _ | LocalDecl _ ->
       fail "unresolved local syntax reached reference lowering"
   | Assign (name, rhs) ->
@@ -1777,6 +1779,8 @@ and lower_equality_like env state ~negated left right =
 and lower_stmt env state stmt =
   match stmt with
   | Skip -> Ok (Skip, state)
+  | Break | Continue ->
+      fail "`break`/`continue` reached memory lowering"
   | Block _ | LocalDecl _ ->
       fail "unresolved local syntax reached memory lowering"
   | Assign (name, rhs) ->

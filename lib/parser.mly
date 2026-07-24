@@ -235,11 +235,32 @@ let zero_of_type = function
   | TBool -> BoolLit false
   | _ -> Int 0
 
+(* Locals are restricted to the three scalar types the DSL documents. Anvil has
+   no `int64_t` keyword, so an unknown type name arrives here as `TRecord` --
+   `int64_t`, `uint32_t`, or a typo alike -- and must be rejected at the gate
+   rather than in the C++ build. Parameters are parsed by `evolve_param_list`
+   and are unaffected, so `int64_t obj_id` still works. *)
+let evolve_local_type local_type name =
+  match local_type with
+  | TInt | TDouble | TBool -> local_type
+  | TRecord type_name ->
+      fail
+        "local `%s` has type `%s`, which is not a scalar type; evolve-block \
+         locals must be `int`, `double` or `bool` (`int64_t` is only for the \
+         score function's object-id parameter)"
+        name type_name
+  | other ->
+      fail
+        "local `%s` has type `%s`; evolve-block locals must be `int`, `double` \
+         or `bool`"
+        name (c_type_to_c other)
+
 (* An uninitialized scalar local is memory-safe (no pointer/heap involved),
    so the gate admits it by supplying a synthetic zero initializer. This is
    only used for the safety gate, which does not reason about reads of
    uninitialized values. *)
 let evolve_local_decl local_type name init =
+  let local_type = evolve_local_type local_type name in
   let init =
     match init with
     | Some _ -> init
@@ -255,24 +276,115 @@ let evolve_effect_stmt expr = Assign ("__anvil_discard", expr)
 
 let evolve_compound combine lhs rhs = assignment_stmt lhs (combine lhs rhs)
 
+(* Evolve-block loops must be canonical counted loops, checked here because
+   `evolve_for` desugars to `While` and the shape is unrecoverable afterwards:
+
+     for (int i = <literal>; i <  <literal>; i++)   (also <=, counting up)
+     for (int i = <literal>; i >  <literal>; i--)   (also >=, counting down)
+
+   with the body forbidden from assigning to `i`. The induction variable then
+   moves one step toward a fixed bound every iteration and nothing else can
+   move it, so the loop terminates by construction. *)
+
+(* Endpoint magnitude keeps the counter clear of the integer limits, where the
+   final `i++` wraps and makes the condition true again, and keeps both values
+   exactly representable in a `double` counter. The trip cap is a per-loop cost
+   bound: scoring runs on every eviction, and real heuristics iterate over a
+   listener window of 8-18. It does not bound a loop nest -- nested counted
+   loops multiply, and each is still individually terminating, which is what
+   the gate promises. *)
+let loop_literal_limit = 1 lsl 30
+let loop_max_trip = 4096
+
+let for_induction_var = function
+  | LocalDecl ({ global_name; _ }, Some (Int value)) -> Some (global_name, value)
+  | Assign (name, Int value) -> Some (name, value)
+  | _ -> None
+
+(* Exact iteration count for a `+/-1` counted loop with literal endpoints. *)
+let for_trip_count op ~init ~bound =
+  match op with
+  | `Lt -> if init >= bound then 0 else bound - init
+  | `Le -> if init > bound then 0 else bound - init + 1
+  | `Gt -> if init <= bound then 0 else init - bound
+  | `Ge -> if init < bound then 0 else init - bound + 1
+  (* `evolve_for` rejects equality conditions before reaching this point. *)
+  | `Eq | `Neq -> assert false
+
+let rec stmt_assigns_var name stmt =
+  match stmt with
+  | Assign (target, _) -> String.equal target name
+  | LocalDecl ({ global_name; _ }, _) -> String.equal global_name name
+  | Block stmts | Seq stmts -> List.exists (stmt_assigns_var name) stmts
+  | If (_, then_branch, else_branch) ->
+      stmt_assigns_var name then_branch || stmt_assigns_var name else_branch
+  | While (_, _, body) -> stmt_assigns_var name body
+  | Skip | Break | Continue | Store _ | ArrayAssign _ | FieldAssign _
+  | Assume _ | Assert _ | Free _ | Return _ ->
+      false
+
 let evolve_for ~init ~cond ~step body =
-  seq_of_list [ init; While (None, value_as_cond cond, seq_of_list [ body; step ]) ]
-
-(* The `for` bound must be a compile-time constant so the loop is provably
-   bounded. We accept a comparison where at least one operand is a literal
-   (optionally negated) numeric bound; the other operand is the induction
-   variable. *)
-let is_const_bound = function
-  | Int _ | FloatLit _ | DoubleLit _ | CharLit _ -> true
-  | Sub (Int 0, (Int _ | FloatLit _ | DoubleLit _ | CharLit _)) -> true
-  | _ -> false
-
-let ensure_one_const_bound left right =
-  if is_const_bound left || is_const_bound right then ()
-  else
+  let op, cond_left, cond_right = cond in
+  let name, init_value =
+    match for_induction_var init with
+    | Some pair -> pair
+    | None ->
+        fail
+          "strict for-loops require an induction variable initialised to an \
+           integer literal, e.g. `for (int i = 0; i < 8; i++)`"
+  in
+  let bound_value =
+    match cond_left, cond_right with
+    | Var v, Int bound when String.equal v name -> bound
+    | _ ->
+        fail
+          "strict for-loops require the condition to compare `%s` against an \
+           integer literal, e.g. `%s < 8`, got `%s ? %s`"
+          name name (expr_to_c cond_left) (expr_to_c cond_right)
+  in
+  List.iter
+    (fun (what, value) ->
+      if abs value > loop_literal_limit then
+        fail
+          "strict for-loop %s %d is too large: both endpoints must satisfy \
+           |value| <= %d so the counter cannot overflow or lose precision"
+          what value loop_literal_limit)
+    [ ("initialiser", init_value); ("bound", bound_value) ];
+  let expected_step, shown_step =
+    match op with
+    | `Lt | `Le -> Add (Var name, Int 1), name ^ "++"
+    | `Gt | `Ge -> Sub (Var name, Int 1), name ^ "--"
+    | `Eq | `Neq ->
+        fail
+          "strict for-loops require a `<`, `<=`, `>` or `>=` condition on `%s`; \
+           an equality test gives no termination argument"
+          name
+  in
+  (match step, expected_step with
+  | Assign (target, Add (Var v, Int 1)), Add (Var _, Int 1)
+    when String.equal target name && String.equal v name ->
+      ()
+  | Assign (target, Sub (Var v, Int 1)), Sub (Var _, Int 1)
+    when String.equal target name && String.equal v name ->
+      ()
+  | _ ->
+      fail
+        "strict for-loops require the step `%s` so it matches the condition \
+         direction and provably approaches the bound"
+        shown_step);
+  if stmt_assigns_var name body then
     fail
-      "strict for-loops require a compile-time constant bound, got `%s ? %s`"
-      (expr_to_c left) (expr_to_c right)
+      "strict for-loops forbid assigning to the induction variable `%s` inside \
+       the loop body; that breaks the termination argument"
+      name;
+  let trips = for_trip_count op ~init:init_value ~bound:bound_value in
+  if trips > loop_max_trip then
+    fail
+      "strict for-loop runs %d iterations, over the limit of %d; the scoring \
+       function is called on every eviction, so keep loops short"
+      trips loop_max_trip;
+  let cond = val_cmp op cond_left cond_right in
+  seq_of_list [ init; While (None, value_as_cond cond, seq_of_list [ body; step ]) ]
 
 type evolve_item =
   | Evolve_effect of stmt
@@ -344,7 +456,7 @@ let build_program items =
 %token <int> CHAR_LIT
 %token <string> IDENT
 %token INT_KW FLOAT_KW DOUBLE_KW CHAR_KW BOOL_KW CONST_KW MAIN_KW VOID_KW STRUCT_KW CLASS_KW NAMESPACE_KW IF_KW ELSE_KW WHILE_KW RETURN_KW FREE_KW TRUE_KW FALSE_KW FORALL_KW
-%token AUTO_KW STATIC_CAST_KW FOR_KW
+%token AUTO_KW STATIC_CAST_KW FOR_KW BREAK_KW CONTINUE_KW
 %token <string> STDFUNCTION_TYPE
 %token LPAREN RPAREN LBRACE RBRACE LBRACKET RBRACKET SEMI COMMA AMP DOT ARROW SCOPE
 %token QUESTION COLON INCR DECR STAREQ SLASHEQ
@@ -1158,32 +1270,36 @@ evolve_stmt:
       { Return (Some value) }
   | RETURN_KW SEMI
       { Return None }
+  | BREAK_KW SEMI
+      { Break }
+  | CONTINUE_KW SEMI
+      { Continue }
   | IF_KW LPAREN cond = val_expr RPAREN then_branch = evolve_stmt ELSE_KW else_branch = evolve_stmt
       { If (value_as_cond cond, then_branch, else_branch) }
   | IF_KW LPAREN cond = val_expr RPAREN then_branch = evolve_stmt
       { If (value_as_cond cond, then_branch, Skip) }
-  | WHILE_KW LPAREN cond = val_expr RPAREN body = evolve_stmt
-      { While (None, value_as_cond cond, body) }
+  (* No `while` production here on purpose: an evolve-block loop must carry a
+     syntactic termination argument, and only the counted `for` below does.
+     The core language keeps its own `while` (see `stmt`). *)
   | FOR_KW LPAREN init = evolve_for_init SEMI cond = val_for_cond SEMI step = evolve_for_step RPAREN body = evolve_stmt
       { evolve_for ~init ~cond ~step body }
   | expr = val_expr SEMI
       { evolve_effect_stmt expr }
 
-(* A for-loop condition must compare the induction variable against a
-   compile-time constant so the loop is provably bounded. We require one side
-   of the comparison to be a literal; the other is the (data-dependent)
-   counter. Any non-comparison or non-constant-bounded condition is rejected. *)
+(* Yields the operator tag alongside its operands; `evolve_for` checks that the
+   condition compares the induction variable against a literal and that the
+   step moves it toward that bound. *)
 val_for_cond:
   | left = val_add_expr op = val_cmp_op right = val_add_expr
-      { let _ = ensure_one_const_bound left right in op left right }
+      { (op, left, right) }
 
 %inline val_cmp_op:
-  | EQEQ { fun l r -> val_cmp `Eq l r }
-  | NEQ  { fun l r -> val_cmp `Neq l r }
-  | LT   { fun l r -> val_cmp `Lt l r }
-  | LE   { fun l r -> val_cmp `Le l r }
-  | GT   { fun l r -> val_cmp `Gt l r }
-  | GE   { fun l r -> val_cmp `Ge l r }
+  | EQEQ { `Eq }
+  | NEQ  { `Neq }
+  | LT   { `Lt }
+  | LE   { `Le }
+  | GT   { `Gt }
+  | GE   { `Ge }
 
 evolve_for_init:
   | base = evolve_value_type name = IDENT ASSIGN init = val_expr

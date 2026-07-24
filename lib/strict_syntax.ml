@@ -137,7 +137,7 @@ and validate_bexpr fn_name bexpr =
 
 and validate_stmt fn_name stmt =
   match stmt with
-  | Skip -> Ok ()
+  | Skip | Break | Continue -> Ok ()
   | Block stmts
   | Seq stmts ->
       validate_list (validate_stmt fn_name) stmts
@@ -221,6 +221,116 @@ let validate_import (imported : imported_function) =
 
 let validate_header_import (header : header_import) =
   validate_list validate_import header.functions
+
+(* With loops restricted to counted `for`s, an acyclic call graph is what is
+   left to rule out non-termination. Only functions defined in the program can
+   form a cycle, so unresolved callees (externs, `__anvil_*` intrinsics) are
+   skipped. *)
+
+let rec calls_in_expr acc expr =
+  match expr with
+  | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ | Var _ -> acc
+  | AddrOf inner | Deref inner | Field (inner, _) -> calls_in_expr acc inner
+  | Index (left, right)
+  | Add (left, right)
+  | Sub (left, right)
+  | Mul (left, right)
+  | Div (left, right)
+  | Mod (left, right) ->
+      calls_in_expr (calls_in_expr acc left) right
+  | FuncCall (name, args) -> List.fold_left calls_in_expr (name :: acc) args
+
+and calls_in_bexpr acc bexpr =
+  match bexpr with
+  | True | False -> acc
+  | Forall (_, body) | Not body -> calls_in_bexpr acc body
+  | Eq (left, right)
+  | Neq (left, right)
+  | Lt (left, right)
+  | Le (left, right)
+  | Gt (left, right)
+  | Ge (left, right) ->
+      calls_in_expr (calls_in_expr acc left) right
+  | And (left, right) | Or (left, right) ->
+      calls_in_bexpr (calls_in_bexpr acc left) right
+
+and calls_in_stmt acc stmt =
+  match stmt with
+  | Skip | Break | Continue -> acc
+  | Block stmts | Seq stmts -> List.fold_left calls_in_stmt acc stmts
+  | LocalDecl (_, None) | Return None -> acc
+  | LocalDecl (_, Some expr) | Assign (_, expr) | Free expr | Return (Some expr)
+    ->
+      calls_in_expr acc expr
+  | Store (left, right) | FieldAssign (left, _, right) ->
+      calls_in_expr (calls_in_expr acc left) right
+  | ArrayAssign (base, index, value) ->
+      calls_in_expr (calls_in_expr (calls_in_expr acc base) index) value
+  | If (cond, then_branch, else_branch) ->
+      calls_in_stmt (calls_in_stmt (calls_in_bexpr acc cond) then_branch)
+        else_branch
+  | While (invariant, cond, body) ->
+      let acc =
+        match invariant with
+        | None -> acc
+        | Some invariant -> calls_in_bexpr acc invariant
+      in
+      calls_in_stmt (calls_in_bexpr acc cond) body
+  | Assume cond | Assert (_, cond) -> calls_in_bexpr acc cond
+
+(* `break`/`continue` outside a loop is not valid C++, and the evolve grammar
+   admits them in any statement position, so the loop context is checked here
+   instead. Inside a counted `for` both are inert for termination: `break`
+   only exits sooner, and `continue` still runs the step. *)
+let validate_loop_control (program : program) =
+  let rec walk ~in_loop stmt =
+    match stmt with
+    | Break -> if in_loop then Ok () else errorf "`break` outside a loop"
+    | Continue -> if in_loop then Ok () else errorf "`continue` outside a loop"
+    | Block stmts | Seq stmts -> validate_list (walk ~in_loop) stmts
+    | If (_, then_branch, else_branch) ->
+        let* () = walk ~in_loop then_branch in
+        walk ~in_loop else_branch
+    | While (_, _, body) -> walk ~in_loop:true body
+    | Skip | LocalDecl _ | Assign _ | Store _ | ArrayAssign _ | FieldAssign _
+    | Assume _ | Assert _ | Free _ | Return _ ->
+        Ok ()
+  in
+  validate_list
+    (fun fn -> walk ~in_loop:false fn.body)
+    (program.main :: program.functions)
+
+let validate_no_recursion (program : program) =
+  let defined = program.main :: program.functions in
+  let callees_of fn =
+    let names = calls_in_stmt [] fn.body in
+    List.filter
+      (fun name -> List.exists (fun f -> String.equal f.name name) defined)
+      names
+  in
+  let body_of name =
+    List.find_opt (fun f -> String.equal f.name name) defined
+  in
+  (* Depth-first search for a back edge. `visiting` is the current call chain;
+     `acyclic` memoises names already proven to reach no cycle. Without the
+     memo a branching call graph is re-walked once per path, so a candidate
+     with a few dozen fanning-out helpers takes exponential time to gate. *)
+  let acyclic = ref [] in
+  let rec walk visiting name =
+    if List.exists (String.equal name) visiting then
+      errorf "evolve blocks forbid recursion: `%s` is reachable from itself (%s)"
+        name
+        (String.concat " -> " (List.rev (name :: visiting)))
+    else if List.exists (String.equal name) !acyclic then Ok ()
+    else
+      match body_of name with
+      | None -> Ok ()
+      | Some fn ->
+          let* () = validate_list (walk (name :: visiting)) (callees_of fn) in
+          acyclic := name :: !acyclic;
+          Ok ()
+  in
+  validate_list (fun fn -> walk [] fn.name) defined
 
 let validate_program (program : program) =
   let* () = validate_list validate_header_import program.imports in

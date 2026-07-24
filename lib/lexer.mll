@@ -54,6 +54,8 @@ rule read = parse
   | "if"                { IF_KW }
   | "else"              { ELSE_KW }
   | "while"             { WHILE_KW }
+  | "break"             { BREAK_KW }
+  | "continue"          { CONTINUE_KW }
   | "return"            { RETURN_KW }
   | "free"              { FREE_KW }
   | "std::function"     { stdfunction_angle (Buffer.create 32) 0 lexbuf }
