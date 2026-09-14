@@ -93,6 +93,26 @@ let gen_program size =
               };
           }))
 
+let user_imports (program : program) =
+  List.filter program.imports ~f:(fun (header : header_import) ->
+      not (String.is_empty header.include_path))
+
+let rec find_repo_root dir =
+  let marker = Stdlib.Filename.concat dir "dune-project" in
+  if Stdlib.Sys.file_exists marker then
+    dir
+  else
+    let parent = Stdlib.Filename.dirname dir in
+    if String.equal parent dir then
+      failwith "Could not locate repo root for tests"
+    else
+      find_repo_root parent
+
+let repo_root = lazy (find_repo_root (Stdlib.Sys.getcwd ()))
+
+let repo_path relative =
+  Stdlib.Filename.concat (Lazy.force repo_root) relative
+
 let assert_header_import_roundtrip () =
   let header_path = Stdlib.Filename.temp_file "anvil_contracts" ".h" in
   Fun.protect
@@ -122,7 +142,7 @@ let assert_header_import_roundtrip () =
       match parse_program ~base_dir source with
       | Error e -> failwith ("Header import parse failed: " ^ e)
       | Ok p ->
-          if List.length p.imports <> 1 then
+          if List.length (user_imports p) <> 1 then
             failwith "Expected exactly one imported header";
           match parse_program ~base_dir (program_to_c p) with
           | Error e -> failwith ("Header roundtrip parse failed: " ^ e)
@@ -352,7 +372,7 @@ let assert_named_header_contract_import_handles_partial_contracts () =
       match parse_program ~base_dir source with
       | Error e -> failwith ("Named-header parse failed: " ^ e)
       | Ok program ->
-          (match program.imports with
+          (match user_imports program with
           | [ (imported : header_import) ] ->
               let imported_names =
                 imported.functions
@@ -1460,9 +1480,10 @@ let assert_method_overloading_roundtrip_and_verification () =
             ^ Verify.format_outcome outcome))
 
 let assert_example_file_verifies file_name =
-  let path = "test/e2e_cases/" ^ file_name in
+  let path = repo_path ("test/e2e_cases/" ^ file_name) in
   let source = In_channel.read_all path in
-  match parse_program ~base_dir:"test/e2e_cases" ~source_name:path source with
+  let base_dir = repo_path "test/e2e_cases" in
+  match parse_program ~base_dir ~source_name:path source with
   | Error e -> failwith ("Example parse failed for " ^ file_name ^ ": " ^ e)
   | Ok program ->
       (match Verify.verify_program program with
@@ -1476,9 +1497,10 @@ let assert_example_file_verifies file_name =
             ^ Verify.format_outcome outcome))
 
 let assert_example_file_reports_counterexample file_name =
-  let path = "test/e2e_cases/" ^ file_name in
+  let path = repo_path ("test/e2e_cases/" ^ file_name) in
   let source = In_channel.read_all path in
-  match parse_program ~base_dir:"test/e2e_cases" ~source_name:path source with
+  let base_dir = repo_path "test/e2e_cases" in
+  match parse_program ~base_dir ~source_name:path source with
   | Error e -> failwith ("Example parse failed for " ^ file_name ^ ": " ^ e)
   | Ok program ->
       (match Verify.verify_program program with
@@ -1964,9 +1986,10 @@ let assert_header_theorem_on_local_definition_is_checked () =
                 ^ Verify.format_outcome outcome)))
 
 let assert_comparator_total_order_example_verifies () =
-  let path = "examples/comparator_total_order.c" in
+  let path = repo_path "examples/comparator_total_order.c" in
   let source = In_channel.read_all path in
-  match parse_program ~base_dir:"examples" ~source_name:path source with
+  let base_dir = repo_path "examples" in
+  match parse_program ~base_dir ~source_name:path source with
   | Error e -> failwith ("Comparator example parse failed: " ^ e)
   | Ok program ->
       (match Verify.verify_program program with
@@ -1976,6 +1999,401 @@ let assert_comparator_total_order_example_verifies () =
           failwith
             ("Expected comparator example to verify, got:\n"
             ^ Verify.format_outcome outcome))
+
+let assert_scoring_fn_sugar_roundtrip () =
+  let source =
+    "SCORING_FN(const vulcan::feature_store& fs, int64_t obj_id) {\n"
+    ^ "  if (obj_id < 0) return 0.0;\n"
+    ^ "  return fs.get_latest(1, obj_id);\n"
+    ^ "};\n\n"
+    ^ "int main(void) {\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("SCORING_FN parse failed: " ^ e)
+  | Ok program ->
+      (match program.functions with
+      | [ fn ] when String.equal fn.name "scoring_fn" -> ()
+      | _ -> failwith "Expected SCORING_FN sugar to lower to `scoring_fn`");
+      let pretty = program_to_c program in
+      if String.is_substring pretty ~substring:"SCORING_FN" then
+        failwith "Expected SCORING_FN sugar to be lowered away in the pretty-printer";
+      (match parse_program pretty with
+      | Error e -> failwith ("SCORING_FN roundtrip failed: " ^ e)
+      | Ok roundtripped ->
+          if not (equal_program program roundtripped) then
+            failwith "SCORING_FN roundtrip mismatch")
+
+let assert_single_statement_if_roundtrip_and_verification () =
+  let source =
+    "/* @Contract clamp_nonneg\n"
+    ^ " * @Guarantee result >= 0\n"
+    ^ " */\n"
+    ^ "int clamp_nonneg(int x) {\n"
+    ^ "  if (x < 0) return 0;\n"
+    ^ "  return x;\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Single-statement if parse failed: " ^ e)
+  | Ok program ->
+      (match parse_program (program_to_c program) with
+      | Error e -> failwith ("Single-statement if roundtrip failed: " ^ e)
+      | Ok roundtripped ->
+          if not (equal_program program roundtripped) then
+            failwith "Single-statement if roundtrip mismatch");
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Single-statement if verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected single-statement if example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_cast_and_sizeof_lowering_roundtrip () =
+  let source =
+    "int main(void) {\n"
+    ^ "  float* values = (float*) malloc(10 * sizeof(float));\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Cast/sizeof parse failed: " ^ e)
+  | Ok program ->
+      let pretty = program_to_c program in
+      if String.is_substring pretty ~substring:"sizeof" then
+        failwith "Expected sizeof sugar to be lowered away in the pretty-printer";
+      if String.is_substring pretty ~substring:"(float*)" then
+        failwith "Expected C-style cast sugar to be lowered away in the pretty-printer";
+      if not (String.is_substring pretty ~substring:"malloc(10 * 4)") then
+        failwith ("Expected sizeof(float) to lower to 4, got:\n" ^ pretty);
+      (match parse_program pretty with
+      | Error e -> failwith ("Cast/sizeof roundtrip failed: " ^ e)
+      | Ok roundtripped ->
+          if not (equal_program program roundtripped) then
+            failwith "Cast/sizeof roundtrip mismatch")
+
+let assert_ternary_contracted_calls_verify () =
+  let source =
+    "#include <stdbool.h>\n\n"
+    ^ "/* @Contract inc\n"
+    ^ " * @Guarantee result > x\n"
+    ^ " */\n"
+    ^ "int inc(int x) {\n"
+    ^ "  return (x + 1);\n"
+    ^ "}\n\n"
+    ^ "/* @Contract choose\n"
+    ^ " * @Guarantee result > x\n"
+    ^ " */\n"
+    ^ "int choose(bool take_first, int x) {\n"
+    ^ "  return ((take_first != 0) ? inc(x) : inc(x + 1));\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Ternary contracted-call parse failed: " ^ e)
+  | Ok program ->
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Ternary contracted-call verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected ternary contracted-call example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_nested_pointer_contract_calls_verify () =
+  let source =
+    "/* @Contract observe\n"
+    ^ " * @Guarantee result >= 0\n"
+    ^ " */\n"
+    ^ "int observe(int* p) {\n"
+    ^ "  return 1;\n"
+    ^ "}\n\n"
+    ^ "/* @Contract lift\n"
+    ^ " * @Require x >= 0\n"
+    ^ " * @Guarantee result > 0\n"
+    ^ " */\n"
+    ^ "int lift(int x) {\n"
+    ^ "  return (x + 1);\n"
+    ^ "}\n\n"
+    ^ "int use(int* p) {\n"
+    ^ "  return lift(observe(p));\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  int x = 0;\n"
+    ^ "  int* p = &x;\n"
+    ^ "  return use(p);\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Nested pointer contract-call parse failed: " ^ e)
+  | Ok program ->
+      (match Verify.verify_program program with
+      | Error e ->
+          failwith ("Nested pointer contract-call verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected nested pointer contract-call example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_vulcan_listener_stub_header_verifies () =
+  let base_dir = Lazy.force repo_root in
+  let source =
+    "#include \"stubs/vulcan_listeners.hpp\"\n\n"
+    ^ "int main(void) {\n"
+    ^ "  double value;\n"
+    ^ "  value = std::sqrt(vulcan__ns__feature_store__get_ewma(0, 1, 0, 0.5));\n"
+    ^ "  if (!(value >= 0)) { abort(); }\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program ~base_dir source with
+  | Error e -> failwith ("Vulcan stub-header parse failed: " ^ e)
+  | Ok program ->
+      (match user_imports program with
+      | [ (header : header_import) ] ->
+          if not (String.equal header.include_path "stubs/vulcan_listeners.hpp") then
+            failwith "Expected the imported Vulcan stub header to be preserved"
+      | _ ->
+          failwith "Expected exactly one user-imported Vulcan stub header");
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Vulcan stub-header verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected Vulcan stub-header example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_overloaded_vulcan_method_call_verifies () =
+  let source =
+    "/* @Contract score\n"
+    ^ " * @Require feature >= 0 && obj_id >= 0\n"
+    ^ " * @Guarantee result >= 0\n"
+    ^ " */\n"
+    ^ "double score(const vulcan::feature_store& fs, int feature, int obj_id) {\n"
+    ^ "  return fs.get_ewma(feature, obj_id, 0.5);\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Overloaded Vulcan method parse failed: " ^ e)
+  | Ok program ->
+      (match Verify.verify_program program with
+      | Error e ->
+          failwith ("Overloaded Vulcan method verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected overloaded Vulcan method example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_vulcan_add_listeners_six_arity_roundtrip () =
+  let source =
+    "void attach(vulcan::rank_config& config) {\n"
+    ^ "  config.add_listeners(0, {1, 2, 3, 4, 5, 6});\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Six-listener Vulcan parse failed: " ^ e)
+  | Ok program ->
+      let pretty =
+        match Instrument.instrument_program program with
+        | Ok instrumented -> program_to_c instrumented
+        | Error e -> failwith ("Six-listener Vulcan instrumentation failed: " ^ e)
+      in
+      if
+        not
+          (String.is_substring
+             pretty
+             ~substring:
+               "vulcan__ns__rank_config__add_listeners__ol__int__int__int__int__int__int__int(config, 0, 1, 2, 3, 4, 5, 6)")
+      then
+        failwith
+          "Expected six-listener add_listeners call to resolve to the arity-7 overload";
+      ()
+
+let assert_brace_list_call_lowering () =
+  let source = "foo({1, 2});\n" in
+  match parse_program source with
+  | Error e -> failwith ("Brace-list parse failed: " ^ e)
+  | Ok program ->
+      (match program.main.body with
+      | Seq [ ExprStmt (FuncCall ("foo", [ Int 1; Int 2 ])); Return (Some (Int 0)) ] ->
+          ()
+      | _ ->
+          failwith ("Unexpected brace-list lowering:\n" ^ program_to_c program));
+      let pretty = program_to_c program in
+      if String.is_substring pretty ~substring:"{1, 2}" then
+        failwith "Brace-list sugar should be lowered away in the pretty-printer";
+      (match parse_program pretty with
+      | Error e -> failwith ("Brace-list roundtrip failed: " ^ e)
+      | Ok roundtripped ->
+          if not (equal_program program roundtripped) then
+            failwith "Brace-list roundtrip mismatch")
+
+let assert_preprocess_defines_roundtrip () =
+  let source =
+    "#define LIMIT 8\n"
+    ^ "int main(void) {\n"
+    ^ "  int x = LIMIT;\n"
+    ^ "  return x;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("#define parse failed: " ^ e)
+  | Ok program ->
+      (match program.main.locals with
+      | [ local ] ->
+          if
+            not
+              (String.is_substring local.global_name ~substring:"x"
+              && Poly.equal local.global_type TInt)
+          then
+            failwith "Expected a lowered local `x` after preprocessing"
+      | _ -> failwith "Expected a lowered local `x` after preprocessing");
+      let pretty = program_to_c program in
+      if String.is_substring pretty ~substring:"LIMIT" then
+        failwith "Expected preprocessing to eliminate macro names from the pretty-printer";
+      (match parse_program pretty with
+      | Error e -> failwith ("#define roundtrip failed: " ^ e)
+      | Ok roundtripped ->
+          if not (equal_program program roundtripped) then
+            failwith "#define roundtrip mismatch")
+
+let assert_top_level_lambda_binding_roundtrip_and_verification () =
+  let source =
+    "auto inc = [](int x) -> int {\n"
+    ^ "  return (x + 1);\n"
+    ^ "};\n\n"
+    ^ "int main(void) {\n"
+    ^ "  return inc(0);\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Top-level lambda parse failed: " ^ e)
+  | Ok program ->
+      (match program.functions with
+      | [ fn ] when String.equal fn.name "inc" -> ()
+      | _ -> failwith "Expected top-level lambda binding to lower to a function `inc`");
+      (match parse_program (program_to_c program) with
+      | Error e -> failwith ("Top-level lambda roundtrip failed: " ^ e)
+      | Ok roundtripped ->
+          if not (equal_program program roundtripped) then
+            failwith "Top-level lambda roundtrip mismatch");
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Top-level lambda verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected top-level lambda example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_ternary_roundtrip_and_verification () =
+  let source =
+    "/* @Contract choose\n"
+    ^ " * @Guarantee result >= 0\n"
+    ^ " */\n"
+    ^ "int choose(int x) {\n"
+    ^ "  return ((x < 0) ? 0 : x);\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("Ternary parse failed: " ^ e)
+  | Ok program ->
+      (match parse_program (program_to_c program) with
+      | Error e -> failwith ("Ternary roundtrip failed: " ^ e)
+      | Ok roundtripped ->
+          if not (equal_program program roundtripped) then
+            failwith "Ternary roundtrip mismatch");
+      (match Verify.verify_program program with
+      | Error e -> failwith ("Ternary verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith
+            ("Expected ternary example to verify, got:\n"
+            ^ Verify.format_outcome outcome))
+
+let assert_for_loop_lowering_roundtrip () =
+  let source =
+    "int main(void) {\n"
+    ^ "  int i = 0;\n"
+    ^ "  for (i = 0; i < 3; i++) {\n"
+    ^ "  }\n"
+    ^ "  return i;\n"
+    ^ "}\n"
+  in
+  match parse_program source with
+  | Error e -> failwith ("For-loop parse failed: " ^ e)
+  | Ok program ->
+      let pretty = program_to_c program in
+      if String.is_substring pretty ~substring:"for (" then
+        failwith "Expected `for` loops to lower to the core `while` form";
+      if not (String.is_substring pretty ~substring:"while (") then
+        failwith "Expected lowered `while` loop in pretty-printer output";
+      (match parse_program pretty with
+      | Error e -> failwith ("For-loop roundtrip failed: " ^ e)
+      | Ok roundtripped ->
+          if not (equal_program program roundtripped) then
+            failwith "For-loop roundtrip mismatch")
+
+let assert_strict_mode_accepts_record_field_access () =
+  let source =
+    "struct Pair {\n"
+    ^ "  int left;\n"
+    ^ "  int right;\n"
+    ^ "};\n\n"
+    ^ "int project(struct Pair pair) {\n"
+    ^ "  return (pair.left + pair.right);\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program ~strict:true source with
+  | Error e -> failwith ("Strict-mode record-field parse failed: " ^ e)
+  | Ok _ ->
+      ()
+
+let assert_strict_mode_rejects_method_sugar () =
+  let source =
+    "class Counter {\n"
+    ^ "  int value;\n"
+    ^ "  int get() {\n"
+    ^ "    return value;\n"
+    ^ "  }\n"
+    ^ "};\n\n"
+    ^ "int use(Counter counter) {\n"
+    ^ "  return counter.get();\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  return 0;\n"
+    ^ "}\n"
+  in
+  match parse_program ~strict:true source with
+  | Ok _ ->
+      failwith "Expected strict mode to reject method sugar that lowers to receiver pointers"
+  | Error e ->
+      if
+        not
+          (String.is_substring e ~substring:"forbids pointer type"
+          && String.is_substring e ~substring:"parameter `this` of `Counter__get`")
+      then
+        failwith ("Unexpected strict-mode method-sugar error: " ^ e)
 
 let assert_strict_mode_accepts_initialized_scalar_program () =
   let source =
@@ -2036,15 +2454,16 @@ let assert_strict_mode_rejects_memory_syntax () =
     "#include <stdlib.h>\n"
     ^ "#include <stdio.h>\n\n"
     ^ "int main(void) {\n"
-    ^ "  int values[2];\n"
+    ^ "  int x = 0;\n"
+    ^ "  int* ptr = &x;\n"
     ^ "  return 0;\n"
     ^ "}\n"
   in
   match parse_program ~strict:true source with
   | Ok _ ->
-      failwith "Expected strict mode to reject array syntax"
+      failwith "Expected strict mode to reject pointer syntax"
   | Error e ->
-      if not (String.is_substring e ~substring:"forbids array type `int[2]`") then
+      if not (String.is_substring e ~substring:"forbids pointer type `int*`") then
         failwith ("Unexpected strict-mode memory error: " ^ e)
 
 let () =
@@ -2094,6 +2513,21 @@ let () =
   assert_imported_theorem_is_reused_modularly ();
   assert_header_theorem_on_local_definition_is_checked ();
   assert_comparator_total_order_example_verifies ();
+  assert_scoring_fn_sugar_roundtrip ();
+  assert_single_statement_if_roundtrip_and_verification ();
+  assert_cast_and_sizeof_lowering_roundtrip ();
+  assert_ternary_contracted_calls_verify ();
+  assert_nested_pointer_contract_calls_verify ();
+  assert_vulcan_listener_stub_header_verifies ();
+  assert_overloaded_vulcan_method_call_verifies ();
+  assert_vulcan_add_listeners_six_arity_roundtrip ();
+  assert_brace_list_call_lowering ();
+  assert_preprocess_defines_roundtrip ();
+  assert_top_level_lambda_binding_roundtrip_and_verification ();
+  assert_ternary_roundtrip_and_verification ();
+  assert_for_loop_lowering_roundtrip ();
+  assert_strict_mode_accepts_record_field_access ();
+  assert_strict_mode_rejects_method_sugar ();
   assert_strict_mode_accepts_initialized_scalar_program ();
   assert_strict_mode_rejects_uninitialized_local ();
   assert_strict_mode_rejects_globals ();
@@ -2107,10 +2541,11 @@ let () =
       match parse_program code with
       | Error e -> failwith ("Parse failed: " ^ e ^ "\nGenerated code:\n" ^ code)
       | Ok p2 ->
-          if not (equal_program p p2) then
+          let reparsed = program_to_c p2 in
+          if not (String.equal code reparsed) then
             failwith
               ("Roundtrip mismatch:\ninput="
               ^ code
               ^ "\nparsed:\n"
-              ^ program_to_c p2)
+              ^ reparsed)
     )

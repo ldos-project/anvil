@@ -12,9 +12,10 @@ type int_expr =
   | Mul of int_expr list
   | Div of int_expr * int_expr
   | Mod of int_expr * int_expr
+  | Ite of formula * int_expr * int_expr
   | App of string * int_expr list
 
-type formula =
+and formula =
   | True
   | False
   | Not of formula
@@ -71,11 +72,17 @@ let rec int_expr_to_smt = function
       parens "div" [int_expr_to_smt left; int_expr_to_smt right]
   | Mod (left, right) ->
       parens "mod" [int_expr_to_smt left; int_expr_to_smt right]
+  | Ite (cond, then_branch, else_branch) ->
+      parens "ite"
+        [ formula_to_smt cond
+        ; int_expr_to_smt then_branch
+        ; int_expr_to_smt else_branch
+        ]
   | App (name, []) -> name
   | App (name, args) ->
       parens name (List.map int_expr_to_smt args)
 
-let rec formula_to_smt = function
+and formula_to_smt = function
   | True -> "true"
   | False -> "false"
   | Not inner -> parens "not" [formula_to_smt inner]
@@ -178,6 +185,12 @@ let mk_forall bindings body =
   | [] -> body
   | _ -> Forall (bindings, body)
 
+let add_bound_names set bindings =
+  List.fold_left
+    (fun acc (name, _sort) -> String_set.add name acc)
+    set
+    bindings
+
 let rec subst_int_expr var replacement = function
   | Int_lit _ as expr -> expr
   | Real_lit _ as expr -> expr
@@ -194,22 +207,25 @@ let rec subst_int_expr var replacement = function
   | Mod (left, right) ->
       Mod
         (subst_int_expr var replacement left, subst_int_expr var replacement right)
+  | Ite (cond, then_branch, else_branch) ->
+      Ite
+        ( subst_formula var replacement cond
+        , subst_int_expr var replacement then_branch
+        , subst_int_expr var replacement else_branch )
   | App (name, args) ->
       App (name, List.map (subst_int_expr var replacement) args)
 
-let add_bound_names set bindings =
-  List.fold_left
-    (fun acc (name, _sort) -> String_set.add name acc)
-    set
-    bindings
-
-let rec all_var_names_in_int_expr acc = function
+and all_var_names_in_int_expr acc = function
   | Int_lit _ | Real_lit _ -> acc
   | Var name -> String_set.add name acc
   | Add exprs | Mul exprs ->
       List.fold_left all_var_names_in_int_expr acc exprs
   | Sub (left, right) | Div (left, right) | Mod (left, right) ->
       all_var_names_in_int_expr (all_var_names_in_int_expr acc left) right
+  | Ite (cond, then_branch, else_branch) ->
+      all_var_names_in_int_expr
+        (all_var_names_in_int_expr (all_var_names_in_formula acc cond) then_branch)
+        else_branch
   | App (_, args) ->
       List.fold_left all_var_names_in_int_expr acc args
 
@@ -298,10 +314,14 @@ let rec vars_in_int_expr acc = function
       List.fold_left vars_in_int_expr acc exprs
   | Sub (left, right) | Div (left, right) | Mod (left, right) ->
       vars_in_int_expr (vars_in_int_expr acc left) right
+  | Ite (cond, then_branch, else_branch) ->
+      vars_in_int_expr
+        (vars_in_int_expr (vars_in_formula acc cond) then_branch)
+        else_branch
   | App (_, args) ->
       List.fold_left vars_in_int_expr acc args
 
-let rec vars_in_formula acc = function
+and vars_in_formula acc = function
   | True | False -> acc
   | Not inner -> vars_in_formula acc inner
   | And formulas | Or formulas ->
@@ -334,13 +354,17 @@ let rec apps_in_int_expr acc = function
       List.fold_left apps_in_int_expr acc exprs
   | Sub (left, right) | Div (left, right) | Mod (left, right) ->
       apps_in_int_expr (apps_in_int_expr acc left) right
+  | Ite (cond, then_branch, else_branch) ->
+      apps_in_int_expr
+        (apps_in_int_expr (apps_in_formula acc cond) then_branch)
+        else_branch
   | App (name, args) as expr ->
       let acc =
         List.fold_left apps_in_int_expr acc args
       in
       String_map.add (int_expr_to_smt expr) (name, expr) acc
 
-let rec apps_in_formula acc = function
+and apps_in_formula acc = function
   | True | False -> acc
   | Not inner -> apps_in_formula acc inner
   | And formulas | Or formulas ->
@@ -369,8 +393,32 @@ let rec int_expr_mentions_bound_var bound = function
       List.exists (int_expr_mentions_bound_var bound) exprs
   | Sub (left, right) | Div (left, right) | Mod (left, right) ->
       int_expr_mentions_bound_var bound left || int_expr_mentions_bound_var bound right
+  | Ite (cond, then_branch, else_branch) ->
+      formula_mentions_bound_var bound cond
+      || int_expr_mentions_bound_var bound then_branch
+      || int_expr_mentions_bound_var bound else_branch
   | App (_, args) ->
       List.exists (int_expr_mentions_bound_var bound) args
+
+and formula_mentions_bound_var bound = function
+  | True | False -> false
+  | Not inner -> formula_mentions_bound_var bound inner
+  | And formulas | Or formulas ->
+      List.exists (formula_mentions_bound_var bound) formulas
+  | Implies (left, right) ->
+      formula_mentions_bound_var bound left || formula_mentions_bound_var bound right
+  | Forall (bindings, body) ->
+      if List.exists (fun (name, _sort) -> String_set.mem name bound) bindings then false
+      else
+        let bound = add_bound_names bound bindings in
+        formula_mentions_bound_var bound body
+  | Eq (left, right)
+  | Neq (left, right)
+  | Lt (left, right)
+  | Le (left, right)
+  | Gt (left, right)
+  | Ge (left, right) ->
+      int_expr_mentions_bound_var bound left || int_expr_mentions_bound_var bound right
 
 let rec queryable_apps_in_int_expr bound acc = function
   | Int_lit _ | Real_lit _ | Var _ -> acc
@@ -380,6 +428,13 @@ let rec queryable_apps_in_int_expr bound acc = function
       queryable_apps_in_int_expr bound
         (queryable_apps_in_int_expr bound acc left)
         right
+  | Ite (cond, then_branch, else_branch) ->
+      queryable_apps_in_int_expr bound
+        (queryable_apps_in_int_expr
+           bound
+           (queryable_apps_in_formula bound acc cond)
+           then_branch)
+        else_branch
   | App (name, args) as expr ->
       let acc =
         List.fold_left (queryable_apps_in_int_expr bound) acc args
@@ -387,7 +442,7 @@ let rec queryable_apps_in_int_expr bound acc = function
       if int_expr_mentions_bound_var bound expr then acc
       else String_map.add (int_expr_to_smt expr) (name, expr) acc
 
-let rec queryable_apps_in_formula bound acc = function
+and queryable_apps_in_formula bound acc = function
   | True | False -> acc
   | Not inner -> queryable_apps_in_formula bound acc inner
   | And formulas | Or formulas ->
@@ -461,10 +516,18 @@ let rec int_expr_to_pretty = function
       "(" ^ int_expr_to_pretty left ^ " / " ^ int_expr_to_pretty right ^ ")"
   | Mod (left, right) ->
       "(" ^ int_expr_to_pretty left ^ " % " ^ int_expr_to_pretty right ^ ")"
+  | Ite (cond, then_branch, else_branch) ->
+      "("
+      ^ formula_to_pretty cond
+      ^ " ? "
+      ^ int_expr_to_pretty then_branch
+      ^ " : "
+      ^ int_expr_to_pretty else_branch
+      ^ ")"
   | App (name, args) ->
       name ^ "(" ^ String.concat ", " (List.map int_expr_to_pretty args) ^ ")"
 
-let rec formula_to_pretty = function
+and formula_to_pretty = function
   | True -> "true"
   | False -> "false"
   | Not inner -> "!(" ^ formula_to_pretty inner ^ ")"

@@ -61,6 +61,11 @@ let rec substitute_expr bindings = function
   | Deref inner -> Deref (substitute_expr bindings inner)
   | Field (base, field) ->
       Field (substitute_expr bindings base, field)
+  | Conditional (cond, then_branch, else_branch) ->
+      Conditional
+        ( substitute_bexpr bindings cond
+        , substitute_expr bindings then_branch
+        , substitute_expr bindings else_branch )
   | Add (left, right) ->
       Add (substitute_expr bindings left, substitute_expr bindings right)
   | Sub (left, right) ->
@@ -74,7 +79,7 @@ let rec substitute_expr bindings = function
   | FuncCall (name, args) ->
       FuncCall (name, List.map (substitute_expr bindings) args)
 
-let rec substitute_bexpr bindings = function
+and substitute_bexpr bindings = function
   | True -> True
   | False -> False
   | Forall (quantified, body) ->
@@ -114,6 +119,10 @@ let rec expr_has_var target = function
       expr_has_var target base || expr_has_var target index
   | Deref inner -> expr_has_var target inner
   | Field (base, _) -> expr_has_var target base
+  | Conditional (cond, then_branch, else_branch) ->
+      bexpr_has_var target cond
+      || expr_has_var target then_branch
+      || expr_has_var target else_branch
   | Add (left, right)
   | Sub (left, right)
   | Mul (left, right)
@@ -122,7 +131,7 @@ let rec expr_has_var target = function
       expr_has_var target left || expr_has_var target right
   | FuncCall (_, args) -> List.exists (expr_has_var target) args
 
-let rec bexpr_has_var target = function
+and bexpr_has_var target = function
   | True | False -> false
   | Forall (bindings, body) ->
       if List.exists (fun (binding : quantified_var) -> String.equal binding.quant_name target) bindings
@@ -151,7 +160,35 @@ let empty_ghost_env ghost_names = {
   ghost_names;
 }
 
-let rec substitute_expr_with_ghosts scalar_bindings bool_bindings = function
+let bool_truthiness_binding
+    (bool_bindings : (string * bexpr) list)
+    positive
+    left
+    right =
+  let matched_name =
+    match left, right with
+    | Var name, Int 0
+    | Int 0, Var name ->
+        Some name
+    | _ ->
+        None
+  in
+  match matched_name with
+  | None -> None
+  | Some name ->
+      Option.map
+        (fun binding -> if positive then binding else Not binding)
+        (assoc_opt name bool_bindings)
+
+let remove_shadowed_bindings names bindings =
+  List.filter
+    (fun (name, _value) ->
+      not (List.exists (fun shadowed -> String.equal name shadowed) names))
+    bindings
+
+let rec substitute_expr_with_ghosts
+    (scalar_bindings : (string * expr) list)
+    (bool_bindings : (string * bexpr) list) = function
   | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ as expr -> Ok expr
   | Var name ->
       (match assoc_opt name scalar_bindings with
@@ -179,6 +216,17 @@ let rec substitute_expr_with_ghosts scalar_bindings bool_bindings = function
   | Field (base, field) ->
       let* base = substitute_expr_with_ghosts scalar_bindings bool_bindings base in
       Ok (Field (base, field))
+  | Conditional (cond, then_branch, else_branch) ->
+      let* cond =
+        substitute_bexpr_with_ghosts scalar_bindings bool_bindings cond
+      in
+      let* then_branch =
+        substitute_expr_with_ghosts scalar_bindings bool_bindings then_branch
+      in
+      let* else_branch =
+        substitute_expr_with_ghosts scalar_bindings bool_bindings else_branch
+      in
+      Ok (Conditional (cond, then_branch, else_branch))
   | Add (left, right) ->
       let* left = substitute_expr_with_ghosts scalar_bindings bool_bindings left in
       let* right =
@@ -221,29 +269,9 @@ let rec substitute_expr_with_ghosts scalar_bindings bool_bindings = function
       let* args = loop [] args in
       Ok (FuncCall (name, args))
 
-let bool_truthiness_binding bool_bindings positive left right =
-  let matched_name =
-    match left, right with
-    | Var name, Int 0
-    | Int 0, Var name ->
-        Some name
-    | _ ->
-        None
-  in
-  match matched_name with
-  | None -> None
-  | Some name ->
-      Option.map
-        (fun binding -> if positive then binding else Not binding)
-        (assoc_opt name bool_bindings)
-
-let remove_shadowed_bindings names bindings =
-  List.filter
-    (fun (name, _value) ->
-      not (List.exists (fun shadowed -> String.equal name shadowed) names))
-    bindings
-
-let rec substitute_bexpr_with_ghosts scalar_bindings bool_bindings = function
+and substitute_bexpr_with_ghosts
+    (scalar_bindings : (string * expr) list)
+    (bool_bindings : (string * bexpr) list) = function
   | True -> Ok True
   | False -> Ok False
   | Forall (bindings, body) ->
@@ -432,6 +460,7 @@ let flatten_imports (imports : header_import list) : contracted_function list =
   List.concat_map
     (fun (imported_header : header_import) -> imported_header.functions)
     imports
+  |> List.filter (fun (fn : contracted_function) -> not (contract_is_empty fn.contract))
 
 let flatten_local_contracts (functions : function_def list) : contracted_function list =
   List.filter_map
@@ -475,6 +504,31 @@ let build_contract_env
   let* imported = build_unique_env ~kind:"imported" (flatten_imports imports) in
   let* local = build_unique_env ~kind:"local" (flatten_local_contracts functions) in
   Ok (merge_env ~preferred:local ~fallback:imported)
+
+let lookup_contract_fn
+    (env : (string * contracted_function) list)
+    name
+    args =
+  match assoc_opt name env with
+  | Some fn ->
+      Some fn
+  | None ->
+      let matches =
+        List.filter_map
+          (fun (_candidate_name, (fn : contracted_function)) ->
+            if String.equal (overload_base_name fn.name) (overload_base_name name)
+               && List.length fn.params = List.length args
+            then
+              Some fn
+            else
+              None)
+          env
+      in
+      (match matches with
+      | [ fn ] ->
+          Some fn
+      | _ ->
+          None)
 
 type state = {
   next_temp : int;
@@ -784,6 +838,62 @@ let append_safety_assert current stmts =
   let* safety = instantiate_step_safety current in
   Ok (seq_of_list (stmts @ assert_clauses (Function_safety current.contract_fn.name) safety))
 
+let merge_expr_types left right =
+  match left, right with
+  | TPointer left_pointee, TPointer right_pointee when left_pointee = right_pointee ->
+      TPointer left_pointee
+  | TPointer _, TPointer _
+  | TPointer _, _
+  | _, TPointer _ ->
+      TInt
+  | _ when is_real_type left || is_real_type right ->
+      TDouble
+  | _ when left = right ->
+      left
+  | _ ->
+      TInt
+
+let rec instrument_expr_type (memory_env : Memory_safety.contract_env) expr =
+  match Memory_safety.expr_kind memory_env expr with
+  | Memory_safety.Pointer_kind pointee ->
+      TPointer pointee
+  | Memory_safety.Scalar_kind ->
+      (match expr with
+      | Int _ -> TInt
+      | FloatLit _ -> TFloat
+      | DoubleLit _ -> TDouble
+      | CharLit _ -> TChar
+      | BoolLit _ -> TBool
+      | Var name ->
+          (match Memory_safety.global_scalar_type memory_env name with
+          | Some c_type -> c_type
+          | None -> TInt)
+      | AddrOf addressable ->
+          (match Memory_safety.addressable_type memory_env addressable with
+          | Some c_type -> TPointer c_type
+          | None -> TInt)
+      | (Index _ | Deref _ | Field _) as expr ->
+          (match Memory_safety.addressable_type memory_env expr with
+          | Some c_type -> c_type
+          | None -> TInt)
+      | Conditional (_cond, then_branch, else_branch) ->
+          merge_expr_types
+            (instrument_expr_type memory_env then_branch)
+            (instrument_expr_type memory_env else_branch)
+      | Add (left, right)
+      | Sub (left, right)
+      | Mul (left, right)
+      | Div (left, right) ->
+          merge_expr_types
+            (instrument_expr_type memory_env left)
+            (instrument_expr_type memory_env right)
+      | Mod _ ->
+          TInt
+      | FuncCall (name, _args) ->
+          (match Memory_safety.lookup_function_sig memory_env name with
+          | Some (_params, return_type) -> return_type
+          | None -> TInt))
+
 let rec instrument_expr
     (memory_env : Memory_safety.contract_env)
     (env : (string * contracted_function) list)
@@ -805,6 +915,32 @@ let rec instrument_expr
   | Field (base, field) ->
       let* prefix, base, state = instrument_expr memory_env env state base in
       Ok (prefix, Field (base, field), state)
+  | Conditional (cond, then_branch, else_branch) ->
+      let* cond_prefix, cond, state = instrument_bexpr memory_env env state cond in
+      let* then_prefix, then_branch, state =
+        instrument_expr memory_env env state then_branch
+      in
+      let* else_prefix, else_branch, state =
+        instrument_expr memory_env env state else_branch
+      in
+      if cond_prefix = [] && then_prefix = [] && else_prefix = [] then
+        Ok ([], Conditional (cond, then_branch, else_branch), state)
+      else
+        let result_type =
+          merge_expr_types
+            (instrument_expr_type memory_env then_branch)
+            (instrument_expr_type memory_env else_branch)
+        in
+        let result_name, state = fresh_name result_type state in
+        Ok
+          ( cond_prefix
+            @ [ If
+                  ( cond
+                  , seq_of_list (then_prefix @ [ Assign (result_name, then_branch) ])
+                  , seq_of_list (else_prefix @ [ Assign (result_name, else_branch) ]) )
+              ]
+          , Var result_name
+          , state )
   | Add (left, right) ->
       instrument_binary_expr memory_env env state left right (fun l r -> Add (l, r))
   | Sub (left, right) ->
@@ -817,7 +953,7 @@ let rec instrument_expr
       instrument_binary_expr memory_env env state left right (fun l r -> Mod (l, r))
   | FuncCall (name, args) ->
       let* prefix, args, state = instrument_expr_list memory_env env state args in
-      (match assoc_opt name env with
+      (match lookup_contract_fn env name args with
       | None -> Ok (prefix, FuncCall (name, args), state)
       | Some contract_fn ->
           (match contract_fn.return_type with
@@ -855,7 +991,7 @@ let rec instrument_expr
               Ok
                 ( prefix
                   @ assert_clauses (Call_require contract_fn.name) require
-                  @ [ Assign (result_name, FuncCall (name, args)) ]
+                  @ [ Assign (result_name, FuncCall (contract_fn.name, args)) ]
                   @ assume_clauses guarantee
                   @ assume_clauses safety
                 , result_expr
@@ -942,6 +1078,28 @@ and instrument_stmt
           Ok (stmt, state))
   | Block _ | LocalDecl _ ->
       Error "unresolved local syntax reached contract instrumentation"
+  | ExprStmt expr ->
+      let* expr =
+        match current_contract with
+        | None -> Ok expr
+        | Some current -> substitute_current_expr current expr
+      in
+      let* prefix, expr, state = instrument_expr memory_env env state expr in
+      let stmt =
+        match prefix, expr with
+        | [], expr ->
+            seq_of_list [ ExprStmt expr ]
+        | prefix, Var _ ->
+            seq_of_list prefix
+        | prefix, expr ->
+            seq_of_list (prefix @ [ ExprStmt expr ])
+      in
+      (match current_contract with
+      | None ->
+          Ok (stmt, state)
+      | Some current ->
+          let* stmt = append_safety_assert current [ stmt ] in
+          Ok (stmt, state))
   | Assign (name, expr) ->
       let* expr =
         match current_contract with

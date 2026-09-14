@@ -131,17 +131,68 @@ let call_stmt name args =
     fail "expected `abort()` without arguments";
   Assert (Source_assert, False)
 
+let expr_stmt expr =
+  match expr with
+  | FuncCall (name, args) when String.equal name "abort" ->
+      call_stmt name args
+  | FuncCall _ ->
+      ExprStmt expr
+  | _ ->
+      fail "unsupported expression statement `%s`" (expr_to_c expr)
+
+let conditional_expr cond then_branch else_branch =
+  Conditional (cond, then_branch, else_branch)
+
+let rec unwrap_single_stmt = function
+  | Block [ stmt ] -> unwrap_single_stmt stmt
+  | stmt -> stmt
+
+let for_loop init cond step body =
+  let init =
+    match init with
+    | None -> []
+    | Some stmt -> [ stmt ]
+  in
+  let step =
+    match step with
+    | None -> []
+    | Some stmt -> [ stmt ]
+  in
+  let body = seq_of_list ([ body ] @ step) in
+  seq_of_list (init @ [ While (None, Option.value cond ~default:True, body) ])
+
+let flatten_arg_groups groups =
+  List.concat groups
+
 let stmt_of_if_without_else cond then_branch =
-  match cond, then_branch with
-  | Not premise, Block [ Return None ] ->
+  match cond, unwrap_single_stmt then_branch with
+  | Not premise, Return None ->
       Assume premise
-  | Not premise, Block [ Return (Some value) ] ->
+  | Not premise, Return (Some value) ->
       expect_zero_literal value;
       Assume premise
-  | Not premise, Block [ Assert (Source_assert, False) ] ->
+  | Not premise, Assert (Source_assert, False) ->
       Assert (Source_assert, premise)
   | _ ->
       If (cond, then_branch, Skip)
+
+let rec sizeof_c_type = function
+  | TInt -> 4
+  | TFloat -> 4
+  | TDouble -> 8
+  | TChar -> 1
+  | TBool -> 1
+  | TVoid ->
+      fail "`sizeof(void)` is unsupported"
+  | TRecord name ->
+      fail "`sizeof(struct %s)` is unsupported in parser sugar" name
+  | TPointer _ ->
+      pointer_object_byte_size
+  | TArray (element_type, size) ->
+      size * sizeof_c_type element_type
+  | TReference inner
+  | TConstReference inner ->
+      sizeof_c_type (TPointer inner)
 
 let raw_qualified_name parts =
   String.concat raw_namespace_separator parts
@@ -166,6 +217,7 @@ type top_item =
   | Top_record of record_def
   | Top_global of global_def
   | Top_function of function_def
+  | Top_stmt of stmt
   | Top_main of function_def
 
 type top_group_builder = string list -> top_item list
@@ -185,12 +237,22 @@ let build_class class_name members =
   :: List.rev methods_rev
 
 let build_program items =
-  let rec loop records_rev globals_rev functions_rev main = function
+  let rec loop records_rev globals_rev functions_rev top_stmts_rev main = function
     | [] ->
         let main =
-          match main with
-          | Some main -> main
-          | None -> fail "missing `main` definition"
+          match main, List.rev top_stmts_rev with
+          | Some main, [] ->
+              main
+          | Some _, _ :: _ ->
+              fail "top-level statements are unsupported when `main` is explicitly defined"
+          | None, [] ->
+              fail "missing `main` definition"
+          | None, top_stmts ->
+              make_function
+                ~name:"main"
+                ~return_type:TInt
+                ~params:[]
+                (seq_of_list (top_stmts @ [ Return (Some (Int 0)) ]))
         in
         {
           imports = [];
@@ -200,18 +262,20 @@ let build_program items =
           main;
         }
     | Top_record record :: rest ->
-        loop (record :: records_rev) globals_rev functions_rev main rest
+        loop (record :: records_rev) globals_rev functions_rev top_stmts_rev main rest
     | Top_global global :: rest ->
-        loop records_rev (global :: globals_rev) functions_rev main rest
+        loop records_rev (global :: globals_rev) functions_rev top_stmts_rev main rest
     | Top_function fn :: rest ->
-        loop records_rev globals_rev (fn :: functions_rev) main rest
+        loop records_rev globals_rev (fn :: functions_rev) top_stmts_rev main rest
+    | Top_stmt stmt :: rest ->
+        loop records_rev globals_rev functions_rev (stmt :: top_stmts_rev) main rest
     | Top_main fn :: rest ->
         (match main with
         | Some _ -> fail "multiple `main` definitions"
         | None ->
-            loop records_rev globals_rev functions_rev (Some fn) rest)
+            loop records_rev globals_rev functions_rev top_stmts_rev (Some fn) rest)
   in
-  loop [] [] [] None items
+  loop [] [] [] [] None items
 %}
 
 %token <int> INT_LIT
@@ -219,12 +283,14 @@ let build_program items =
 %token <string> DOUBLE_LIT
 %token <int> CHAR_LIT
 %token <string> IDENT
-%token INT_KW FLOAT_KW DOUBLE_KW CHAR_KW BOOL_KW CONST_KW MAIN_KW VOID_KW STRUCT_KW CLASS_KW NAMESPACE_KW IF_KW ELSE_KW WHILE_KW RETURN_KW FREE_KW TRUE_KW FALSE_KW FORALL_KW
-%token LPAREN RPAREN LBRACE RBRACE LBRACKET RBRACKET SEMI COMMA AMP DOT ARROW SCOPE
-%token PLUS MINUS STAR SLASH PERCENT
+%token INT_KW INT64_KW FLOAT_KW DOUBLE_KW CHAR_KW BOOL_KW CONST_KW AUTO_KW MAIN_KW VOID_KW STRUCT_KW CLASS_KW NAMESPACE_KW IF_KW ELSE_KW WHILE_KW FOR_KW RETURN_KW FREE_KW TRUE_KW FALSE_KW FORALL_KW SIZEOF_KW SCORING_FN_KW
+%token LPAREN RPAREN LBRACE RBRACE LBRACKET RBRACKET SEMI COMMA AMP DOT ARROW SCOPE QUESTION COLON
+%token PLUS MINUS STAR SLASH PERCENT PLUSPLUS MINUSMINUS
 %token ASSIGN PLUSEQ MINUSEQ EQEQ NEQ LT LE GT GE NOT AND OR IMPLIES
 %token EOF
 
+%nonassoc IF_NO_ELSE
+%nonassoc ELSE_KW
 %right IMPLIES
 %left OR
 %left AND
@@ -250,6 +316,8 @@ bexpr_eof:
 
 scalar_type:
   | INT_KW
+      { TInt }
+  | INT64_KW
       { TInt }
   | FLOAT_KW
       { TFloat }
@@ -280,6 +348,24 @@ qualified_ident_tail:
   | { [] }
   | SCOPE next = IDENT rest = qualified_ident_tail
       { next :: rest }
+
+cast_nonvoid_type:
+  | base = scalar_type
+      { base }
+  | STRUCT_KW name = qualified_ident
+      { TRecord name }
+
+cast_type:
+  | base = cast_nonvoid_type stars = pointer_stars
+      { pointer_type base stars }
+  | VOID_KW STAR stars = pointer_stars
+      { pointer_type TVoid (stars + 1) }
+
+sizeof_type:
+  | base = nonvoid_type stars = pointer_stars
+      { pointer_type base stars }
+  | VOID_KW STAR stars = pointer_stars
+      { pointer_type TVoid (stars + 1) }
 
 contract_expr:
   | value = contract_add_expr
@@ -395,6 +481,17 @@ contract_nonparen_primary_expr:
   | name = qualified_ident
       { Var name }
 
+call_arg:
+  | value = expr
+      { [ value ] }
+  | LBRACE values = separated_list(COMMA, expr) RBRACE
+      { values }
+
+call_args:
+  | { [] }
+  | groups = separated_nonempty_list(COMMA, call_arg)
+      { flatten_arg_groups groups }
+
 contract_quantified_type:
   | base = nonvoid_type stars = pointer_stars
       { ensure_quantified_type_supported (pointer_type base stars) }
@@ -504,6 +601,11 @@ top_group:
             fail "`main` must be declared at global scope";
           [ Top_main (make_function ~name:"main" ~return_type:TInt ~params:[] body) ]
       }
+  | AUTO_KW name = IDENT ASSIGN lambda = lambda_def SEMI
+      {
+        fun namespace ->
+          [ Top_function (lambda (qualify_decl_name namespace name)) ]
+      }
   | base = nonvoid_type stars = pointer_stars name = IDENT LPAREN params = param_list RPAREN SEMI
       {
         ignore base;
@@ -534,6 +636,54 @@ top_group:
                  ~params
                  body)
           ]
+      }
+  | SCORING_FN_KW LPAREN params = param_list RPAREN body = block SEMI
+      {
+        fun namespace ->
+          [ Top_function
+              (make_function
+                 ~name:(qualify_decl_name namespace "scoring_fn")
+                 ~return_type:TDouble
+                 ~params
+                 body)
+          ]
+      }
+  | SCORING_FN_KW LPAREN params = param_list RPAREN body = block
+      {
+        fun namespace ->
+          [ Top_function
+              (make_function
+                 ~name:(qualify_decl_name namespace "scoring_fn")
+                 ~return_type:TDouble
+                 ~params
+                 body)
+          ]
+      }
+  | stmt = stmt
+      {
+        fun namespace ->
+          if namespace <> [] then
+            fail "top-level statements are only supported at global scope";
+          [ Top_stmt stmt ]
+      }
+
+lambda_capture:
+  | LBRACKET RBRACKET
+      { () }
+  | LBRACKET AMP RBRACKET
+      { () }
+
+lambda_return_type:
+  | base = nonvoid_type stars = pointer_stars
+      { pointer_type base stars }
+  | VOID_KW stars = pointer_stars
+      { pointer_type TVoid stars }
+
+lambda_def:
+  | _capture = lambda_capture LPAREN params = param_list RPAREN ARROW return_type = lambda_return_type body = block
+      {
+        fun name ->
+          make_function ~name ~return_type ~params body
       }
 
 class_member_list:
@@ -653,6 +803,8 @@ param_tail:
 named_param:
   | base = nonvoid_type stars = pointer_stars name = IDENT
       { { param_type = pointer_type base stars; param_name = Some name } }
+  | CONST_KW base = nonvoid_type stars = pointer_stars name = IDENT
+      { { param_type = pointer_type base stars; param_name = Some name } }
   | base = nonvoid_type stars = pointer_stars AMP name = IDENT
       { { param_type = TReference (pointer_type base stars); param_name = Some name } }
   | CONST_KW base = nonvoid_type stars = pointer_stars AMP name = IDENT
@@ -688,6 +840,13 @@ local_decl_tail:
           make_local_decl (array_type base size) name None
       }
 
+const_local_decl_tail:
+  | ASSIGN init = expr SEMI
+      {
+        fun base stars name ->
+          make_local_decl (pointer_type base stars) name (Some init)
+      }
+
 local_void_decl_tail:
   | SEMI
       {
@@ -707,6 +866,8 @@ stmt:
       { body }
   | base = nonvoid_type stars = pointer_stars name = IDENT tail = local_decl_tail
       { tail base stars name }
+  | CONST_KW base = nonvoid_type stars = pointer_stars name = IDENT tail = const_local_decl_tail
+      { tail base stars name }
   | VOID_KW STAR stars = pointer_stars name = IDENT tail = local_void_decl_tail
       { tail stars name }
   | lhs = postfix_expr ASSIGN rhs = expr SEMI
@@ -715,24 +876,84 @@ stmt:
       { compound_assignment_stmt (fun left right -> Add (left, right)) lhs rhs }
   | lhs = postfix_expr MINUSEQ rhs = expr SEMI
       { compound_assignment_stmt (fun left right -> Sub (left, right)) lhs rhs }
+  | lhs = postfix_expr PLUSPLUS SEMI
+      { compound_assignment_stmt (fun left right -> Add (left, right)) lhs (Int 1) }
+  | lhs = postfix_expr MINUSMINUS SEMI
+      { compound_assignment_stmt (fun left right -> Sub (left, right)) lhs (Int 1) }
+  | PLUSPLUS lhs = postfix_expr SEMI
+      { compound_assignment_stmt (fun left right -> Add (left, right)) lhs (Int 1) }
+  | MINUSMINUS lhs = postfix_expr SEMI
+      { compound_assignment_stmt (fun left right -> Sub (left, right)) lhs (Int 1) }
   | STAR lhs = expr ASSIGN rhs = expr SEMI
       { Store (lhs, rhs) }
   | STAR lhs = expr PLUSEQ rhs = expr SEMI
       { compound_store_stmt (fun left right -> Add (left, right)) lhs rhs }
   | STAR lhs = expr MINUSEQ rhs = expr SEMI
       { compound_store_stmt (fun left right -> Sub (left, right)) lhs rhs }
-  | name = qualified_ident LPAREN args = separated_list(COMMA, expr) RPAREN SEMI
-      { call_stmt name args }
+  | call = postfix_expr SEMI
+      { expr_stmt call }
   | RETURN_KW value = option(expr) SEMI
       { Return value }
   | FREE_KW LPAREN ptr = expr RPAREN SEMI
       { Free ptr }
-  | IF_KW LPAREN cond = bexpr RPAREN then_branch = block ELSE_KW else_branch = block
+  | IF_KW LPAREN cond = bexpr RPAREN then_branch = stmt ELSE_KW else_branch = stmt
       { If (cond, then_branch, else_branch) }
-  | IF_KW LPAREN cond = bexpr RPAREN then_branch = block
+  | IF_KW LPAREN cond = bexpr RPAREN then_branch = stmt %prec IF_NO_ELSE
       { stmt_of_if_without_else cond then_branch }
   | WHILE_KW LPAREN cond = bexpr RPAREN body = block
       { While (None, cond, body) }
+  | FOR_KW LPAREN init = for_init_opt SEMI cond = option(bexpr) SEMI step = for_step_opt RPAREN body = stmt
+      { for_loop init cond step body }
+
+for_init_opt:
+  | { None }
+  | stmt = for_init_stmt
+      { Some stmt }
+
+for_step_opt:
+  | { None }
+  | stmt = for_step_stmt
+      { Some stmt }
+
+for_init_stmt:
+  | base = nonvoid_type stars = pointer_stars name = IDENT ASSIGN init = expr
+      { make_local_decl (pointer_type base stars) name (Some init) }
+  | CONST_KW base = nonvoid_type stars = pointer_stars name = IDENT ASSIGN init = expr
+      { make_local_decl (pointer_type base stars) name (Some init) }
+  | lhs = postfix_expr ASSIGN rhs = expr
+      { assignment_stmt lhs rhs }
+  | lhs = postfix_expr PLUSEQ rhs = expr
+      { compound_assignment_stmt (fun left right -> Add (left, right)) lhs rhs }
+  | lhs = postfix_expr MINUSEQ rhs = expr
+      { compound_assignment_stmt (fun left right -> Sub (left, right)) lhs rhs }
+  | lhs = postfix_expr PLUSPLUS
+      { compound_assignment_stmt (fun left right -> Add (left, right)) lhs (Int 1) }
+  | lhs = postfix_expr MINUSMINUS
+      { compound_assignment_stmt (fun left right -> Sub (left, right)) lhs (Int 1) }
+  | PLUSPLUS lhs = postfix_expr
+      { compound_assignment_stmt (fun left right -> Add (left, right)) lhs (Int 1) }
+  | MINUSMINUS lhs = postfix_expr
+      { compound_assignment_stmt (fun left right -> Sub (left, right)) lhs (Int 1) }
+  | call = postfix_expr
+      { expr_stmt call }
+
+for_step_stmt:
+  | lhs = postfix_expr ASSIGN rhs = expr
+      { assignment_stmt lhs rhs }
+  | lhs = postfix_expr PLUSEQ rhs = expr
+      { compound_assignment_stmt (fun left right -> Add (left, right)) lhs rhs }
+  | lhs = postfix_expr MINUSEQ rhs = expr
+      { compound_assignment_stmt (fun left right -> Sub (left, right)) lhs rhs }
+  | lhs = postfix_expr PLUSPLUS
+      { compound_assignment_stmt (fun left right -> Add (left, right)) lhs (Int 1) }
+  | lhs = postfix_expr MINUSMINUS
+      { compound_assignment_stmt (fun left right -> Sub (left, right)) lhs (Int 1) }
+  | PLUSPLUS lhs = postfix_expr
+      { compound_assignment_stmt (fun left right -> Add (left, right)) lhs (Int 1) }
+  | MINUSMINUS lhs = postfix_expr
+      { compound_assignment_stmt (fun left right -> Sub (left, right)) lhs (Int 1) }
+  | call = postfix_expr
+      { expr_stmt call }
 
 bexpr:
   | value = or_bexpr
@@ -779,6 +1000,8 @@ atom_bexpr:
       { tail left }
 
 expr:
+  | cond = bexpr QUESTION then_branch = expr COLON else_branch = expr
+      { conditional_expr cond then_branch else_branch }
   | value = add_expr
       { value }
 
@@ -803,12 +1026,16 @@ mul_expr:
 unary_expr:
   | value = postfix_expr
       { value }
+  | LPAREN _cast_type = cast_type RPAREN value = unary_expr
+      { value }
   | MINUS value = unary_expr
       { negate_expr value }
   | AMP value = postfix_expr
       { AddrOf value }
   | STAR value = unary_expr
       { Deref value }
+  | SIZEOF_KW LPAREN c_type = sizeof_type RPAREN
+      { Int (sizeof_c_type c_type) }
 
 nonparen_expr:
   | value = nonparen_add_expr
@@ -835,21 +1062,25 @@ nonparen_mul_expr:
 nonparen_unary_expr:
   | value = nonparen_postfix_expr
       { value }
+  | LPAREN _cast_type = cast_type RPAREN value = unary_expr
+      { value }
   | MINUS value = unary_expr
       { negate_expr value }
   | AMP value = postfix_expr
       { AddrOf value }
   | STAR value = unary_expr
       { Deref value }
+  | SIZEOF_KW LPAREN c_type = sizeof_type RPAREN
+      { Int (sizeof_c_type c_type) }
 
 nonparen_postfix_expr:
   | value = nonparen_primary_expr
       { value }
   | base = nonparen_postfix_expr LBRACKET index = expr RBRACKET
       { Index (base, index) }
-  | base = nonparen_postfix_expr DOT method_name = IDENT LPAREN args = separated_list(COMMA, expr) RPAREN
+  | base = nonparen_postfix_expr DOT method_name = IDENT LPAREN args = call_args RPAREN
       { FuncCall (method_dot_call_name method_name, base :: args) }
-  | base = nonparen_postfix_expr ARROW method_name = IDENT LPAREN args = separated_list(COMMA, expr) RPAREN
+  | base = nonparen_postfix_expr ARROW method_name = IDENT LPAREN args = call_args RPAREN
       { FuncCall (method_arrow_call_name method_name, base :: args) }
   | base = nonparen_postfix_expr DOT field = IDENT
       { Field (base, field) }
@@ -861,9 +1092,9 @@ postfix_expr:
       { value }
   | base = postfix_expr LBRACKET index = expr RBRACKET
       { Index (base, index) }
-  | base = postfix_expr DOT method_name = IDENT LPAREN args = separated_list(COMMA, expr) RPAREN
+  | base = postfix_expr DOT method_name = IDENT LPAREN args = call_args RPAREN
       { FuncCall (method_dot_call_name method_name, base :: args) }
-  | base = postfix_expr ARROW method_name = IDENT LPAREN args = separated_list(COMMA, expr) RPAREN
+  | base = postfix_expr ARROW method_name = IDENT LPAREN args = call_args RPAREN
       { FuncCall (method_arrow_call_name method_name, base :: args) }
   | base = postfix_expr DOT field = IDENT
       { Field (base, field) }
@@ -883,10 +1114,12 @@ primary_expr:
       { BoolLit true }
   | FALSE_KW
       { BoolLit false }
-  | name = qualified_ident LPAREN args = separated_list(COMMA, expr) RPAREN
+  | name = qualified_ident LPAREN args = call_args RPAREN
       { FuncCall (name, args) }
   | name = qualified_ident
       { Var name }
+  | LPAREN cond = bexpr QUESTION then_branch = expr COLON else_branch = expr RPAREN
+      { conditional_expr cond then_branch else_branch }
   | LPAREN value = expr RPAREN
       { value }
 
@@ -903,7 +1136,7 @@ nonparen_primary_expr:
       { BoolLit true }
   | FALSE_KW
       { BoolLit false }
-  | name = qualified_ident LPAREN args = separated_list(COMMA, expr) RPAREN
+  | name = qualified_ident LPAREN args = call_args RPAREN
       { FuncCall (name, args) }
   | name = qualified_ident
       { Var name }

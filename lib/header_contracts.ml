@@ -695,14 +695,22 @@ let load_defined_contracts ~source_path source =
     let decl_line = Option.value !top_start_line ~default:!line_number in
     if decl <> "" then
       if terminator = '{' && find_substring ~sub:"(" decl <> None then begin
-        let signature =
-          parse_definition_signature ~source_path ~line_number:decl_line decl
-        in
-        signatures_rev := add_signature !signatures_rev signature;
-        if not (contract_is_empty !pending_legacy) then
-          legacy_contracts :=
-            add_signature_contract signature !pending_legacy !legacy_contracts;
-        pending_legacy := empty_contract
+        match
+          try
+            Some
+              (parse_definition_signature ~source_path ~line_number:decl_line decl)
+          with
+          | Error _ when contract_is_empty !pending_legacy ->
+              None
+        with
+        | Some signature ->
+            signatures_rev := add_signature !signatures_rev signature;
+            if not (contract_is_empty !pending_legacy) then
+              legacy_contracts :=
+                add_signature_contract signature !pending_legacy !legacy_contracts;
+            pending_legacy := empty_contract
+        | None ->
+            ()
       end else if not (contract_is_empty !pending_legacy) then
         pending_legacy := empty_contract;
     clear_top ()

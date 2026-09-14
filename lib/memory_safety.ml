@@ -134,6 +134,10 @@ let rec count_malloc_expr = function
       count_malloc_expr base + count_malloc_expr index
   | Deref inner -> count_malloc_expr inner
   | Field (base, _) -> count_malloc_expr base
+  | Conditional (cond, then_branch, else_branch) ->
+      count_malloc_bexpr cond
+      + count_malloc_expr then_branch
+      + count_malloc_expr else_branch
   | Add (left, right)
   | Sub (left, right)
   | Mul (left, right)
@@ -146,19 +150,7 @@ let rec count_malloc_expr = function
       in
       here + List.fold_left (fun acc arg -> acc + count_malloc_expr arg) 0 args
 
-let rec uses_memory_expr = function
-  | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ | Var _ -> false
-  | AddrOf _ | Index _ | Deref _ | Field _ -> true
-  | Add (left, right)
-  | Sub (left, right)
-  | Mul (left, right)
-  | Div (left, right)
-  | Mod (left, right) ->
-      uses_memory_expr left || uses_memory_expr right
-  | FuncCall (name, args) ->
-      String.equal name "malloc" || List.exists uses_memory_expr args
-
-let rec count_malloc_bexpr = function
+and count_malloc_bexpr = function
   | True | False -> 0
   | Forall (_, body) -> count_malloc_bexpr body
   | Eq (left, right)
@@ -181,6 +173,8 @@ let rec count_malloc_stmt = function
       (match init with
       | None -> 0
       | Some expr -> count_malloc_expr expr)
+  | ExprStmt expr ->
+      count_malloc_expr expr
   | Assign (_, expr) -> count_malloc_expr expr
   | Store (ptr, value) -> count_malloc_expr ptr + count_malloc_expr value
   | ArrayAssign (base, index, value) ->
@@ -207,7 +201,23 @@ let rec count_malloc_stmt = function
   | Return None -> 0
   | Return (Some value) -> count_malloc_expr value
 
-let rec uses_memory_stmt = function
+let rec uses_memory_expr = function
+  | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ | Var _ -> false
+  | AddrOf _ | Index _ | Deref _ | Field _ -> true
+  | Conditional (cond, then_branch, else_branch) ->
+      uses_memory_bexpr cond
+      || uses_memory_expr then_branch
+      || uses_memory_expr else_branch
+  | Add (left, right)
+  | Sub (left, right)
+  | Mul (left, right)
+  | Div (left, right)
+  | Mod (left, right) ->
+      uses_memory_expr left || uses_memory_expr right
+  | FuncCall (name, args) ->
+      String.equal name "malloc" || List.exists uses_memory_expr args
+
+and uses_memory_stmt = function
   | Skip -> false
   | Block stmts ->
       List.exists uses_memory_stmt stmts
@@ -215,6 +225,8 @@ let rec uses_memory_stmt = function
       (match init with
       | None -> false
       | Some expr -> uses_memory_expr expr)
+  | ExprStmt expr ->
+      uses_memory_expr expr
   | Assign (_, expr) -> uses_memory_expr expr
   | Store _ | ArrayAssign _ | FieldAssign _ | Free _ -> true
   | Seq stmts -> List.exists uses_memory_stmt stmts
@@ -348,6 +360,28 @@ let lookup_reference_binding env name =
 let lookup_reference_function_params env name =
   assoc_opt name env.function_params
 
+let param_types_match_arity param_types arg_count =
+  List.length param_types = arg_count
+
+let lookup_reference_call_params env name arg_count =
+  match lookup_reference_function_params env name with
+  | Some param_types when param_types_match_arity param_types arg_count ->
+      Some (name, param_types)
+  | Some _ | None ->
+      let base_name = overload_base_name name in
+      let matches =
+        List.filter
+          (fun (candidate, param_types) ->
+            String.equal (overload_base_name candidate) base_name
+            && param_types_match_arity param_types arg_count)
+          env.function_params
+      in
+      (match matches with
+      | [ (resolved_name, param_types) ] ->
+          Some (resolved_name, param_types)
+      | _ ->
+          None)
+
 let is_reference_var env name =
   Option.is_some (lookup_reference_binding env name)
 
@@ -358,6 +392,7 @@ let is_const_reference_var env name =
 
 let expr_is_addressable = function
   | Var _ | Field _ | Index _ | Deref _ -> true
+  | Conditional _ -> false
   | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ | AddrOf _ | Add _ | Sub _
   | Mul _ | Div _ | Mod _ | FuncCall _ ->
       false
@@ -367,6 +402,7 @@ let rec direct_const_reference_lvalue env = function
   | Field (base, _) -> direct_const_reference_lvalue env base
   | Index (base, _) -> direct_const_reference_lvalue env base
   | Deref _ -> false
+  | Conditional _ -> false
   | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ | AddrOf _ | Add _ | Sub _
   | Mul _ | Div _ | Mod _ | FuncCall _ ->
       false
@@ -417,11 +453,11 @@ and lower_reference_binding_arg env arg =
         (expr_to_c arg)
 
 and lower_reference_call env name args =
-  match lookup_reference_function_params env name with
+  match lookup_reference_call_params env name (List.length args) with
   | None ->
       let* args = lower_reference_expr_list env args in
       Ok (FuncCall (name, args))
-  | Some param_types ->
+  | Some (resolved_name, param_types) ->
       let rec loop param_types args =
         match param_types, args with
         | [], [] ->
@@ -434,7 +470,7 @@ and lower_reference_call env name args =
             fail "arity mismatch while lowering references for `%s`" name
       in
       let* args = loop param_types args in
-      Ok (FuncCall (name, args))
+      Ok (FuncCall (resolved_name, args))
 
 and lower_reference_expr env = function
   | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ as expr ->
@@ -458,6 +494,11 @@ and lower_reference_expr env = function
   | Field (base, field) ->
       let* base = lower_reference_expr env base in
       Ok (Field (base, field))
+  | Conditional (cond, then_branch, else_branch) ->
+      let* cond = lower_reference_bexpr env cond in
+      let* then_branch = lower_reference_expr env then_branch in
+      let* else_branch = lower_reference_expr env else_branch in
+      Ok (Conditional (cond, then_branch, else_branch))
   | Add (left, right) ->
       let* left = lower_reference_expr env left in
       let* right = lower_reference_expr env right in
@@ -488,7 +529,7 @@ and lower_reference_expr_list env = function
       let* rest = lower_reference_expr_list env rest in
       Ok (expr :: rest)
 
-let rec lower_reference_bexpr env = function
+and lower_reference_bexpr env = function
   | True -> Ok True
   | False -> Ok False
   | Forall (bindings, body) ->
@@ -546,10 +587,13 @@ let rec lower_reference_bexpr env = function
       let* right = lower_reference_bexpr env right in
       Ok (Or (left, right))
 
-let rec lower_reference_stmt env = function
+and lower_reference_stmt env = function
   | Skip -> Ok Skip
   | Block _ | LocalDecl _ ->
       fail "unresolved local syntax reached reference lowering"
+  | ExprStmt expr ->
+      let* expr = lower_reference_expr env expr in
+      Ok (ExprStmt expr)
   | Assign (name, rhs) ->
       let* rhs = lower_reference_expr env rhs in
       (match lookup_reference_binding env name with
@@ -709,6 +753,7 @@ type env = {
   quantified_pointers : (var * c_type) list;
   function_sigs : (string * (c_type list * c_type)) list;
   malloc_sites : int;
+  memory_lowering_active : bool;
 }
 
 type contract_env = env
@@ -759,6 +804,8 @@ let rec expr_is_stable = function
       true
   | Var name ->
       is_shadow_value_temp name
+  | Conditional _ ->
+      false
   | Add (left, right)
   | Sub (left, right)
   | Mul (left, right)
@@ -1023,6 +1070,7 @@ let function_env_of_program (program : program) fn malloc_sites =
     quantified_pointers = [];
     function_sigs = build_function_sigs program;
     malloc_sites;
+    memory_lowering_active = uses_memory_program program;
   }
 
 let lookup_field_type env record_name field_name =
@@ -1033,6 +1081,26 @@ let lookup_field_offset env record_name field_name =
 
 let lookup_function_sig env name =
   assoc_opt name env.function_sigs
+
+let lookup_call_sig env name arg_count =
+  match lookup_function_sig env name with
+  | Some ((param_types, _return_type) as signature)
+    when param_types_match_arity param_types arg_count ->
+      Some (name, signature)
+  | Some _ | None ->
+      let base_name = overload_base_name name in
+      let matches =
+        List.filter
+          (fun (candidate, (param_types, _return_type)) ->
+            String.equal (overload_base_name candidate) base_name
+            && param_types_match_arity param_types arg_count)
+          env.function_sigs
+      in
+      (match matches with
+      | [ (resolved_name, signature) ] ->
+          Some (resolved_name, signature)
+      | _ ->
+          None)
 
 let lower_function_params (params : param list) =
   let expand_param (param : param) =
@@ -1103,6 +1171,12 @@ let rec expr_kind env = function
           | Some (TArray (element_type, _)) -> Pointer_kind element_type
           | Some _ | None -> Scalar_kind)
       | None -> Scalar_kind)
+  | Conditional (_cond, then_branch, else_branch) ->
+      (match expr_kind env then_branch, expr_kind env else_branch with
+      | Pointer_kind left, Pointer_kind right when left = right ->
+          Pointer_kind left
+      | _ ->
+          Scalar_kind)
   | Add (left, right) ->
       (match expr_kind env left, expr_kind env right with
       | Pointer_kind pointee, Scalar_kind
@@ -1134,6 +1208,8 @@ and addressable_type env = function
       (match expr_kind env ptr with
       | Pointer_kind pointee -> Some pointee
       | Scalar_kind -> None)
+  | Conditional _ ->
+      None
   | Int _
   | FloatLit _
   | DoubleLit _
@@ -1463,6 +1539,14 @@ and lower_scalar_expr env state expr =
                     [] ]
             , FuncCall (load_helper_name field_type, [ block; offset ])
             , state ))
+  | Conditional (cond, then_branch, else_branch) ->
+      let* cond_prefix, cond, state = lower_bexpr env state cond in
+      let* then_prefix, then_branch, state = lower_scalar_expr env state then_branch in
+      let* else_prefix, else_branch, state = lower_scalar_expr env state else_branch in
+      if cond_prefix <> [] || then_prefix <> [] || else_prefix <> [] then
+        fail "memory operations inside ternary expressions are unsupported"
+      else
+        Ok ([], Conditional (cond, then_branch, else_branch), state)
   | Add (left, right) ->
       (match expr_kind env left, expr_kind env right with
       | Scalar_kind, Scalar_kind ->
@@ -1490,8 +1574,8 @@ and lower_scalar_expr env state expr =
   | FuncCall (name, args) when String.equal name "malloc" ->
       fail "`malloc` used where a scalar was expected"
   | FuncCall (name, args) ->
-      let* prefix, args, state = lower_call_args env state name args in
-      Ok (prefix, FuncCall (name, args), state)
+      let* prefix, resolved_name, args, state = lower_call_args env state name args in
+      Ok (prefix, FuncCall (resolved_name, args), state)
 
 and lower_field_address env state base field =
   let* prefix, block, offset, base_type, state =
@@ -1545,10 +1629,11 @@ and lower_pointer_value_from_addressable env state expr =
       fail "expression `%s` does not evaluate to a pointer" (expr_to_c expr)
 
 and lower_call_args env state name args =
-  match lookup_function_sig env name with
+  match lookup_call_sig env name (List.length args) with
   | None ->
-      lower_scalar_expr_list env state args
-  | Some (param_types, _return_type) ->
+      let* prefix, args, state = lower_scalar_expr_list env state args in
+      Ok (prefix, name, args, state)
+  | Some (resolved_name, (param_types, _return_type)) ->
       let rec loop state param_types args =
         match param_types, args with
         | [], [] ->
@@ -1575,7 +1660,8 @@ and lower_call_args env state name args =
         | _, _ ->
             fail "arity mismatch while lowering call to `%s`" name
       in
-      loop state param_types args
+      let* prefix, args, state = loop state param_types args in
+      Ok (prefix, resolved_name, args, state)
 
 and lower_scalar_expr_list env state exprs =
   match exprs with
@@ -1630,6 +1716,8 @@ and lower_ptr_expr ?expected env state expr =
         lower_addressable_expr env state inner
       in
       Ok (prefix, block, offset, Some pointee, state)
+  | Conditional _ ->
+      fail "conditional pointer expressions are unsupported in this proof-of-concept"
   | Index _ ->
       lower_pointer_value_from_addressable env state expr
   | Add (left, right) ->
@@ -1779,6 +1867,9 @@ and lower_stmt env state stmt =
   | Skip -> Ok (Skip, state)
   | Block _ | LocalDecl _ ->
       fail "unresolved local syntax reached memory lowering"
+  | ExprStmt expr ->
+      let* prefix, expr, state = lower_scalar_expr env state expr in
+      Ok (seq_of_list (prefix @ [ ExprStmt expr ]), state)
   | Assign (name, rhs) ->
       (match pointer_pointee_type env name with
       | Some pointee ->
@@ -2182,6 +2273,7 @@ let contract_env_of_program (program : program) =
     quantified_pointers = [];
     function_sigs = build_function_sigs program;
     malloc_sites = count_malloc_program program;
+    memory_lowering_active = uses_memory_program program;
   }
 
 let rec lower_contract_scalar_expr env expr =
@@ -2221,6 +2313,11 @@ let rec lower_contract_scalar_expr env expr =
           fail "could not infer the pointee type for contract dereference")
   | Field _ ->
       fail "field reads are unsupported inside contract expressions"
+  | Conditional (cond, then_branch, else_branch) ->
+      let* cond = lower_contract_bexpr env cond in
+      let* then_branch = lower_contract_scalar_expr env then_branch in
+      let* else_branch = lower_contract_scalar_expr env else_branch in
+      Ok (Conditional (cond, then_branch, else_branch))
   | Add (left, right) ->
       let* left = lower_contract_scalar_expr env left in
       let* right = lower_contract_scalar_expr env right in
@@ -2242,12 +2339,23 @@ let rec lower_contract_scalar_expr env expr =
       let* right = lower_contract_scalar_expr env right in
       Ok (Mod (left, right))
   | FuncCall (name, args) ->
-      let* args =
-        match lower_contract_scalar_expr_list env args with
-        | Ok args -> Ok args
-        | Error _ as error -> error
-      in
-      Ok (FuncCall (name, args))
+      (match lookup_call_sig env name (List.length args) with
+      | Some (_resolved_name, (_param_types, (TPointer _ | TArray _ | TRecord _ | TVoid as return_type))) ->
+          fail
+            "function `%s` returns `%s`, which is unsupported in scalar contract expressions"
+            name
+            (c_type_to_c return_type)
+      | Some (_resolved_name, (_param_types, (TReference _ | TConstReference _ as return_type))) ->
+          fail
+            "function `%s` returns `%s`, which should be lowered before scalar contract expressions"
+            name
+            (c_type_to_c return_type)
+      | Some (resolved_name, (param_types, (TInt | TFloat | TDouble | TChar | TBool))) ->
+          let* args = lower_contract_call_args_with_params env resolved_name param_types args in
+          Ok (FuncCall (resolved_name, args))
+      | None ->
+          let* args = lower_contract_scalar_expr_list env args in
+          Ok (FuncCall (name, args)))
 
 and lower_contract_scalar_expr_list env exprs =
   match exprs with
@@ -2256,6 +2364,83 @@ and lower_contract_scalar_expr_list env exprs =
       let* expr = lower_contract_scalar_expr env expr in
       let* rest = lower_contract_scalar_expr_list env rest in
       Ok (expr :: rest)
+
+and lower_contract_opaque_ptr_expr env expr =
+  match expr with
+  | Var name when is_pointer_name env name ->
+      Ok (Var name)
+  | Var name ->
+      fail "scalar variable `%s` used where a pointer call argument was expected" name
+  | Int _ | CharLit _ | BoolLit _ as expr ->
+      Ok expr
+  | FloatLit _ | DoubleLit _ ->
+      fail "floating-point value `%s` used where a pointer call argument was expected" (expr_to_c expr)
+  | Conditional (cond, then_branch, else_branch) ->
+      let* cond = lower_contract_bexpr env cond in
+      let* then_branch = lower_contract_opaque_ptr_expr env then_branch in
+      let* else_branch = lower_contract_opaque_ptr_expr env else_branch in
+      Ok (Conditional (cond, then_branch, else_branch))
+  | Add (left, right) ->
+      (match expr_kind env left, expr_kind env right with
+      | Pointer_kind _, Scalar_kind ->
+          let* left = lower_contract_opaque_ptr_expr env left in
+          let* right = lower_contract_scalar_expr env right in
+          Ok (Add (left, right))
+      | Scalar_kind, Pointer_kind _ ->
+          let* left = lower_contract_scalar_expr env left in
+          let* right = lower_contract_opaque_ptr_expr env right in
+          Ok (Add (left, right))
+      | _ ->
+          fail "unsupported opaque pointer argument `%s` in contract call" (expr_to_c expr))
+  | FuncCall _ ->
+      fail "nested pointer-returning calls are unsupported in contract call arguments"
+  | AddrOf _ | Index _ | Deref _ | Field _ | Sub _ | Mul _ | Div _ | Mod _ ->
+      fail "unsupported pointer argument `%s` in contract call" (expr_to_c expr)
+
+and lower_contract_call_args env name args =
+  match lookup_call_sig env name (List.length args) with
+  | None ->
+      lower_contract_scalar_expr_list env args
+  | Some (resolved_name, (param_types, _return_type)) ->
+      lower_contract_call_args_with_params env resolved_name param_types args
+
+and lower_contract_call_args_with_params env name param_types args =
+  let rec loop param_types args =
+    match param_types, args with
+    | [], [] ->
+        Ok []
+    | TPointer pointee :: rest_params, arg :: rest_args ->
+        let* lowered_arg =
+          if env.memory_lowering_active then
+            let* block, offset, _pointee =
+              lower_contract_ptr_expr ~expected:pointee env arg
+            in
+            Ok [ block; offset ]
+          else
+            let* ptr = lower_contract_opaque_ptr_expr env arg in
+            Ok [ ptr ]
+        in
+        let* rest = loop rest_params rest_args in
+        Ok (lowered_arg @ rest)
+    | (TInt | TFloat | TDouble | TChar | TBool) :: rest_params, arg :: rest_args ->
+        let* arg = lower_contract_scalar_expr env arg in
+        let* rest = loop rest_params rest_args in
+        Ok (arg :: rest)
+    | TVoid :: _, _ ->
+        fail "void parameters are unsupported in scalar contract calls to `%s`" name
+    | TRecord _ :: _, _ ->
+        fail "record parameters are unsupported in scalar contract calls to `%s`" name
+    | TArray _ :: _, _ ->
+        fail "array parameters are unsupported in scalar contract calls to `%s`" name
+    | TReference _ :: _, _
+    | TConstReference _ :: _, _ ->
+        fail
+          "reference parameters should be lowered before scalar contract calls to `%s`"
+          name
+    | _, _ ->
+        fail "arity mismatch while lowering scalar contract call to `%s`" name
+  in
+  loop param_types args
 
 and lower_contract_ptr_expr ?expected env expr =
   match expr with
@@ -2291,6 +2476,8 @@ and lower_contract_ptr_expr ?expected env expr =
       fail "field addresses are unsupported inside contract expressions"
   | AddrOf _ ->
       fail "only address-of for globals and indexed locations is supported in contracts"
+  | Conditional _ ->
+      fail "conditional pointer expressions are unsupported inside contract expressions"
   | Index _ ->
       fail "indexed value used where a pointer contract expression was expected"
   | Add (left, right) ->
@@ -2314,13 +2501,13 @@ and lower_contract_ptr_expr ?expected env expr =
   | Sub _ | Mul _ | Div _ | Mod _ ->
       fail "unsupported pointer contract expression"
 
-let pointer_eq_formula left_block left_offset right_block right_offset =
+and pointer_eq_formula left_block left_offset right_block right_offset =
   mk_and
     [ int_eq left_block right_block
     ; int_eq left_offset right_offset
     ]
 
-let allocated_formula env block offset pointee_opt =
+and allocated_formula env block offset pointee_opt =
   let width =
     match pointee_opt with
     | Some (TInt | TFloat | TDouble | TChar | TBool as pointee) ->
@@ -2333,7 +2520,7 @@ let allocated_formula env block offset pointee_opt =
   in
   valid_access_formula env block offset width
 
-let is_live_formula env block =
+and is_live_formula env block =
   let global_cases =
     List.filter_map
       (fun global ->
@@ -2352,7 +2539,7 @@ let is_live_formula env block =
   in
   mk_or (global_cases @ alloc_cases)
 
-let lower_predicate env name args =
+and lower_predicate env name args =
   match name, args with
   | "heap_ok", [] ->
       Ok (Eq (Var heap_ok_name, Int 1))
@@ -2380,10 +2567,10 @@ let lower_predicate env name args =
   | _ ->
       fail "unknown ghost-heap predicate `%s`" name
 
-let is_ghost_heap_predicate name =
+and is_ghost_heap_predicate name =
   List.exists (String.equal name) ghost_heap_predicates
 
-let rec lower_contract_bexpr env bexpr =
+and lower_contract_bexpr env bexpr =
   match bexpr with
   | True -> Ok True
   | False -> Ok False

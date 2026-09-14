@@ -79,6 +79,7 @@ type expr =
   | Index of expr * expr
   | Deref of expr
   | Field of expr * string
+  | Conditional of bexpr * expr * expr
   | Add of expr * expr
   | Sub of expr * expr
   | Mul of expr * expr
@@ -86,7 +87,7 @@ type expr =
   | Mod of expr * expr
   | FuncCall of func_name * expr list
 
-type bexpr =
+and bexpr =
   | True
   | False
   | Forall of quantified_var list * bexpr
@@ -104,6 +105,7 @@ type stmt =
   | Skip
   | Block of stmt list
   | LocalDecl of global_def * expr option
+  | ExprStmt of expr
   | Assign of var * expr
   | Store of expr * expr
   | ArrayAssign of expr * expr * expr
@@ -520,9 +522,12 @@ let expr_prec_unary = 30
 
 let expr_prec_postfix = 40
 
+let expr_prec_conditional = 5
+
 let expr_prec_atom = 50
 
 let expr_precedence = function
+  | Conditional _ -> expr_prec_conditional
   | Add _ | Sub _ -> expr_prec_add
   | Mul _ | Div _ | Mod _ -> expr_prec_mul
   | AddrOf _ | Deref _ -> expr_prec_unary
@@ -531,6 +536,9 @@ let expr_precedence = function
 
 let parenthesize_if needed text =
   if needed then "(" ^ text ^ ")" else text
+
+let quantified_var_to_c quantified =
+  type_with_name_to_c quantified.quant_type quantified.quant_name
 
 let rec expr_to_c_with_prec min_prec expr =
   let rendered =
@@ -554,6 +562,12 @@ let rec expr_to_c_with_prec min_prec expr =
         expr_to_c_with_prec expr_prec_postfix base ^ "->" ^ field
     | Field (base, field) ->
         expr_to_c_with_prec expr_prec_postfix base ^ "." ^ field
+    | Conditional (cond, then_branch, else_branch) ->
+        bexpr_to_c cond
+        ^ " ? "
+        ^ expr_to_c_with_prec expr_prec_conditional then_branch
+        ^ " : "
+        ^ expr_to_c_with_prec expr_prec_conditional else_branch
     | Add (left, right) ->
         expr_to_c_with_prec expr_prec_add left
         ^ " + "
@@ -579,16 +593,10 @@ let rec expr_to_c_with_prec min_prec expr =
   in
   parenthesize_if (expr_precedence expr < min_prec) rendered
 
-let expr_to_c expr =
+and expr_to_c expr =
   expr_to_c_with_prec 0 expr
 
-let postfix_receiver_to_c expr =
-  expr_to_c_with_prec expr_prec_postfix expr
-
-let quantified_var_to_c quantified =
-  type_with_name_to_c quantified.quant_type quantified.quant_name
-
-let rec bexpr_to_c = function
+and bexpr_to_c = function
   | True -> "1"
   | False -> "0"
   | Forall (bindings, body) ->
@@ -605,6 +613,9 @@ let rec bexpr_to_c = function
   | Not p -> "(!" ^ bexpr_to_c p ^ ")"
   | And (p, q) -> "(" ^ bexpr_to_c p ^ " && " ^ bexpr_to_c q ^ ")"
   | Or (p, q) -> "(" ^ bexpr_to_c p ^ " || " ^ bexpr_to_c q ^ ")"
+
+let postfix_receiver_to_c expr =
+  expr_to_c_with_prec expr_prec_postfix expr
 
 let rec bexpr_to_annotation = function
   | True -> "1"
@@ -761,6 +772,8 @@ let rec stmt_to_c ~indent_level ~return_type = function
       (match init with
       | None -> decl ^ ";\n"
       | Some expr -> decl ^ " = " ^ expr_to_c expr ^ ";\n")
+  | ExprStmt expr ->
+      indent indent_level ^ expr_to_c expr ^ ";\n"
   | Assign (x, e) ->
       (match compound_rhs_suffix (Var x) e with
       | Some (op, rhs) ->
@@ -844,6 +857,8 @@ let rec vars_in_expr = function
       vars_in_expr base @ vars_in_expr index
   | Deref inner -> vars_in_expr inner
   | Field (base, _) -> vars_in_expr base
+  | Conditional (cond, then_branch, else_branch) ->
+      vars_in_bexpr cond @ vars_in_expr then_branch @ vars_in_expr else_branch
   | Add (left, right)
   | Sub (left, right)
   | Mul (left, right)
@@ -853,7 +868,7 @@ let rec vars_in_expr = function
   | FuncCall (_, args) ->
       List.concat_map vars_in_expr args
 
-let rec vars_in_bexpr = function
+and vars_in_bexpr = function
   | True | False -> []
   | Forall (bindings, body) ->
       let bound_names = List.map (fun binding -> binding.quant_name) bindings in
@@ -881,6 +896,8 @@ let rec vars_in_stmt = function
       (match init with
       | None -> []
       | Some expr -> vars_in_expr expr)
+  | ExprStmt expr ->
+      vars_in_expr expr
   | Assign (name, expr) ->
       name :: vars_in_expr expr
   | Store (ptr, value) ->
@@ -960,6 +977,9 @@ let helper_prototypes p =
         helpers_in_expr (helpers_in_expr acc base) index
     | Deref inner -> helpers_in_expr acc inner
     | Field (base, _) -> helpers_in_expr acc base
+    | Conditional (cond, then_branch, else_branch) ->
+        let acc = helpers_in_bexpr acc cond in
+        helpers_in_expr (helpers_in_expr acc then_branch) else_branch
     | Add (left, right)
     | Sub (left, right)
     | Mul (left, right)
@@ -976,8 +996,8 @@ let helper_prototypes p =
             acc
         in
         List.fold_left helpers_in_expr acc args
-  in
-  let rec helpers_in_bexpr acc = function
+
+  and helpers_in_bexpr acc = function
     | True | False -> acc
     | Forall (_, body) -> helpers_in_bexpr acc body
     | Eq (left, right)
@@ -991,8 +1011,8 @@ let helper_prototypes p =
     | And (left, right)
     | Or (left, right) ->
         helpers_in_bexpr (helpers_in_bexpr acc left) right
-  in
-  let rec helpers_in_stmt acc = function
+
+  and helpers_in_stmt acc = function
     | Skip -> acc
     | Block stmts ->
         List.fold_left helpers_in_stmt acc stmts
@@ -1000,6 +1020,7 @@ let helper_prototypes p =
         (match init with
         | None -> acc
         | Some expr -> helpers_in_expr acc expr)
+    | ExprStmt expr -> helpers_in_expr acc expr
     | Assign (_, expr) -> helpers_in_expr acc expr
     | Store (ptr, value) -> helpers_in_expr (helpers_in_expr acc ptr) value
     | ArrayAssign (base, index, value) ->
@@ -1047,7 +1068,7 @@ let program_to_c p =
     | prototypes -> prototypes ^ "\n"
   in
   let imports =
-    match p.imports with
+    match List.filter (fun imported_header -> imported_header.include_path <> "") p.imports with
     | [] -> "\n"
     | imports ->
         String.concat ""

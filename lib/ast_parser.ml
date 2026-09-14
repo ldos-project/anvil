@@ -21,6 +21,7 @@ let rec normalize_stmt = function
       normalize_stmt (Seq stmts)
   | LocalDecl _ ->
       failwith "internal error: unresolved local declaration reached normalization"
+  | ExprStmt _ as stmt -> stmt
   | If (c, t, e) -> If (c, normalize_stmt t, normalize_stmt e)
   | While (invariant, c, body) ->
       let body = normalize_stmt body in
@@ -245,6 +246,11 @@ let rec resolve_expr scopes = function
   | Deref expr -> Deref (resolve_expr scopes expr)
   | Field (base, field) ->
       Field (resolve_expr scopes base, field)
+  | Conditional (cond, then_branch, else_branch) ->
+      Conditional
+        ( resolve_bexpr scopes cond
+        , resolve_expr scopes then_branch
+        , resolve_expr scopes else_branch )
   | Add (left, right) ->
       Add (resolve_expr scopes left, resolve_expr scopes right)
   | Sub (left, right) ->
@@ -258,7 +264,7 @@ let rec resolve_expr scopes = function
   | FuncCall (name, args) ->
       FuncCall (name, List.map (resolve_expr scopes) args)
 
-let rec resolve_bexpr scopes = function
+and resolve_bexpr scopes = function
   | True -> True
   | False -> False
   | Forall (bindings, body) ->
@@ -331,6 +337,8 @@ let rec resolve_stmt scopes state stmt =
                 Ok (Assign (resolved_name, resolve_expr scopes expr))
         in
         Ok (init_stmt, state, scopes)
+  | ExprStmt expr ->
+      Ok (ExprStmt (resolve_expr scopes expr), state, scopes)
   | Assign (name, expr) ->
       Ok
         ( Assign (resolve_assign_target scopes name, resolve_expr scopes expr)
@@ -874,6 +882,49 @@ and resolve_method_sig env class_name method_name args =
            arg_addressable_types
            candidates)
 
+and resolve_any_method_sig env method_name args =
+  let arg_types = List.map (desugar_expr_type env) args in
+  let arg_addressable_types = List.map (desugar_addressable_type env) args in
+  let matches =
+    List.filter_map
+      (fun (signature : function_sig) ->
+        match parse_class_method_name signature.base_name with
+        | Some (class_name, candidate_method_name)
+          when String.equal candidate_method_name method_name ->
+            Option.map
+              (fun unknowns -> unknowns, class_name, signature)
+              (overload_signature_matches
+                 arg_types
+                 arg_addressable_types
+                 signature.param_types)
+        | Some _ | None ->
+            None)
+      env.function_sigs
+  in
+  match matches with
+  | [] -> None
+  | _ ->
+      let best_unknowns =
+        List.fold_left
+          (fun best (unknowns, _, _) -> min best unknowns)
+          max_int
+          matches
+      in
+      let best_matches =
+        List.filter
+          (fun (unknowns, _, _) -> unknowns = best_unknowns)
+          matches
+      in
+      (match best_matches with
+      | [ _, class_name, signature ] ->
+          Some (class_name, signature)
+      | _ ->
+          failwith
+            (Printf.sprintf
+               "ambiguous method overload for `%s(%s)`"
+               method_name
+               (format_overload_types arg_types)))
+
 and desugar_addressable_type env = function
   | Var name ->
       Option.map strip_reference_type (lookup_var_type env name)
@@ -890,6 +941,8 @@ and desugar_addressable_type env = function
       (match desugar_expr_type env expr with
       | Some (TPointer pointee) -> Some pointee
       | Some _ | None -> None)
+  | Conditional _ ->
+      None
   | Int _
   | FloatLit _
   | DoubleLit _
@@ -932,6 +985,14 @@ and desugar_expr_type env = function
       (match desugar_record_receiver_type env base with
       | Some record_name -> record_field_type env.records record_name field
       | None -> None)
+  | Conditional (_cond, then_branch, else_branch) ->
+      (match desugar_expr_type env then_branch, desugar_expr_type env else_branch with
+      | Some left_type, Some right_type when left_type = right_type ->
+          Some left_type
+      | Some left_type, Some right_type ->
+          if is_real_type left_type || is_real_type right_type then Some TDouble else Some TInt
+      | (Some _ | None), (Some _ | None) ->
+          None)
   | Add (left, right) ->
       (match desugar_expr_type env left, desugar_expr_type env right with
       | Some (TPointer pointee), Some right_type when is_integer_like_type right_type ->
@@ -964,25 +1025,23 @@ and desugar_expr_type env = function
       | Some (Method_dot, method_name), receiver :: _ ->
           (match desugar_expr_type env receiver with
           | Some (TRecord class_name) ->
-              (match lookup_class_info env class_name with
-              | Some class_info when List.mem method_name class_info.method_names ->
-                  Option.map
-                    (fun (signature : function_sig) -> signature.return_type)
-                    (resolve_method_sig env class_name method_name (List.tl args))
-              | Some _ | None -> None)
+              Option.map
+                (fun (signature : function_sig) -> signature.return_type)
+                (resolve_method_sig env class_name method_name (List.tl args))
           | Some _ | None ->
-              None)
+              Option.map
+                (fun (_class_name, signature) -> signature.return_type)
+                (resolve_any_method_sig env method_name (List.tl args)))
       | Some (Method_arrow, method_name), receiver :: _ ->
           (match desugar_expr_type env receiver with
           | Some (TPointer (TRecord class_name)) ->
-              (match lookup_class_info env class_name with
-              | Some class_info when List.mem method_name class_info.method_names ->
-                  Option.map
-                    (fun (signature : function_sig) -> signature.return_type)
-                    (resolve_method_sig env class_name method_name (List.tl args))
-              | Some _ | None -> None)
+              Option.map
+                (fun (signature : function_sig) -> signature.return_type)
+                (resolve_method_sig env class_name method_name (List.tl args))
           | Some _ | None ->
-              None)
+              Option.map
+                (fun (_class_name, signature) -> signature.return_type)
+                (resolve_any_method_sig env method_name (List.tl args)))
       | Some _, [] ->
           None
       | None, _ ->
@@ -1007,12 +1066,28 @@ let desugar_env_for_function (program : program) classes fn =
 
 let desugar_receiver_method_call env kind method_name receiver args =
   let receiver_type = desugar_expr_type env receiver in
-  let class_name, receiver_arg =
+  let class_name, receiver_arg, signature =
     match kind, receiver_type with
     | Method_dot, Some (TRecord class_name) ->
-        class_name, AddrOf receiver
+        (match resolve_method_sig env class_name method_name args with
+        | Some signature ->
+            class_name, AddrOf receiver, signature
+        | None ->
+            failwith
+              (Printf.sprintf
+                 "unknown method `%s` on class `%s`"
+                 method_name
+                 class_name))
     | Method_arrow, Some (TPointer (TRecord class_name)) ->
-        class_name, receiver
+        (match resolve_method_sig env class_name method_name args with
+        | Some signature ->
+            class_name, receiver, signature
+        | None ->
+            failwith
+              (Printf.sprintf
+                 "unknown method `%s` on class `%s`"
+                 method_name
+                 class_name))
     | Method_dot, Some other ->
         failwith
           (Printf.sprintf
@@ -1026,28 +1101,22 @@ let desugar_receiver_method_call env kind method_name receiver args =
              method_name
              (c_type_to_c other))
     | _, None ->
-        failwith
-          (Printf.sprintf
-             "could not infer the receiver type for method `%s`"
-             method_name)
+        (match resolve_any_method_sig env method_name args with
+        | Some (class_name, signature) ->
+            let receiver_arg =
+              match kind with
+              | Method_dot -> AddrOf receiver
+              | Method_arrow -> receiver
+            in
+            class_name, receiver_arg, signature
+        | None ->
+            failwith
+              (Printf.sprintf
+                 "could not infer the receiver type for method `%s`"
+                 method_name))
   in
-  match lookup_class_info env class_name with
-  | Some class_info when List.mem method_name class_info.method_names ->
-      (match resolve_method_sig env class_name method_name args with
-      | Some signature ->
-          FuncCall (signature.actual_name, receiver_arg :: args)
-      | None ->
-          failwith
-            (Printf.sprintf
-               "unknown method `%s` on class `%s`"
-               method_name
-               class_name))
-  | Some _ | None ->
-      failwith
-        (Printf.sprintf
-           "unknown method `%s` on class `%s`"
-           method_name
-           class_name)
+  let _ = class_name in
+  FuncCall (signature.actual_name, receiver_arg :: args)
 
 let rec desugar_method_expr env current_class = function
   | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ as expr ->
@@ -1067,6 +1136,11 @@ let rec desugar_method_expr env current_class = function
       Deref (desugar_method_expr env current_class expr)
   | Field (base, field) ->
       Field (desugar_method_expr env current_class base, field)
+  | Conditional (cond, then_branch, else_branch) ->
+      Conditional
+        ( desugar_method_bexpr env current_class cond
+        , desugar_method_expr env current_class then_branch
+        , desugar_method_expr env current_class else_branch )
   | Add (left, right) ->
       Add
         (desugar_method_expr env current_class left, desugar_method_expr env current_class right)
@@ -1109,7 +1183,7 @@ let rec desugar_method_expr env current_class = function
               | Some signature -> FuncCall (signature.actual_name, args)
               | None -> FuncCall (name, args))))
 
-let rec desugar_method_bexpr env current_class = function
+and desugar_method_bexpr env current_class = function
   | True -> True
   | False -> False
   | Forall (bindings, body) ->
@@ -1149,6 +1223,8 @@ let rec desugar_method_stmt env current_class = function
       Block (List.map (desugar_method_stmt env current_class) stmts)
   | LocalDecl _ ->
       failwith "internal error: unresolved local declaration reached class desugaring"
+  | ExprStmt expr ->
+      ExprStmt (desugar_method_expr env current_class expr)
   | Assign (name, rhs) ->
       let rhs = desugar_method_expr env current_class rhs in
       (match current_class with
@@ -1246,6 +1322,11 @@ let rec resolve_value_expr env = function
       Deref (resolve_value_expr env expr)
   | Field (base, field) ->
       Field (resolve_value_expr env base, field)
+  | Conditional (cond, then_branch, else_branch) ->
+      Conditional
+        ( resolve_value_bexpr env cond
+        , resolve_value_expr env then_branch
+        , resolve_value_expr env else_branch )
   | Add (left, right) ->
       Add (resolve_value_expr env left, resolve_value_expr env right)
   | Sub (left, right) ->
@@ -1260,7 +1341,7 @@ let rec resolve_value_expr env = function
       FuncCall
         (resolve_function_name env name, List.map (resolve_value_expr env) args)
 
-let rec resolve_value_bexpr env = function
+and resolve_value_bexpr env = function
   | True -> True
   | False -> False
   | Forall (bindings, body) ->
@@ -1290,6 +1371,8 @@ let rec resolve_value_stmt env = function
       Block (List.map (resolve_value_stmt env) stmts)
   | LocalDecl _ ->
       failwith "internal error: unresolved local declaration reached namespace resolution"
+  | ExprStmt expr ->
+      ExprStmt (resolve_value_expr env expr)
   | Assign (name, value) ->
       Assign (resolve_global_name env name, resolve_value_expr env value)
   | Store (ptr, value) ->
@@ -1360,7 +1443,7 @@ let resolve_program_values program =
 
 let rec attach_loop_invariants_stmt source_name invariants stmt =
   match stmt with
-  | Skip | LocalDecl _ | Assign _ | Store _ | ArrayAssign _ | FieldAssign _ | Assume _ | Assert _ | Free _ | Return _ ->
+  | Skip | LocalDecl _ | ExprStmt _ | Assign _ | Store _ | ArrayAssign _ | FieldAssign _ | Assume _ | Assert _ | Free _ | Return _ ->
       stmt, invariants
   | Block stmts ->
       let stmts, invariants =
@@ -1397,10 +1480,10 @@ let rec attach_loop_invariants_stmt source_name invariants stmt =
   | While (_, cond, body) ->
       (match invariants with
       | [] ->
-          failwith
-            (Printf.sprintf
-               "internal error: missing loop annotation slot while attaching invariants in %s"
-               source_name)
+          let body, invariants =
+            attach_loop_invariants_stmt source_name invariants body
+          in
+          While (None, cond, body), invariants
       | invariant :: invariants ->
           let invariant =
             Option.map (parse_loop_invariant source_name) invariant
@@ -1441,9 +1524,13 @@ let parse_program
     ?(base_dir = Sys.getcwd ())
     ?(source_name = "<input>")
     source =
+  let source = Preprocess.preprocess source in
   let lexbuf = Lexing.from_string source in
   try
-    let imports = Header_contracts.load_imports ~base_dir source in
+    let imports =
+      Header_contracts.load_imports ~base_dir source
+      |> Builtin_stubs.add_imports
+    in
     let defined_contracts =
       Header_contracts.load_defined_contracts ~source_path:source_name source
     in
@@ -1453,21 +1540,27 @@ let parse_program
       |> attach_loop_invariants source_name loop_invariants
     in
     let program = resolve_program_type_names program in
+    let* () =
+      if strict then
+        Strict_syntax.validate_source_program program
+      else
+        Ok ()
+    in
     let program = { program with imports } in
     let imports, defined_contracts, program =
       mangle_overloaded_program_names imports defined_contracts program
-    in
-    let* () =
-      if strict then
-        Strict_syntax.validate_program { program with imports }
-      else
-        Ok ()
     in
     let defined_contracts = build_defined_contract_env source_name defined_contracts in
     let* program = resolve_program_locals program in
     let program = resolve_program_type_names program in
     let program = desugar_classes program in
     let program = resolve_program_values program in
+    let* () =
+      if strict then
+        Strict_syntax.validate_program { program with imports }
+      else
+        Ok ()
+    in
     Ok
       (normalize_program
          {

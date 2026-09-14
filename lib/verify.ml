@@ -185,6 +185,10 @@ let rec expr_type env = function
       Option.value (lookup_var_type env name) ~default:TInt
   | AddrOf _ | Index _ | Deref _ | Field _ ->
       failwith "memory expressions should be lowered before verification"
+  | Conditional (_cond, then_branch, else_branch) ->
+      let then_type = expr_type env then_branch in
+      let else_type = expr_type env else_branch in
+      if is_real_type then_type || is_real_type else_type then TDouble else then_type
   | Add (left, right)
   | Sub (left, right)
   | Mul (left, right)
@@ -209,6 +213,9 @@ let rec expr_to_ir env = function
   | Var name -> Ir.Var name
   | AddrOf _ | Index _ | Deref _ | Field _ ->
       failwith "memory expressions should be lowered before verification"
+  | Conditional (cond, then_branch, else_branch) ->
+      Ir.Ite
+        (bexpr_to_ir env cond, expr_to_ir env then_branch, expr_to_ir env else_branch)
   | Add (left, right) -> Ir.Add [expr_to_ir env left; expr_to_ir env right]
   | Sub (left, right) -> Ir.Sub (expr_to_ir env left, expr_to_ir env right)
   | Mul (left, right) -> Ir.Mul [expr_to_ir env left; expr_to_ir env right]
@@ -216,7 +223,7 @@ let rec expr_to_ir env = function
   | Mod (left, right) -> Ir.Mod (expr_to_ir env left, expr_to_ir env right)
   | FuncCall (name, args) -> Ir.App (name, List.map (expr_to_ir env) args)
 
-let rec bexpr_to_ir env = function
+and bexpr_to_ir env = function
   | True -> Ir.True
   | False -> Ir.False
   | Forall (bindings, body) ->
@@ -491,19 +498,100 @@ let theorem_assumptions_for_contract
 let defined_function_names (program : program) =
   List.map (fun (fn : function_def) -> fn.name) (program.functions @ [ program.main ])
 
+let called_function_names (program : program) =
+  let rec calls_in_expr acc = function
+    | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ | Var _ ->
+        acc
+    | AddrOf inner -> calls_in_expr acc inner
+    | Index (base, index) ->
+        calls_in_expr (calls_in_expr acc base) index
+    | Deref inner -> calls_in_expr acc inner
+    | Field (base, _) -> calls_in_expr acc base
+    | Conditional (cond, then_branch, else_branch) ->
+        calls_in_expr
+          (calls_in_expr (calls_in_bexpr acc cond) then_branch)
+          else_branch
+    | Add (left, right)
+    | Sub (left, right)
+    | Mul (left, right)
+    | Div (left, right)
+    | Mod (left, right) ->
+        calls_in_expr (calls_in_expr acc left) right
+    | FuncCall (name, args) ->
+        List.fold_left calls_in_expr (String_set.add name acc) args
+  and calls_in_bexpr acc = function
+    | True | False -> acc
+    | Forall (_, body) -> calls_in_bexpr acc body
+    | Eq (left, right)
+    | Neq (left, right)
+    | Lt (left, right)
+    | Le (left, right)
+    | Gt (left, right)
+    | Ge (left, right) ->
+        calls_in_expr (calls_in_expr acc left) right
+    | Not inner -> calls_in_bexpr acc inner
+    | And (left, right)
+    | Or (left, right) ->
+        calls_in_bexpr (calls_in_bexpr acc left) right
+  and calls_in_stmt acc = function
+    | Skip -> acc
+    | Block stmts
+    | Seq stmts ->
+        List.fold_left calls_in_stmt acc stmts
+    | LocalDecl (_, init) ->
+        (match init with
+        | None -> acc
+        | Some expr -> calls_in_expr acc expr)
+    | ExprStmt expr -> calls_in_expr acc expr
+    | Assign (_, expr) -> calls_in_expr acc expr
+    | Store (ptr, value) ->
+        calls_in_expr (calls_in_expr acc ptr) value
+    | ArrayAssign (base, index, value) ->
+        calls_in_expr (calls_in_expr (calls_in_expr acc base) index) value
+    | FieldAssign (base, _, value) ->
+        calls_in_expr (calls_in_expr acc base) value
+    | If (cond, then_branch, else_branch) ->
+        calls_in_stmt (calls_in_stmt (calls_in_bexpr acc cond) then_branch) else_branch
+    | While (invariant, cond, body) ->
+        let acc =
+          match invariant with
+          | None -> acc
+          | Some invariant -> calls_in_bexpr acc invariant
+        in
+        calls_in_stmt (calls_in_bexpr acc cond) body
+    | Assume cond
+    | Assert (_, cond) ->
+        calls_in_bexpr acc cond
+    | Free ptr -> calls_in_expr acc ptr
+    | Return None -> acc
+    | Return (Some value) -> calls_in_expr acc value
+  in
+  List.fold_left
+    (fun acc (fn : function_def) -> calls_in_stmt acc fn.body)
+    String_set.empty
+    (program.functions @ [ program.main ])
+
 let contract_summary_for_program (program : program) =
   let* contract_env =
     Instrument.build_contract_env program.imports (program.functions @ [ program.main ])
   in
   let malloc_sites = (Memory_safety.contract_env_of_program program).malloc_sites in
   let defined_names = defined_function_names program in
-  let rec summary_loop acc = function
+  let called_names = called_function_names program in
+  let rec summary_loop acc (entries : (string * contracted_function) list) =
+    match entries with
     | [] -> Ok (List.rev acc)
     | (_name, contract_fn) :: rest ->
-        let* formulas =
-          instantiate_summary_clauses program malloc_sites contract_fn
-        in
-        summary_loop (List.rev_append formulas acc) rest
+        if
+          not (List.exists (String.equal contract_fn.name) defined_names)
+          && not (String_set.mem contract_fn.name called_names)
+        then
+          summary_loop acc rest
+        else
+          let* formulas =
+            instantiate_summary_clauses program malloc_sites contract_fn
+          in
+          summary_loop (List.rev_append formulas acc) rest
   in
   let rec imported_theorem_loop acc = function
     | [] -> Ok (List.rev acc)
@@ -513,6 +601,8 @@ let contract_summary_for_program (program : program) =
             (fun (fn : imported_function) ->
               not (List.exists (String.equal fn.name) defined_names))
             header.functions
+          |> List.filter (fun (fn : imported_function) ->
+                 String_set.mem fn.name called_names)
         in
         let rec loop_functions acc = function
           | [] ->
@@ -548,6 +638,7 @@ let rec wp_stmt env state stmt post =
   | Skip -> post, state
   | Block _ | LocalDecl _ ->
       failwith "unresolved local syntax reached weakest-precondition generation"
+  | ExprStmt _ -> post, state
   | Assign (name, expr) ->
       Ir.subst_formula name (expr_to_ir env expr) post, state
   | Store _ | ArrayAssign _ | FieldAssign _ | Free _ ->
@@ -731,6 +822,13 @@ let rec vars_in_ir_expr acc = function
   | Ir.Div (left, right)
   | Ir.Mod (left, right) ->
       vars_in_ir_expr (vars_in_ir_expr acc left) right
+  | Ir.Ite (cond, then_branch, else_branch) ->
+      vars_in_ir_expr
+        (vars_in_ir_expr
+           (Ir.collect_vars cond
+            |> List.fold_left (fun acc name -> String_set.add name acc) acc)
+           then_branch)
+        else_branch
   | Ir.App (_, args) ->
       List.fold_left vars_in_ir_expr acc args
 
@@ -743,6 +841,16 @@ let rec apps_in_ir_expr acc = function
   | Ir.Div (left, right)
   | Ir.Mod (left, right) ->
       apps_in_ir_expr (apps_in_ir_expr acc left) right
+  | Ir.Ite (cond, then_branch, else_branch) ->
+      apps_in_ir_expr
+        (apps_in_ir_expr
+           (Ir.collect_apps cond
+            |> List.fold_left
+                 (fun acc (name, expr) ->
+                   String_map.add (Ir.int_expr_to_pretty expr) (name, expr) acc)
+                 acc)
+           then_branch)
+        else_branch
   | Ir.App (name, args) as expr ->
       let acc =
         List.fold_left apps_in_ir_expr acc args
@@ -943,6 +1051,10 @@ let rec apps_in_expr env acc = function
       apps_in_expr env acc inner
   | Field (base, _) ->
       apps_in_expr env acc base
+  | Conditional (cond, then_branch, else_branch) ->
+      apps_in_expr env
+        (apps_in_expr env (apps_in_bexpr env acc cond) then_branch)
+        else_branch
   | Add (left, right)
   | Sub (left, right)
   | Mul (left, right)
@@ -956,7 +1068,7 @@ let rec apps_in_expr env acc = function
       let ir_expr = expr_to_ir env expr in
       String_map.add (Ir.int_expr_to_pretty ir_expr) (name, ir_expr) acc
 
-let rec apps_in_bexpr env acc = function
+and apps_in_bexpr env acc = function
   | True | False -> acc
   | Forall (bindings, body) ->
       apps_in_bexpr (extend_expr_env_with_quantified_bindings env bindings) acc body
@@ -980,6 +1092,7 @@ let rec apps_in_stmt env acc = function
       (match init with
       | None -> acc
       | Some expr -> apps_in_expr env acc expr)
+  | ExprStmt expr -> apps_in_expr env acc expr
   | Assign (_, expr) -> apps_in_expr env acc expr
   | Store (ptr, value) -> apps_in_expr env (apps_in_expr env acc ptr) value
   | ArrayAssign (base, index, value) ->
@@ -1073,6 +1186,11 @@ let rec symbolic_expr env = function
       | None -> Ir.Var name)
   | AddrOf _ | Index _ | Deref _ | Field _ ->
       failwith "memory expressions should be lowered before replay"
+  | Conditional (cond, then_branch, else_branch) ->
+      Ir.Ite
+        ( symbolic_bexpr env cond
+        , symbolic_expr env then_branch
+        , symbolic_expr env else_branch )
   | Add (left, right) ->
       Ir.Add [ symbolic_expr env left; symbolic_expr env right ]
   | Sub (left, right) ->
@@ -1086,7 +1204,7 @@ let rec symbolic_expr env = function
   | FuncCall (name, args) ->
       Ir.App (name, List.map (symbolic_expr env) args)
 
-let rec symbolic_bexpr env = function
+and symbolic_bexpr env = function
   | True -> Ir.True
   | False -> Ir.False
   | Forall (bindings, body) ->
@@ -1162,13 +1280,18 @@ let rec eval_int_expr model = function
       | Some _left, Some 0 -> None
       | Some left, Some right -> Some (left mod right)
       | _ -> None)
+  | Ir.Ite (cond, then_branch, else_branch) ->
+      (match eval_formula model cond with
+      | Some true -> eval_int_expr model then_branch
+      | Some false -> eval_int_expr model else_branch
+      | None -> None)
   | Ir.App _ as expr ->
       let label = Ir.int_expr_to_pretty expr in
       (match String_map.find_opt label model with
       | None -> None
       | Some value -> int_of_model_value value)
 
-let rec eval_formula model = function
+and eval_formula model = function
   | Ir.True -> Some true
   | Ir.False -> Some false
   | Ir.Not inner ->
@@ -1237,6 +1360,7 @@ let rec replay_stmt model env fuel stmt =
     | Skip -> Replay_continue env
     | Block _ | LocalDecl _ ->
         Replay_blocked
+    | ExprStmt _ -> Replay_continue env
     | Assign (name, expr) ->
         Replay_continue (bind_env env name (symbolic_expr env expr))
     | Store _ | ArrayAssign _ | FieldAssign _ | Free _ ->

@@ -35,11 +35,15 @@ rule read = parse
   | "/*"                { block_comment lexbuf; read lexbuf }
   | "//"                { skip_line lexbuf; read lexbuf }
   | "int"               { INT_KW }
+  | "int64_t"           { INT64_KW }
   | "float"             { FLOAT_KW }
   | "double"            { DOUBLE_KW }
   | "char"              { CHAR_KW }
   | "bool"              { BOOL_KW }
   | "const"             { CONST_KW }
+  | "auto"              { AUTO_KW }
+  | "sizeof"            { SIZEOF_KW }
+  | "SCORING_FN"        { SCORING_FN_KW }
   | "struct"            { STRUCT_KW }
   | "class"             { CLASS_KW }
   | "namespace"         { NAMESPACE_KW }
@@ -51,6 +55,7 @@ rule read = parse
   | "if"                { IF_KW }
   | "else"              { ELSE_KW }
   | "while"             { WHILE_KW }
+  | "for"               { FOR_KW }
   | "return"            { RETURN_KW }
   | "free"              { FREE_KW }
   | "&&"                { AND }
@@ -58,6 +63,8 @@ rule read = parse
   | "==>"               { IMPLIES }
   | "::"                { SCOPE }
   | "->"                { ARROW }
+  | "++"                { PLUSPLUS }
+  | "--"                { MINUSMINUS }
   | "+="                { PLUSEQ }
   | "-="                { MINUSEQ }
   | "=="                { EQEQ }
@@ -86,6 +93,8 @@ rule read = parse
   | ','                 { COMMA }
   | '&'                 { AMP }
   | '.'                 { DOT }
+  | '?'                 { QUESTION }
+  | ':'                 { COLON }
   | '+'                 { PLUS }
   | '-'                 { MINUS }
   | '*'                 { STAR }
