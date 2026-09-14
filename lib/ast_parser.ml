@@ -44,7 +44,6 @@ let normalize_program p =
   {
     p with
     functions = List.map normalize_function p.functions;
-    main = normalize_function p.main;
   }
 
 let equal_program p q = normalize_program p = normalize_program q
@@ -416,8 +415,7 @@ let resolve_program_locals program =
     in
     loop [] program.functions
   in
-  let* main = resolve_function_locals program.main in
-  Ok { program with functions; main }
+  Ok { program with functions }
 
 let has_mangled_namespace name =
   contains_substring ~sub:namespace_separator name
@@ -546,11 +544,6 @@ let resolve_program_type_names program =
     records = List.map (resolve_field_type_names records) program.records;
     globals = List.map (resolve_global_type_names records) program.globals;
     functions = List.map (resolve_function_type_names records) program.functions;
-    main =
-      {
-        (resolve_function_type_names records program.main) with
-        name = program.main.name;
-      };
   }
 
 let dispatch_param_types name params =
@@ -722,7 +715,7 @@ let build_function_sigs (program : program) =
           param_types = dispatch_param_types fn.name fn.params;
           return_type = fn.return_type;
         })
-      (program.functions @ [ program.main ])
+      program.functions
   in
   imported @ locals
 
@@ -1207,7 +1200,6 @@ let desugar_classes program =
   {
     program with
     functions = List.map (desugar_class_function program classes) program.functions;
-    main = desugar_class_function program classes program.main;
   }
 
 type value_resolve_env = {
@@ -1349,13 +1341,11 @@ let resolve_program_values program =
   let function_names =
     imported_function_names
     @ List.map (fun fn -> fn.name) program.functions
-    @ [ program.main.name ]
   in
   {
     program with
     functions =
       List.map (resolve_function_values global_names function_names) program.functions;
-    main = resolve_function_values global_names function_names program.main;
   }
 
 let rec attach_loop_invariants_stmt source_name invariants stmt =
@@ -1425,11 +1415,8 @@ let attach_loop_invariants source_name invariants program =
       ([], invariants)
       program.functions
   in
-  let main, invariants =
-    attach_loop_invariants_function source_name invariants program.main
-  in
   match invariants with
-  | [] -> { program with functions = List.rev functions_rev; main }
+  | [] -> { program with functions = List.rev functions_rev }
   | _ :: _ ->
       failwith
         (Printf.sprintf
@@ -1475,7 +1462,6 @@ let parse_program
            imports;
            functions =
              List.map (attach_contract source_name defined_contracts) program.functions;
-           main = attach_contract source_name defined_contracts program.main;
          })
   with
   | Header_contracts.Error msg ->

@@ -231,5 +231,4 @@ let validate_program (program : program) =
       program.records
   in
   let* () = validate_list validate_global program.globals in
-  let* () = validate_list validate_function program.functions in
-  validate_function program.main
+  validate_list validate_function program.functions

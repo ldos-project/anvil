@@ -166,7 +166,6 @@ type top_item =
   | Top_record of record_def
   | Top_global of global_def
   | Top_function of function_def
-  | Top_main of function_def
 
 type top_group_builder = string list -> top_item list
 
@@ -185,33 +184,22 @@ let build_class class_name members =
   :: List.rev methods_rev
 
 let build_program items =
-  let rec loop records_rev globals_rev functions_rev main = function
+  let rec loop records_rev globals_rev functions_rev = function
     | [] ->
-        let main =
-          match main with
-          | Some main -> main
-          | None -> fail "missing `main` definition"
-        in
         {
           imports = [];
           records = List.rev records_rev;
           globals = List.rev globals_rev;
           functions = List.rev functions_rev;
-          main;
         }
     | Top_record record :: rest ->
-        loop (record :: records_rev) globals_rev functions_rev main rest
+        loop (record :: records_rev) globals_rev functions_rev rest
     | Top_global global :: rest ->
-        loop records_rev (global :: globals_rev) functions_rev main rest
+        loop records_rev (global :: globals_rev) functions_rev rest
     | Top_function fn :: rest ->
-        loop records_rev globals_rev (fn :: functions_rev) main rest
-    | Top_main fn :: rest ->
-        (match main with
-        | Some _ -> fail "multiple `main` definitions"
-        | None ->
-            loop records_rev globals_rev functions_rev (Some fn) rest)
+        loop records_rev globals_rev (fn :: functions_rev) rest
   in
-  loop [] [] [] None items
+  loop [] [] [] items
 %}
 
 %token <int> INT_LIT
@@ -219,7 +207,7 @@ let build_program items =
 %token <string> DOUBLE_LIT
 %token <int> CHAR_LIT
 %token <string> IDENT
-%token INT_KW FLOAT_KW DOUBLE_KW CHAR_KW BOOL_KW CONST_KW MAIN_KW VOID_KW STRUCT_KW CLASS_KW NAMESPACE_KW IF_KW ELSE_KW WHILE_KW RETURN_KW FREE_KW TRUE_KW FALSE_KW FORALL_KW
+%token INT_KW FLOAT_KW DOUBLE_KW CHAR_KW BOOL_KW CONST_KW VOID_KW STRUCT_KW CLASS_KW NAMESPACE_KW IF_KW ELSE_KW WHILE_KW RETURN_KW FREE_KW TRUE_KW FALSE_KW FORALL_KW
 %token LPAREN RPAREN LBRACE RBRACE LBRACKET RBRACKET SEMI COMMA AMP DOT ARROW SCOPE
 %token PLUS MINUS STAR SLASH PERCENT
 %token ASSIGN PLUSEQ MINUSEQ EQEQ NEQ LT LE GT GE NOT AND OR IMPLIES
@@ -489,20 +477,6 @@ top_group:
         fun namespace ->
           let class_name = qualify_decl_name namespace name in
           build_class class_name (List.map (fun build -> build class_name) members)
-      }
-  | INT_KW MAIN_KW LPAREN VOID_KW RPAREN body = block
-      {
-        fun namespace ->
-          if namespace <> [] then
-            fail "`main` must be declared at global scope";
-          [ Top_main (make_function ~name:"main" ~return_type:TInt ~params:[] body) ]
-      }
-  | INT_KW MAIN_KW LPAREN RPAREN body = block
-      {
-        fun namespace ->
-          if namespace <> [] then
-            fail "`main` must be declared at global scope";
-          [ Top_main (make_function ~name:"main" ~return_type:TInt ~params:[] body) ]
       }
   | base = nonvoid_type stars = pointer_stars name = IDENT LPAREN params = param_list RPAREN SEMI
       {

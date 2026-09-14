@@ -250,7 +250,7 @@ and uses_memory_bexpr = function
 let count_malloc_program program =
   List.fold_left
     (fun acc fn -> acc + count_malloc_stmt fn.body)
-    (count_malloc_stmt program.main.body)
+    0
     program.functions
 
 let contract_mentions_memory_predicates contract =
@@ -338,7 +338,7 @@ let build_reference_function_params (program : program) =
     List.map
       (fun (fn : function_def) ->
         fn.name, List.map (fun param -> param.param_type) fn.params)
-      (program.functions @ [ program.main ])
+      program.functions
   in
   imported @ locals
 
@@ -677,8 +677,7 @@ let lower_references_program (program : program) =
         loop_functions (fn :: acc) rest
   in
   let* functions = loop_functions [] program.functions in
-  let* main = lower_reference_function function_params program.main in
-  Ok { program with imports; functions; main }
+  Ok { program with imports; functions }
 
 let locals_need_memory locals =
   List.exists
@@ -689,9 +688,9 @@ let locals_need_memory locals =
 let uses_memory_program program =
   pointer_globals program.globals <> []
   || List.exists (fun global -> is_array_type global.global_type) program.globals
-  || List.exists (fun fn -> locals_need_memory fn.locals) (program.main :: program.functions)
-  || List.exists uses_memory_stmt (program.main.body :: List.map (fun fn -> fn.body) program.functions)
-  || List.exists function_mentions_memory_contract (program.main :: program.functions)
+  || List.exists (fun fn -> locals_need_memory fn.locals) program.functions
+  || List.exists (fun fn -> uses_memory_stmt fn.body) program.functions
+  || List.exists function_mentions_memory_contract program.functions
   || List.exists
        (fun (imported_header : header_import) ->
          List.exists imported_function_mentions_memory_contract imported_header.functions)
@@ -1004,7 +1003,7 @@ let build_function_sigs (program : program) =
     List.map
       (fun (fn : function_def) ->
         fn.name, (List.map (fun param -> param.param_type) fn.params, fn.return_type))
-      (program.functions @ [ program.main ])
+      program.functions
   in
   imported @ locals
 
@@ -2148,14 +2147,12 @@ let lower_program (program : program) =
   in
   let* functions = lower_functions program state malloc_sites program.functions in
   let functions, state = functions in
-  let main_env = function_env_of_program program program.main malloc_sites in
-  let* main, state = lower_function main_env state program.main in
   let pointer_names =
     List.concat_map
       (fun fn ->
         pointer_bindings_of_defs fn.locals
         |> List.map fst)
-      (program.main :: program.functions)
+      program.functions
   in
   let extra_globals =
     pointer_shadow_globals (List.sort_uniq String.compare (List.map fst (pointer_globals_of_program program) @ pointer_names))
@@ -2170,7 +2167,6 @@ let lower_program (program : program) =
         @ List.rev state.temp_globals_rev
         @ List.map (fun name -> { global_type = TInt; global_name = name }) extra_globals;
       functions;
-      main;
     }
 
 let contract_env_of_program (program : program) =

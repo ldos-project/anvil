@@ -139,7 +139,7 @@ let build_function_sigs (program : program) =
         ( fn.name
         , ( List.map (fun param -> lower_reference_type param.param_type) fn.params
           , lower_reference_type fn.return_type ) ))
-      (program.functions @ [ program.main ])
+      program.functions
   in
   imported @ locals
 
@@ -489,11 +489,11 @@ let theorem_assumptions_for_contract
            clauses)
 
 let defined_function_names (program : program) =
-  List.map (fun (fn : function_def) -> fn.name) (program.functions @ [ program.main ])
+  List.map (fun (fn : function_def) -> fn.name) program.functions
 
 let contract_summary_for_program (program : program) =
   let* contract_env =
-    Instrument.build_contract_env program.imports (program.functions @ [ program.main ])
+    Instrument.build_contract_env program.imports program.functions
   in
   let malloc_sites = (Memory_safety.contract_env_of_program program).malloc_sites in
   let defined_names = defined_function_names program in
@@ -540,7 +540,7 @@ let contract_summary_for_program (program : program) =
   in
   let* assumptions = summary_loop [] contract_env in
   let* imported_theorem_assumptions = imported_theorem_loop [] program.imports in
-  let* theorem_vcs = theorem_loop [] (program.functions @ [ program.main ]) in
+  let* theorem_vcs = theorem_loop [] program.functions in
   Ok (assumptions @ imported_theorem_assumptions, theorem_vcs)
 
 let rec wp_stmt env state stmt post =
@@ -606,7 +606,7 @@ let vcs_for_function (program : program) (fn : function_def) =
     (make_vc (fn.name ^ ": entry") fn.name Entry precondition :: state.vcs_rev)
 
 let vcs_for_program (program : program) =
-  List.concat_map (vcs_for_function program) (program.functions @ [program.main])
+  List.concat_map (vcs_for_function program) program.functions
 
 let with_temp_file prefix suffix f =
   let path = Filename.temp_file prefix suffix in
@@ -750,8 +750,7 @@ let rec apps_in_ir_expr acc = function
       String_map.add (Ir.int_expr_to_pretty expr) (name, expr) acc
 
 let find_function_in_program (program : program) name =
-  if String.equal program.main.name name then Some program.main
-  else List.find_opt (fun (fn : function_def) -> String.equal fn.name name) program.functions
+  List.find_opt (fun (fn : function_def) -> String.equal fn.name name) program.functions
 
 let lookup_param_type (fn : function_def) name =
   List.find_map

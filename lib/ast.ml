@@ -136,7 +136,6 @@ type program = {
   records : record_def list;
   globals : global_def list;
   functions : function_def list;
-  main : function_def;
 }
 
 let namespace_separator = "__ns__"
@@ -1029,7 +1028,7 @@ let helper_prototypes p =
   let helper_names =
     List.fold_left
       (fun acc fn -> helpers_in_stmt acc fn.body)
-      (helpers_in_stmt [] p.main.body)
+      []
       p.functions
   in
   let helper_names =
@@ -1086,5 +1085,4 @@ let program_to_c p =
     | functions ->
         String.concat "\n" (List.map function_def_to_c functions) ^ "\n"
   in
-  let main = function_def_to_c p.main in
-  header ^ helpers ^ imports ^ records ^ globals ^ prototypes ^ functions ^ main
+  header ^ helpers ^ imports ^ records ^ globals ^ prototypes ^ functions

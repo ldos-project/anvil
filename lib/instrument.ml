@@ -494,7 +494,7 @@ let make_state (program : program) =
     List.concat_map
       (fun (fn : function_def) ->
         List.map (fun local -> local.global_name) fn.locals)
-      (program.main :: program.functions)
+      program.functions
   in
   {
     next_temp = 0;
@@ -503,7 +503,6 @@ let make_state (program : program) =
       global_names program.globals
       @ local_names
       @ function_names
-      @ [ program.main.name ]
       @ imported_names;
   }
 
@@ -1236,7 +1235,7 @@ let rec instrument_functions_for_program program memory_env env state functions 
 
 let instrument_program program =
   let* env =
-    build_contract_env program.imports (program.functions @ [ program.main ])
+    build_contract_env program.imports program.functions
   in
   let* program = Memory_safety.lower_references_program program in
   let memory_env = Memory_safety.contract_env_of_program program in
@@ -1248,15 +1247,11 @@ let instrument_program program =
       (make_state program)
       program.functions
   in
-  let* main, state =
-    instrument_function program memory_env env state program.main
-  in
   let instrumented =
     {
       program with
       globals = program.globals @ List.rev state.fresh_globals_rev;
       functions;
-      main;
     }
   in
   Memory_safety.lower_program instrumented
