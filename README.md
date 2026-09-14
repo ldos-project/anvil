@@ -5,6 +5,7 @@ Anvil is a small verifier for a restricted C / C++-flavored language, meant to b
 It can:
 
 - parse, resolve, and pretty-print a restricted core language plus a small C++-style frontend fragment;
+- preprocess simple object-like `#define` directives before parsing;
 - instrument contracts into explicit `Assume` and `Assert` checks;
 - generate verification conditions with weakest preconditions;
 - ask Z3 for a counterexample to the negated VC; and
@@ -115,6 +116,19 @@ Read from standard input:
 cat program.c | ./anvil --verify
 ```
 
+## Frontend Sugar
+
+Before verification, Anvil lowers a small amount of frontend sugar into its core language. In particular, it currently supports:
+
+- ternary expressions `cond ? then_expr : else_expr`;
+- `for (...)` loops lowered into `while`;
+- top-level lambda bindings of the form `auto name = [](...) -> T { ... };`;
+- `const` locals and parameters;
+- brace-list call arguments such as `f(x, {a, b})`, lowered to `f(x, a, b)`; and
+- simple object-like preprocessor defines such as `#define LIMIT 8`.
+
+The preprocessor is intentionally small: it only handles line-oriented object-like defines, not full macro expansion.
+
 ## What Verification Does
 
 When you run:
@@ -125,20 +139,31 @@ When you run:
 
 Anvil:
 
-1. parses the input program;
-2. resolves namespaces, classes, methods, references, and overloads into the core representation;
-3. loads function contracts from local `#include "file.h"` headers;
-4. loads the same contract syntax from implemented functions in the input source file, whether it is named `.c` or `.cpp`;
-5. attaches any `@Invariant` comments to the following `while` loop;
-6. instruments contracts into `Assume` and `Assert` statements;
-7. lowers pointer, array, and shadow-memory obligations plus ghost-heap predicates into scalar ghost state when needed;
-8. computes weakest preconditions for each function;
-9. asks Z3 whether the negation of each VC is satisfiable; and
-10. reports success or a counterexample.
+1. preprocesses simple object-like `#define` directives;
+2. parses the input program;
+3. resolves namespaces, classes, methods, references, and overloads into the core representation;
+4. loads function contracts from local `#include "file.h"` headers;
+5. loads the same contract syntax from implemented functions in the input source file, whether it is named `.c` or `.cpp`;
+6. injects builtin signatures/contracts for common `std::` and Vulcan listener APIs;
+7. attaches any `@Invariant` comments to the following `while` loop;
+8. instruments contracts into `Assume` and `Assert` statements;
+9. lowers pointer, array, and shadow-memory obligations plus ghost-heap predicates into scalar ghost state when needed;
+10. computes weakest preconditions for each function;
+11. asks Z3 whether the negation of each VC is satisfiable; and
+12. reports success or a counterexample.
 
 If Z3 cannot find a model for the negated VC, the program is reported as verified.
 
 If Z3 can find a model, Anvil prints the failing verification condition and the model values it found.
+
+If you want those Vulcan listener assumptions to live in an explicit import rather than only in Anvil's builtin table, the repo also ships [stubs/vulcan_listeners.hpp](/Users/ehcamp-admin/anvil/stubs/vulcan_listeners.hpp).
+That header uses Anvil's lowered helper names and can be imported with:
+
+```cpp
+#include "stubs/vulcan_listeners.hpp"
+```
+
+When such a local header is present, Anvil prefers the imported stub signatures/contracts over the matching builtin listener entries.
 
 ## Highlighting An Evolvable Scoring Hook
 
@@ -162,12 +187,18 @@ In strict mode, Anvil rejects:
 - address-of, dereference, and `->` syntax; and
 - `free`.
 
+Plain records and `.` field access remain allowed.
+
 Strict mode also requires variables to be explicitly initialized:
 
 - local declarations like `int x;` are rejected; and
 - top-level globals are rejected, since the current surface syntax does not support initialized global declarations.
 
-This is a syntactic restriction layer on top of ordinary parsing and verification.
+Strict mode is checked on the lowered frontend core after namespace/class/method desugaring, so method sugar such as `obj.method(...)` is rejected once it lowers to hidden receiver-passing code.
+Anvil also keeps a small early source-side strict check for declaration-time initialization, because local-initializer information is erased by lowering.
+
+Builtin library stubs injected by Anvil itself are not treated as user-written strict-mode violations.
+
 For example, both of these are valid entry points:
 
 ```bash
