@@ -191,6 +191,7 @@ let build_program items =
           records = List.rev records_rev;
           globals = List.rev globals_rev;
           functions = List.rev functions_rev;
+          global_invariants = [];
         }
     | Top_record record :: rest ->
         loop (record :: records_rev) globals_rev functions_rev rest

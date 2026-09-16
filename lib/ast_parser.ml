@@ -1431,8 +1431,15 @@ let parse_program
   let lexbuf = Lexing.from_string source in
   try
     let imports = Header_contracts.load_imports ~base_dir source in
-    let defined_contracts =
+    let defined_contracts_result =
       Header_contracts.load_defined_contracts ~source_path:source_name source
+    in
+    let defined_contracts = defined_contracts_result.functions in
+    let global_invariants =
+      List.concat_map
+        (fun (imported_header : header_import) -> imported_header.class_invariants)
+        imports
+      @ defined_contracts_result.class_invariants
     in
     let loop_invariants = Loop_annotations.load ~source_path:source_name source in
     let program =
@@ -1440,7 +1447,7 @@ let parse_program
       |> attach_loop_invariants source_name loop_invariants
     in
     let program = resolve_program_type_names program in
-    let program = { program with imports } in
+    let program = { program with imports; global_invariants } in
     let imports, defined_contracts, program =
       mangle_overloaded_program_names imports defined_contracts program
     in

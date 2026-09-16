@@ -95,6 +95,7 @@ let gen_program size =
                   contract = None;
                   body = Seq [ body; Return (Some (Int 0)) ];
                 } ];
+            global_invariants = [];
           }))
 
 let assert_header_import_roundtrip () =

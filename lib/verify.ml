@@ -493,7 +493,8 @@ let defined_function_names (program : program) =
 
 let contract_summary_for_program (program : program) =
   let* contract_env =
-    Instrument.build_contract_env program.imports program.functions
+    Instrument.build_contract_env ~global_invariants:program.global_invariants
+      program.imports program.functions
   in
   let malloc_sites = (Memory_safety.contract_env_of_program program).malloc_sites in
   let defined_names = defined_function_names program in

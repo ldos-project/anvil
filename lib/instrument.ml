@@ -559,7 +559,34 @@ let merge_env ~preferred ~fallback =
             (fun (name, _) -> Option.is_none (assoc_opt name preferred))
             fallback)
 
+(* A `@ClassInvariant` declared in this translation unit is conjoined into both
+   the @Require and @Guarantee of every contracted function DEFINED (with a body)
+   in this file -- the same manual thread-it-through-every-contract pattern this
+   codebase already uses by hand (e.g. the `initialized` flag), just automated.
+   It is intentionally NOT assumed pre-construction: an invariant that should not
+   hold before some setup function runs must be written guarded by that function's
+   own state flag, e.g. `initialized == 1 ==> (...)`, so the obligation is vacuous
+   before setup and load-bearing after. *)
+let apply_global_invariants global_invariants (functions : function_def list) env =
+  if global_invariants = [] then env
+  else
+    let local_names = List.map (fun (fn : function_def) -> fn.name) functions in
+    List.map
+      (fun (name, (contract_fn : contracted_function)) ->
+        if List.mem name local_names then
+          ( name
+          , { contract_fn with
+              contract =
+                { contract_fn.contract with
+                  require = contract_fn.contract.require @ global_invariants;
+                  guarantee = contract_fn.contract.guarantee @ global_invariants;
+                };
+            } )
+        else (name, contract_fn))
+      env
+
 let build_contract_env
+    ?(global_invariants = [])
     (imports : header_import list)
     (functions : function_def list) =
   let ( let* ) result f =
@@ -569,7 +596,8 @@ let build_contract_env
   in
   let* imported = build_unique_env ~kind:"imported" (flatten_imports imports) in
   let* local = build_unique_env ~kind:"local" (flatten_local_contracts functions) in
-  merge_env ~preferred:local ~fallback:imported
+  let* merged = merge_env ~preferred:local ~fallback:imported in
+  Ok (apply_global_invariants global_invariants functions merged)
 
 type state = {
   next_temp : int;
@@ -1330,7 +1358,8 @@ let rec instrument_functions_for_program program memory_env env state functions 
 
 let instrument_program program =
   let* env =
-    build_contract_env program.imports program.functions
+    build_contract_env ~global_invariants:program.global_invariants program.imports
+      program.functions
   in
   let* program = Memory_safety.lower_references_program program in
   let memory_env = Memory_safety.contract_env_of_program program in

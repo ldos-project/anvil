@@ -66,6 +66,7 @@ type imported_function = contracted_function
 type header_import = {
   include_path : string;
   functions : imported_function list;
+  class_invariants : string list;
 }
 
 type expr =
@@ -136,6 +137,7 @@ type program = {
   records : record_def list;
   globals : global_def list;
   functions : function_def list;
+  global_invariants : string list;
 }
 
 let namespace_separator = "__ns__"
