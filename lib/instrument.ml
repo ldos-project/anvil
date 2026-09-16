@@ -458,11 +458,106 @@ let build_unique_env ~kind (functions : contracted_function list) =
   in
   loop [] functions
 
-let merge_env ~preferred ~fallback =
+(* A function can carry a contract in an included header AND another next to its
+   own definition. Both are promises about the same function, so the effective
+   contract is their CONJUNCTION -- every clause from both sides has to hold.
+
+   The previous behavior was to keep the definition-side contract and silently
+   discard the header's, with no diagnostic, so a header @Guarantee could vanish
+   simply because the .c file also annotated the function.
+
+   Clause lists are concatenated and de-duplicated, so a local contract that
+   restates a header clause verbatim does not generate the same obligation twice.
+   Contradictory clauses are deliberately not rejected here: the conjunction is
+   just unsatisfiable, and a contradictory @Guarantee pair then fails
+   verification with a counterexample, which is the honest outcome. (Note the
+   asymmetry: a contradictory @Require pair instead makes the precondition
+   unsatisfiable, so the function itself verifies vacuously and the failure
+   surfaces at its call sites.) *)
+let dedup_clauses clauses =
+  let rec loop seen acc = function
+    | [] -> List.rev acc
+    | clause :: rest ->
+        if List.exists (String.equal clause) seen then loop seen acc rest
+        else loop (clause :: seen) (clause :: acc) rest
+  in
+  loop [] [] clauses
+
+let merge_ghosts ~preferred ~fallback =
   preferred
   @ List.filter
-      (fun (name, _) -> Option.is_none (assoc_opt name preferred))
+      (fun (ghost : ghost_binding) ->
+        not
+          (List.exists
+             (fun (kept : ghost_binding) ->
+               String.equal kept.ghost_name ghost.ghost_name)
+             preferred))
       fallback
+
+(* Contract clauses are strings naming the parameters, so merging two contracts
+   is only meaningful when both describe the same signature under the same
+   parameter names -- otherwise a header clause would reference an identifier
+   that does not exist on the definition side. *)
+let same_contract_shape
+    (left : contracted_function)
+    (right : contracted_function) =
+  let param_shape (params : param list) =
+    List.map
+      (fun (param : param) ->
+        (lower_reference_type param.param_type, param.param_name))
+      params
+  in
+  left.return_type = right.return_type
+  && param_shape left.params = param_shape right.params
+
+let merge_contracts
+    ~(preferred : contracted_function)
+    ~(fallback : contracted_function) =
+  if not (same_contract_shape preferred fallback) then
+    Error
+      (Printf.sprintf
+         "cannot merge contracts for function `%s`: the header contract and the \
+          definition contract declare different signatures"
+         preferred.name)
+  else
+    Ok
+      { preferred with
+        contract =
+          { ghosts =
+              merge_ghosts
+                ~preferred:preferred.contract.ghosts
+                ~fallback:fallback.contract.ghosts
+          ; require =
+              dedup_clauses (preferred.contract.require @ fallback.contract.require)
+          ; guarantee =
+              dedup_clauses
+                (preferred.contract.guarantee @ fallback.contract.guarantee)
+          ; theorem =
+              dedup_clauses (preferred.contract.theorem @ fallback.contract.theorem)
+          ; safety =
+              dedup_clauses (preferred.contract.safety @ fallback.contract.safety)
+          };
+      }
+
+let merge_env ~preferred ~fallback =
+  let rec loop acc = function
+    | [] -> Ok (List.rev acc)
+    | (name, preferred_fn) :: rest ->
+        (match assoc_opt name fallback with
+        | None -> loop ((name, preferred_fn) :: acc) rest
+        | Some fallback_fn ->
+            (match merge_contracts ~preferred:preferred_fn ~fallback:fallback_fn with
+            | Error _ as error -> error
+            | Ok merged -> loop ((name, merged) :: acc) rest))
+  in
+  match loop [] preferred with
+  | Error _ as error -> error
+  | Ok merged ->
+      Ok
+        (merged
+        @ List.filter
+            (fun (name, _) -> Option.is_none (assoc_opt name preferred))
+            fallback)
 
 let build_contract_env
     (imports : header_import list)
@@ -474,7 +569,7 @@ let build_contract_env
   in
   let* imported = build_unique_env ~kind:"imported" (flatten_imports imports) in
   let* local = build_unique_env ~kind:"local" (flatten_local_contracts functions) in
-  Ok (merge_env ~preferred:local ~fallback:imported)
+  merge_env ~preferred:local ~fallback:imported
 
 type state = {
   next_temp : int;
