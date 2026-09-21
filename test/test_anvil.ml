@@ -787,7 +787,7 @@ let assert_loop_invariant_roundtrip_and_verification () =
   | Error e -> failwith ("Loop invariant parse failed: " ^ e)
   | Ok program ->
       (match (find_main program).body with
-      | Seq [ Assume _
+      | Seq [ If (Not (Ge (Var "x", Int 0)), Return (Some (Int 0)), Skip)
             ; While (Some (Ge (Var "x", Int 0)), Gt (Var "x", Int 0), _)
             ; Assert (_, Eq (Var "x", Int 0))
             ; Return (Some (Int 0))

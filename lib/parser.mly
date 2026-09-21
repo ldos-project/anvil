@@ -32,17 +32,6 @@ let is_zero_float text =
   try float_of_string stripped = 0.0 with
   | Failure _ -> false
 
-let expect_zero_literal = function
-  | Int 0
-  | CharLit 0
-  | BoolLit false ->
-      ()
-  | FloatLit text
-  | DoubleLit text when is_zero_float text ->
-      ()
-  | expr ->
-      fail "expected a zero literal in assumption form, got `%s`" (expr_to_c expr)
-
 let expect_abort name =
   if String.equal name "abort" then ()
   else fail "expected `abort()`, got `%s()`" name
@@ -133,13 +122,11 @@ let call_stmt name args =
 
 let stmt_of_if_without_else cond then_branch =
   match cond, then_branch with
-  | Not premise, Block [ Return None ] ->
-      Assume premise
-  | Not premise, Block [ Return (Some value) ] ->
-      expect_zero_literal value;
-      Assume premise
+  (* `if (!P) { abort(); }` is surface syntax for `assert(P)`. *)
   | Not premise, Block [ Assert (Source_assert, False) ] ->
       Assert (Source_assert, premise)
+  (* Everything else, incl. `if (!P) return v;`, is a real branch: lower to
+     `If` so the return is checked against the @Guarantee, not assumed away. *)
   | _ ->
       If (cond, then_branch, Skip)
 
