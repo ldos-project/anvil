@@ -298,10 +298,10 @@ let validate_loop_control (program : program) =
   in
   validate_list
     (fun fn -> walk ~in_loop:false fn.body)
-    (program.main :: program.functions)
+    program.functions
 
 let validate_no_recursion (program : program) =
-  let defined = program.main :: program.functions in
+  let defined = program.functions in
   let callees_of fn =
     let names = calls_in_stmt [] fn.body in
     List.filter
@@ -341,5 +341,4 @@ let validate_program (program : program) =
       program.records
   in
   let* () = validate_list validate_global program.globals in
-  let* () = validate_list validate_function program.functions in
-  validate_function program.main
+  validate_list validate_function program.functions

@@ -32,17 +32,6 @@ let is_zero_float text =
   try float_of_string stripped = 0.0 with
   | Failure _ -> false
 
-let expect_zero_literal = function
-  | Int 0
-  | CharLit 0
-  | BoolLit false ->
-      ()
-  | FloatLit text
-  | DoubleLit text when is_zero_float text ->
-      ()
-  | expr ->
-      fail "expected a zero literal in assumption form, got `%s`" (expr_to_c expr)
-
 let expect_abort name =
   if String.equal name "abort" then ()
   else fail "expected `abort()`, got `%s()`" name
@@ -133,13 +122,11 @@ let call_stmt name args =
 
 let stmt_of_if_without_else cond then_branch =
   match cond, then_branch with
-  | Not premise, Block [ Return None ] ->
-      Assume premise
-  | Not premise, Block [ Return (Some value) ] ->
-      expect_zero_literal value;
-      Assume premise
+  (* `if (!P) { abort(); }` is surface syntax for `assert(P)`. *)
   | Not premise, Block [ Assert (Source_assert, False) ] ->
       Assert (Source_assert, premise)
+  (* Everything else, incl. `if (!P) return v;`, is a real branch: lower to
+     `If` so the return is checked against the @Guarantee, not assumed away. *)
   | _ ->
       If (cond, then_branch, Skip)
 
@@ -166,7 +153,6 @@ type top_item =
   | Top_record of record_def
   | Top_global of global_def
   | Top_function of function_def
-  | Top_main of function_def
 
 type top_group_builder = string list -> top_item list
 
@@ -411,43 +397,39 @@ let build_evolve_program items =
     make_function ~name:"main" ~return_type:TInt ~params:[]
       (Block (effects @ [ Return (Some (Int 0)) ]))
   in
-  let functions =
+  let score_fns =
     match score_fns with
     | [] ->
         [ make_function ~name:"score_fn" ~return_type:TDouble ~params:[]
             (Block [ Return (Some (DoubleLit "0.0")) ]) ]
     | _ -> score_fns
   in
-  { imports = []; records = []; globals = []; functions; main }
+  {
+    imports = [];
+    records = [];
+    globals = [];
+    functions = score_fns @ [ main ];
+    global_invariants = [];
+  }
 
 let build_program items =
-  let rec loop records_rev globals_rev functions_rev main = function
+  let rec loop records_rev globals_rev functions_rev = function
     | [] ->
-        let main =
-          match main with
-          | Some main -> main
-          | None -> fail "missing `main` definition"
-        in
         {
           imports = [];
           records = List.rev records_rev;
           globals = List.rev globals_rev;
           functions = List.rev functions_rev;
-          main;
+          global_invariants = [];
         }
     | Top_record record :: rest ->
-        loop (record :: records_rev) globals_rev functions_rev main rest
+        loop (record :: records_rev) globals_rev functions_rev rest
     | Top_global global :: rest ->
-        loop records_rev (global :: globals_rev) functions_rev main rest
+        loop records_rev (global :: globals_rev) functions_rev rest
     | Top_function fn :: rest ->
-        loop records_rev globals_rev (fn :: functions_rev) main rest
-    | Top_main fn :: rest ->
-        (match main with
-        | Some _ -> fail "multiple `main` definitions"
-        | None ->
-            loop records_rev globals_rev functions_rev (Some fn) rest)
+        loop records_rev globals_rev (fn :: functions_rev) rest
   in
-  loop [] [] [] None items
+  loop [] [] [] items
 %}
 
 %token <int> INT_LIT
@@ -455,7 +437,7 @@ let build_program items =
 %token <string> DOUBLE_LIT
 %token <int> CHAR_LIT
 %token <string> IDENT
-%token INT_KW FLOAT_KW DOUBLE_KW CHAR_KW BOOL_KW CONST_KW MAIN_KW VOID_KW STRUCT_KW CLASS_KW NAMESPACE_KW IF_KW ELSE_KW WHILE_KW RETURN_KW FREE_KW TRUE_KW FALSE_KW FORALL_KW
+%token INT_KW FLOAT_KW DOUBLE_KW CHAR_KW BOOL_KW CONST_KW VOID_KW STRUCT_KW CLASS_KW NAMESPACE_KW IF_KW ELSE_KW WHILE_KW RETURN_KW FREE_KW TRUE_KW FALSE_KW FORALL_KW
 %token AUTO_KW STATIC_CAST_KW FOR_KW BREAK_KW CONTINUE_KW
 %token <string> STDFUNCTION_TYPE
 %token LPAREN RPAREN LBRACE RBRACE LBRACKET RBRACKET SEMI COMMA AMP DOT ARROW SCOPE
@@ -729,20 +711,6 @@ top_group:
         fun namespace ->
           let class_name = qualify_decl_name namespace name in
           build_class class_name (List.map (fun build -> build class_name) members)
-      }
-  | INT_KW MAIN_KW LPAREN VOID_KW RPAREN body = block
-      {
-        fun namespace ->
-          if namespace <> [] then
-            fail "`main` must be declared at global scope";
-          [ Top_main (make_function ~name:"main" ~return_type:TInt ~params:[] body) ]
-      }
-  | INT_KW MAIN_KW LPAREN RPAREN body = block
-      {
-        fun namespace ->
-          if namespace <> [] then
-            fail "`main` must be declared at global scope";
-          [ Top_main (make_function ~name:"main" ~return_type:TInt ~params:[] body) ]
       }
   | base = nonvoid_type stars = pointer_stars name = IDENT LPAREN params = param_list RPAREN SEMI
       {

@@ -6,6 +6,16 @@ open Ast_parser
 
 module G = Base_quickcheck.Generator
 
+(* main is an ordinary function now; look it up by name in [functions]. *)
+let find_main (program : program) =
+  List.find_exn program.functions ~f:(fun (fn : function_def) ->
+      String.equal fn.name "main")
+
+(* main is an ordinary function, so tests about helpers skip it. *)
+let helper_functions (program : program) =
+  List.filter program.functions ~f:(fun (fn : function_def) ->
+      not (String.equal fn.name "main"))
+
 let gen_var = G.of_list ["x"; "y"; "z"; "w"; "t"]
 
 let rec gen_expr size =
@@ -81,16 +91,16 @@ let gen_program size =
             globals =
               List.map globals ~f:(fun global_name ->
                   { global_type = TInt; global_name });
-            functions = [];
-            main =
-              {
-                name = "main";
-                return_type = TInt;
-                params = [];
-                locals = [];
-                contract = None;
-                body = Seq [ body; Return (Some (Int 0)) ];
-              };
+            functions =
+              [ {
+                  name = "main";
+                  return_type = TInt;
+                  params = [];
+                  locals = [];
+                  contract = None;
+                  body = Seq [ body; Return (Some (Int 0)) ];
+                } ];
+            global_invariants = [];
           }))
 
 let assert_header_import_roundtrip () =
@@ -169,7 +179,7 @@ let assert_contract_instrumentation () =
                          ~prefix:"__anvil_contract_result_"))
               then
                 failwith "Expected an instrumentation temp global";
-              (match instrumented.main.body with
+              (match (find_main instrumented).body with
               | Seq [ Assert (_, Ge (Int 1, Int 0))
                     ; Assign (tmp, FuncCall ("inc", [ Int 1 ]))
                     ; Assume (Ge (Var result_var, Int 1))
@@ -203,7 +213,7 @@ let assert_local_contract_roundtrip_and_instrumentation () =
   match parse_program source with
   | Error e -> failwith ("Local contract parse failed: " ^ e)
   | Ok program ->
-      (match program.functions with
+      (match helper_functions program with
       | [ { contract = Some _; _ } ] -> ()
       | _ -> failwith "Expected a contracted local helper function");
       (match parse_program (program_to_c program) with
@@ -214,7 +224,7 @@ let assert_local_contract_roundtrip_and_instrumentation () =
       (match Instrument.instrument_program program with
       | Error e -> failwith ("Local contract instrumentation failed: " ^ e)
       | Ok instrumented ->
-          (match instrumented.functions with
+          (match helper_functions instrumented with
           | [ { body =
                   Seq [ Assume (Ge (Var "y", Int 0))
                       ; Assert (_, Ge (Var "y", Int 0))
@@ -226,7 +236,7 @@ let assert_local_contract_roundtrip_and_instrumentation () =
           | _ ->
               failwith
                 ("Unexpected instrumented helper body:\n" ^ program_to_c instrumented));
-          match instrumented.main.body with
+          match (find_main instrumented).body with
           | Seq [ Assert (_, Ge (Int 1, Int 0))
                 ; Assign (tmp, FuncCall ("inc", [ Int 1 ]))
                 ; Assume (Gt (Var result_var, Int 1))
@@ -278,7 +288,7 @@ let assert_named_contract_roundtrip_and_verification () =
   match parse_program source with
   | Error e -> failwith ("Named-contract parse failed: " ^ e)
   | Ok program ->
-      (match program.functions with
+      (match helper_functions program with
       | [ helper; unrelated ] ->
           (match helper.contract, unrelated.contract with
           | Some helper_contract, Some unrelated_contract ->
@@ -418,7 +428,7 @@ let assert_multiple_contract_guarded_cases_verify () =
   match parse_program source with
   | Error e -> failwith ("Multiple-contract parse failed: " ^ e)
   | Ok program ->
-      (match program.functions with
+      (match helper_functions program with
       | [ fn ] ->
           (match fn.contract with
           | Some contract ->
@@ -511,7 +521,7 @@ let assert_ghost_contract_roundtrip_and_verification () =
   match parse_program source with
   | Error e -> failwith ("Ghost-contract parse failed: " ^ e)
   | Ok program ->
-      (match program.functions with
+      (match helper_functions program with
       | [ fn ] ->
           (match fn.contract with
           | Some contract ->
@@ -781,8 +791,8 @@ let assert_loop_invariant_roundtrip_and_verification () =
   match parse_program source with
   | Error e -> failwith ("Loop invariant parse failed: " ^ e)
   | Ok program ->
-      (match program.main.body with
-      | Seq [ Assume _
+      (match (find_main program).body with
+      | Seq [ If (Not (Ge (Var "x", Int 0)), Return (Some (Int 0)), Skip)
             ; While (Some (Ge (Var "x", Int 0)), Gt (Var "x", Int 0), _)
             ; Assert (_, Eq (Var "x", Int 0))
             ; Return (Some (Int 0))
@@ -906,7 +916,7 @@ let assert_local_scope_shadowing_roundtrip_and_verification () =
   match parse_program source with
   | Error e -> failwith ("Local scope parse failed: " ^ e)
   | Ok program ->
-      if List.length program.main.locals <> 2 then
+      if List.length (find_main program).locals <> 2 then
         failwith "Expected two resolved locals from scoped shadowing";
       (match parse_program (program_to_c program) with
       | Error e -> failwith ("Local scope roundtrip failed: " ^ e)

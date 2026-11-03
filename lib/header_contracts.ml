@@ -152,6 +152,7 @@ type pending_contract = {
   guarantee : string list;
   theorem : string list;
   safety : string list;
+  class_invariant : string list;
 }
 
 type contract_fragment = {
@@ -177,6 +178,7 @@ let empty_pending_contract = {
   guarantee = [];
   theorem = [];
   safety = [];
+  class_invariant = [];
 }
 
 let pending_has_clauses contract =
@@ -270,6 +272,11 @@ let append_contract_field line_number header_path (contract : pending_contract) 
       { contract with safety = contract.safety @ [ value ] }
   | _ -> contract
 
+let append_class_invariant line_number header_path (contract : pending_contract) value =
+  if value = "" then
+    fail "empty @ClassInvariant in %s at line %d" header_path line_number;
+  { contract with class_invariant = contract.class_invariant @ [ value ] }
+
 let append_ghost_binding line_number header_path (contract : pending_contract) value =
   let ghost = parse_ghost_binding line_number header_path value in
   if has_duplicate_ghost ghost.ghost_name contract.ghosts then
@@ -291,6 +298,10 @@ let consume_comment_line (contract : pending_contract) ~header_path ~line_number
   | Some value ->
       set_contract_target line_number header_path contract value
   | None ->
+      (match take_tag_value ~tag:"@ClassInvariant" trimmed with
+      | Some value ->
+          append_class_invariant line_number header_path contract value
+      | None ->
       (match take_tag_value ~tag:"@Ghost" trimmed with
       | Some value ->
           append_ghost_binding line_number header_path contract value
@@ -310,7 +321,7 @@ let consume_comment_line (contract : pending_contract) ~header_path ~line_number
                       (match take_tag_value ~tag:"@Safety" trimmed with
                       | Some value ->
                           append_contract_field line_number header_path contract "@Safety" value
-                      | None -> contract)))))
+                      | None -> contract))))))
 
 let consume_comment_text (contract : pending_contract) ~header_path ~line_number text =
   String.split_on_char '\n' text
@@ -501,6 +512,7 @@ let parse_header_file ~base_dir include_path =
   let signatures_rev = ref [] in
   let legacy_contracts = ref [] in
   let named_contracts = ref [] in
+  let class_invariants_rev = ref [] in
   let pending_legacy = ref empty_contract in
   let in_block_comment = ref false in
   let block_start_line = ref 1 in
@@ -511,6 +523,8 @@ let parse_header_file ~base_dir include_path =
     let fragment =
       consume_comment_text empty_pending_contract ~header_path:include_path ~line_number text
     in
+    if fragment.class_invariant <> [] then
+      class_invariants_rev := List.rev_append fragment.class_invariant !class_invariants_rev;
     match materialize_contract_block ~header_path:include_path ~line_number fragment with
     | None -> ()
     | Some { target_name = Some name; contract } ->
@@ -620,6 +634,7 @@ let parse_header_file ~base_dir include_path =
         !signatures_rev
         !legacy_contracts
         !named_contracts;
+    class_invariants = List.rev !class_invariants_rev;
   }
 
 let load_imports ~base_dir source =
@@ -652,10 +667,16 @@ type definition_scan_mode =
       buffer : Buffer.t;
     }
 
+type defined_contracts_result = {
+  functions : contracted_function list;
+  class_invariants : string list;
+}
+
 let load_defined_contracts ~source_path source =
   let signatures_rev = ref [] in
   let legacy_contracts = ref [] in
   let named_contracts = ref [] in
+  let class_invariants_rev = ref [] in
   let pending_legacy = ref empty_contract in
   let brace_depth = ref 0 in
   let line_number = ref 1 in
@@ -665,6 +686,8 @@ let load_defined_contracts ~source_path source =
     let fragment =
       consume_comment_text empty_pending_contract ~header_path:source_path ~line_number text
     in
+    if fragment.class_invariant <> [] then
+      class_invariants_rev := List.rev_append fragment.class_invariant !class_invariants_rev;
     match materialize_contract_block ~header_path:source_path ~line_number fragment with
     | None -> ()
     | Some { target_name = Some name; contract } ->
@@ -720,11 +743,15 @@ let load_defined_contracts ~source_path source =
           finish_comment capture start_line buffer
       | Block_comment _ ->
           fail "unterminated block comment in %s" source_path);
-      finalize_contracts
-        ~source_path
-        !signatures_rev
-        !legacy_contracts
-        !named_contracts
+      {
+        functions =
+          finalize_contracts
+            ~source_path
+            !signatures_rev
+            !legacy_contracts
+            !named_contracts;
+        class_invariants = List.rev !class_invariants_rev;
+      }
     end else
       match mode with
       | Code ->
