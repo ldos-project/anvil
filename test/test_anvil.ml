@@ -36,9 +36,11 @@ let rec gen_expr size =
       ; G.map2 smaller smaller ~f:(fun a b -> Mod (a, b))
       ; G.bind (G.int_uniform_inclusive 0 3) ~f:(fun length ->
           G.map (G.list_with_length smaller ~length) ~f:(fun args -> FuncCall ("f", args)))
+      ; G.map3 (gen_bexpr (size / 2)) smaller smaller ~f:(fun c a b ->
+          Conditional (c, a, b))
       ]
 
-let rec gen_bexpr size =
+and gen_bexpr size =
   if size <= 0 then
     G.union
       [ G.return True
@@ -77,6 +79,8 @@ let rec gen_stmt size =
       ; G.map2 smaller_b smaller ~f:(fun c b -> While (None, c, b))
       ; G.map smaller_b ~f:(fun c -> Assume c)
       ; G.map smaller_b ~f:(fun c -> Assert (Source_assert, c))
+      ; G.map (G.list_with_length (gen_expr (size / 2)) ~length:2) ~f:(fun args ->
+          ExprStmt (FuncCall ("f", args)))
       ]
 
 let gen_program size =
@@ -2057,6 +2061,212 @@ let assert_strict_mode_rejects_memory_syntax () =
       if not (String.is_substring e ~substring:"forbids array type `int[2]`") then
         failwith ("Unexpected strict-mode memory error: " ^ e)
 
+let expect_verified label source =
+  match parse_program source with
+  | Error e -> failwith (label ^ ": parse failed: " ^ e)
+  | Ok program ->
+      (match Verify.verify_program program with
+      | Error e -> failwith (label ^ ": verification failed: " ^ e)
+      | Ok Verify.Verified -> ()
+      | Ok outcome ->
+          failwith (label ^ ": expected Verified, got:\n" ^ Verify.format_outcome outcome))
+
+let expect_counterexample label source =
+  match parse_program source with
+  | Error e -> failwith (label ^ ": parse failed: " ^ e)
+  | Ok program ->
+      (match Verify.verify_program program with
+      | Error e -> failwith (label ^ ": verification failed: " ^ e)
+      | Ok (Verify.Counterexample { location; _ }) -> location
+      | Ok outcome ->
+          failwith
+            (label ^ ": expected a counterexample, got:\n" ^ Verify.format_outcome outcome))
+
+let expect_verification_error label ~substrings source =
+  match parse_program source with
+  | Error e -> failwith (label ^ ": parse failed: " ^ e)
+  | Ok program ->
+      (match Verify.verify_program program with
+      | Error e ->
+          List.iter substrings ~f:(fun substring ->
+              if not (String.is_substring e ~substring) then
+                failwith (label ^ ": error is missing `" ^ substring ^ "`: " ^ e))
+      | Ok outcome ->
+          failwith
+            (label ^ ": expected a verification error, got:\n" ^ Verify.format_outcome outcome))
+
+let abs_source guarantee =
+  "/* @Guarantee " ^ guarantee ^ " */\n"
+  ^ "int abs_val(int x) {\n"
+  ^ "  return x < 0 ? -x : x;\n"
+  ^ "}\n"
+
+let assert_conditional_roundtrip_and_verification () =
+  let source = abs_source "result >= 0" in
+  (match parse_program source with
+  | Error e -> failwith ("Conditional parse failed: " ^ e)
+  | Ok program ->
+      (match program.functions with
+      | [ { body = Return (Some (Conditional (Lt (Var "x", Int 0), Sub (Int 0, Var "x"), Var "x"))); _ } ] ->
+          ()
+      | _ -> failwith ("Unexpected conditional parse:\n" ^ program_to_c program));
+      (match parse_program (program_to_c program) with
+      | Error e -> failwith ("Conditional roundtrip failed: " ^ e)
+      | Ok roundtripped ->
+          if not (equal_program program roundtripped) then
+            failwith "Conditional roundtrip mismatch"));
+  expect_verified "abs_val" source;
+  ignore (expect_counterexample "abs_val > 0" (abs_source "result > 0") : string option)
+
+(* A call in one branch of `?:` only runs when that branch is taken, so its
+   @Require must only be checked there. *)
+let assert_conditional_guards_branch_obligations () =
+  let source guard =
+    "/* @Require d > 0\n"
+    ^ " * @Guarantee result >= 0 */\n"
+    ^ "int half(int d) {\n"
+    ^ "  return d / 2;\n"
+    ^ "}\n\n"
+    ^ "/* @Guarantee result >= 0 */\n"
+    ^ "int f(int y) {\n"
+    ^ "  return " ^ guard ^ " ? half(y) : 0;\n"
+    ^ "}\n"
+  in
+  expect_verified "guarded half" (source "y > 0");
+  match expect_counterexample "unguarded half" (source "y >= 0") with
+  | Some location when String.is_substring location ~substring:"`half`'s @Require" -> ()
+  | location ->
+      failwith
+        ("Expected half's @Require to fail, got location: "
+        ^ Option.value location ~default:"<none>")
+
+(* Conditions and values share C's precedence ladder: `!x == 1` is
+   `(!x) == 1`, comparisons are values, and `(a + b) > c` parses. *)
+let assert_c_expression_precedence () =
+  expect_verified "!x == 1"
+    ("#include <stdlib.h>\n"
+    ^ "int x;\n"
+    ^ "int main(void) {\n"
+    ^ "  x = 5;\n"
+    ^ "  if (!x == 1) { abort(); }\n"
+    ^ "  return 0;\n"
+    ^ "}\n");
+  expect_verified "comparison as value"
+    ("/* @Guarantee result == 0 || result == 1 */\n"
+    ^ "int is_greater(int a, int b, int c) {\n"
+    ^ "  return (a + b) > c;\n"
+    ^ "}\n")
+
+(* A call statement to a header function still asserts its @Require. *)
+let assert_statement_call_checks_contract () =
+  let header_path = Stdlib.Filename.temp_file "anvil_stmt_call" ".h" in
+  Fun.protect
+    ~finally:(fun () ->
+      try Stdlib.Sys.remove header_path with
+      | _ -> ())
+    (fun () ->
+      Out_channel.write_all header_path
+        ~data:"/* @Require v > 0\n * @Guarantee result == v */\nint check(int v);\n";
+      let base_dir = Stdlib.Filename.dirname header_path in
+      let with_header value =
+        "#include \"" ^ Stdlib.Filename.basename header_path ^ "\"\n\n"
+        ^ "int main(void) {\n"
+        ^ "  check(" ^ value ^ ");\n"
+        ^ "  return 0;\n"
+        ^ "}\n"
+      in
+      let verify value =
+        match parse_program ~base_dir (with_header value) with
+        | Error e -> failwith ("Statement call parse failed: " ^ e)
+        | Ok program -> Verify.verify_program program
+      in
+      (match verify "1" with
+      | Ok Verify.Verified -> ()
+      | Ok outcome -> failwith ("Expected check(1) to verify, got:\n" ^ Verify.format_outcome outcome)
+      | Error e -> failwith ("check(1) failed: " ^ e));
+      match verify "0" with
+      | Ok (Verify.Counterexample { location = Some location; _ })
+        when String.is_substring location ~substring:"`check`'s @Require" ->
+          ()
+      | Ok outcome -> failwith ("Expected check(0) to violate @Require, got:\n" ^ Verify.format_outcome outcome)
+      | Error e -> failwith ("check(0) failed: " ^ e))
+
+let assert_effect_free_statement_call_verifies () =
+  expect_verified "square(3);"
+    ("int square(int v) {\n"
+    ^ "  return v * v;\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  square(3);\n"
+    ^ "  return 0;\n"
+    ^ "}\n")
+
+(* Calls are modelled without side effects, so a statement call to a defined
+   function that writes caller-visible state must be rejected, not skipped. *)
+let assert_effectful_statement_calls_rejected () =
+  expect_verification_error "transitive global write"
+    ~substrings:[ "`wrapper`"; "calls `bump`, which assigns global `g`" ]
+    ("int g;\n\n"
+    ^ "int bump(void) {\n"
+    ^ "  g = g + 1;\n"
+    ^ "  return 0;\n"
+    ^ "}\n\n"
+    ^ "int wrapper(void) {\n"
+    ^ "  int r = bump();\n"
+    ^ "  return r;\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  g = 0;\n"
+    ^ "  wrapper();\n"
+    ^ "  return 0;\n"
+    ^ "}\n");
+  expect_verification_error "pointer write"
+    ~substrings:[ "`set`"; "writes through a pointer" ]
+    ("int y;\n\n"
+    ^ "int set(int *p) {\n"
+    ^ "  *p = 5;\n"
+    ^ "  return 0;\n"
+    ^ "}\n\n"
+    ^ "int main(void) {\n"
+    ^ "  set(&y);\n"
+    ^ "  return 0;\n"
+    ^ "}\n");
+  expect_verification_error "mutating method"
+    ~substrings:[ "Counter__inc"; "writes field `n`" ]
+    ("class Counter {\n"
+    ^ "  int n;\n"
+    ^ "  int inc() {\n"
+    ^ "    n = n + 1;\n"
+    ^ "    return n;\n"
+    ^ "  }\n"
+    ^ "};\n\n"
+    ^ "Counter c;\n\n"
+    ^ "int main(void) {\n"
+    ^ "  c.inc();\n"
+    ^ "  return 0;\n"
+    ^ "}\n")
+
+let assert_non_call_expression_statement_rejected () =
+  match parse_program "int x;\nint main(void) {\n  x;\n  return 0;\n}\n" with
+  | Ok _ -> failwith "Expected `x;` to be rejected"
+  | Error e ->
+      if not (String.is_substring e ~substring:"only calls can be used as statements") then
+        failwith ("Unexpected error for `x;`: " ^ e)
+
+let assert_memory_read_in_conditional_branch_rejected () =
+  expect_verification_error "load inside ?:"
+    ~substrings:[ "memory operations inside the branches of `?:`" ]
+    ("#include <stdlib.h>\n"
+    ^ "int *p;\n"
+    ^ "int x;\n\n"
+    ^ "int main(void) {\n"
+    ^ "  p = malloc(4);\n"
+    ^ "  *p = 1;\n"
+    ^ "  x = x > 0 ? *p : 0;\n"
+    ^ "  free(p);\n"
+    ^ "  return 0;\n"
+    ^ "}\n")
+
 let () =
   assert_header_import_roundtrip ();
   assert_contract_instrumentation ();
@@ -2108,6 +2318,14 @@ let () =
   assert_strict_mode_rejects_uninitialized_local ();
   assert_strict_mode_rejects_globals ();
   assert_strict_mode_rejects_memory_syntax ();
+  assert_conditional_roundtrip_and_verification ();
+  assert_conditional_guards_branch_obligations ();
+  assert_c_expression_precedence ();
+  assert_statement_call_checks_contract ();
+  assert_effect_free_statement_call_verifies ();
+  assert_effectful_statement_calls_rejected ();
+  assert_non_call_expression_statement_rejected ();
+  assert_memory_read_in_conditional_branch_rejected ();
   Quickcheck.test
     ~trials:300
     ~sexp_of:(fun _ -> Sexp.Atom "program")

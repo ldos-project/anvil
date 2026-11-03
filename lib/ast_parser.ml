@@ -21,6 +21,7 @@ let rec normalize_stmt = function
       normalize_stmt (Seq stmts)
   | LocalDecl _ ->
       failwith "internal error: unresolved local declaration reached normalization"
+  | ExprStmt _ as stmt -> stmt
   | If (c, t, e) -> If (c, normalize_stmt t, normalize_stmt e)
   | While (invariant, c, body) ->
       let body = normalize_stmt body in
@@ -245,6 +246,11 @@ let rec resolve_expr scopes = function
   | Deref expr -> Deref (resolve_expr scopes expr)
   | Field (base, field) ->
       Field (resolve_expr scopes base, field)
+  | Conditional (cond, then_branch, else_branch) ->
+      Conditional
+        ( resolve_bexpr scopes cond
+        , resolve_expr scopes then_branch
+        , resolve_expr scopes else_branch )
   | Add (left, right) ->
       Add (resolve_expr scopes left, resolve_expr scopes right)
   | Sub (left, right) ->
@@ -258,7 +264,7 @@ let rec resolve_expr scopes = function
   | FuncCall (name, args) ->
       FuncCall (name, List.map (resolve_expr scopes) args)
 
-let rec resolve_bexpr scopes = function
+and resolve_bexpr scopes = function
   | True -> True
   | False -> False
   | Forall (bindings, body) ->
@@ -332,6 +338,8 @@ let rec resolve_stmt scopes state stmt =
                 Ok (Assign (resolved_name, resolve_expr scopes expr))
         in
         Ok (init_stmt, state, scopes)
+  | ExprStmt expr ->
+      Ok (ExprStmt (resolve_expr scopes expr), state, scopes)
   | Assign (name, expr) ->
       Ok
         ( Assign (resolve_assign_target scopes name, resolve_expr scopes expr)
@@ -891,6 +899,7 @@ and desugar_addressable_type env = function
   | CharLit _
   | BoolLit _
   | AddrOf _
+  | Conditional _
   | Add _
   | Sub _
   | Mul _
@@ -927,6 +936,14 @@ and desugar_expr_type env = function
       (match desugar_record_receiver_type env base with
       | Some record_name -> record_field_type env.records record_name field
       | None -> None)
+  | Conditional (_, then_branch, else_branch) ->
+      (match desugar_expr_type env then_branch, desugar_expr_type env else_branch with
+      | Some then_type, Some else_type when then_type = else_type ->
+          Some then_type
+      | Some then_type, Some else_type ->
+          if is_real_type then_type || is_real_type else_type then Some TDouble else Some TInt
+      | (Some _ | None), (Some _ | None) ->
+          None)
   | Add (left, right) ->
       (match desugar_expr_type env left, desugar_expr_type env right with
       | Some (TPointer pointee), Some right_type when is_integer_like_type right_type ->
@@ -1062,6 +1079,11 @@ let rec desugar_method_expr env current_class = function
       Deref (desugar_method_expr env current_class expr)
   | Field (base, field) ->
       Field (desugar_method_expr env current_class base, field)
+  | Conditional (cond, then_branch, else_branch) ->
+      Conditional
+        ( desugar_method_bexpr env current_class cond
+        , desugar_method_expr env current_class then_branch
+        , desugar_method_expr env current_class else_branch )
   | Add (left, right) ->
       Add
         (desugar_method_expr env current_class left, desugar_method_expr env current_class right)
@@ -1104,7 +1126,7 @@ let rec desugar_method_expr env current_class = function
               | Some signature -> FuncCall (signature.actual_name, args)
               | None -> FuncCall (name, args))))
 
-let rec desugar_method_bexpr env current_class = function
+and desugar_method_bexpr env current_class = function
   | True -> True
   | False -> False
   | Forall (bindings, body) ->
@@ -1145,6 +1167,8 @@ let rec desugar_method_stmt env current_class = function
       Block (List.map (desugar_method_stmt env current_class) stmts)
   | LocalDecl _ ->
       failwith "internal error: unresolved local declaration reached class desugaring"
+  | ExprStmt expr ->
+      ExprStmt (desugar_method_expr env current_class expr)
   | Assign (name, rhs) ->
       let rhs = desugar_method_expr env current_class rhs in
       (match current_class with
@@ -1241,6 +1265,11 @@ let rec resolve_value_expr env = function
       Deref (resolve_value_expr env expr)
   | Field (base, field) ->
       Field (resolve_value_expr env base, field)
+  | Conditional (cond, then_branch, else_branch) ->
+      Conditional
+        ( resolve_value_bexpr env cond
+        , resolve_value_expr env then_branch
+        , resolve_value_expr env else_branch )
   | Add (left, right) ->
       Add (resolve_value_expr env left, resolve_value_expr env right)
   | Sub (left, right) ->
@@ -1255,7 +1284,7 @@ let rec resolve_value_expr env = function
       FuncCall
         (resolve_function_name env name, List.map (resolve_value_expr env) args)
 
-let rec resolve_value_bexpr env = function
+and resolve_value_bexpr env = function
   | True -> True
   | False -> False
   | Forall (bindings, body) ->
@@ -1286,6 +1315,8 @@ let rec resolve_value_stmt env = function
       Block (List.map (resolve_value_stmt env) stmts)
   | LocalDecl _ ->
       failwith "internal error: unresolved local declaration reached namespace resolution"
+  | ExprStmt expr ->
+      ExprStmt (resolve_value_expr env expr)
   | Assign (name, value) ->
       Assign (resolve_global_name env name, resolve_value_expr env value)
   | Store (ptr, value) ->
@@ -1354,7 +1385,8 @@ let resolve_program_values program =
 
 let rec attach_loop_invariants_stmt source_name invariants stmt =
   match stmt with
-  | Skip | Break | Continue | LocalDecl _ | Assign _ | Store _ | ArrayAssign _ | FieldAssign _ | Assume _ | Assert _ | Free _ | Return _ ->
+  | Skip | Break | Continue | LocalDecl _ | ExprStmt _ | Assign _ | Store _ | ArrayAssign _
+  | FieldAssign _ | Assume _ | Assert _ | Free _ | Return _ ->
       stmt, invariants
   | Block stmts ->
       let stmts, invariants =

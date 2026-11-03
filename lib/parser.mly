@@ -120,6 +120,36 @@ let call_stmt name args =
     fail "expected `abort()` without arguments";
   Assert (Source_assert, False)
 
+(* A call evaluated for effect. `abort()` keeps its meaning as `assert(0)`. *)
+let expr_stmt = function
+  | FuncCall (name, args) when String.equal name "abort" ->
+      call_stmt name args
+  | FuncCall _ as call ->
+      ExprStmt call
+  | expr ->
+      fail "only calls can be used as statements, got `%s`" (expr_to_c expr)
+
+(* The core grammar parses conditions and values with one C-style precedence
+   ladder, as C does, so `(a + b) > c`, `return a < b;` and `c ? x : y` all
+   parse without the two sublanguages fighting over `(`. Each node remembers
+   which kind it is; a value used as a condition means `e != 0`, and a
+   condition used as a value means `c ? 1 : 0`, exactly as in C. *)
+type cexpr =
+  | Value of expr
+  | Cond of bexpr
+
+let as_expr = function
+  | Value expr -> expr
+  | Cond cond -> Conditional (cond, Int 1, Int 0)
+
+let as_bexpr = function
+  | Value expr -> bexpr_of_expr expr
+  | Cond cond -> cond
+
+let cmp_cexpr mk left right = Cond (mk (as_expr left) (as_expr right))
+
+let arith_cexpr mk left right = Value (mk (as_expr left) (as_expr right))
+
 let stmt_of_if_without_else cond then_branch =
   match cond, then_branch with
   (* `if (!P) { abort(); }` is surface syntax for `assert(P)`. *)
@@ -305,8 +335,8 @@ let rec stmt_assigns_var name stmt =
   | If (_, then_branch, else_branch) ->
       stmt_assigns_var name then_branch || stmt_assigns_var name else_branch
   | While (_, _, body) -> stmt_assigns_var name body
-  | Skip | Break | Continue | Store _ | ArrayAssign _ | FieldAssign _
-  | Assume _ | Assert _ | Free _ | Return _ ->
+  | Skip | Break | Continue | ExprStmt _ | Store _ | ArrayAssign _
+  | FieldAssign _ | Assume _ | Assert _ | Free _ | Return _ ->
       false
 
 let evolve_for ~init ~cond ~step body =
@@ -929,8 +959,8 @@ stmt:
       { compound_store_stmt (fun left right -> Add (left, right)) lhs rhs }
   | STAR lhs = expr MINUSEQ rhs = expr SEMI
       { compound_store_stmt (fun left right -> Sub (left, right)) lhs rhs }
-  | name = qualified_ident LPAREN args = separated_list(COMMA, expr) RPAREN SEMI
-      { call_stmt name args }
+  | call = postfix_expr SEMI
+      { expr_stmt call }
   | RETURN_KW value = option(expr) SEMI
       { Return value }
   | FREE_KW LPAREN ptr = expr RPAREN SEMI
@@ -943,178 +973,120 @@ stmt:
       { While (None, cond, body) }
 
 bexpr:
-  | value = or_bexpr
-      { value }
-
-or_bexpr:
-  | value = and_bexpr
-      { value }
-  | left = or_bexpr OR right = and_bexpr
-      { Or (left, right) }
-
-and_bexpr:
-  | value = not_bexpr
-      { value }
-  | left = and_bexpr AND right = not_bexpr
-      { And (left, right) }
-
-not_bexpr:
-  | value = atom_bexpr
-      { value }
-  | NOT inner = not_bexpr
-      { Not inner }
-
-bexpr_tail:
-  | EQEQ right = expr
-      { fun left -> Eq (left, right) }
-  | NEQ right = expr
-      { fun left -> Neq (left, right) }
-  | LT right = expr
-      { fun left -> Lt (left, right) }
-  | LE right = expr
-      { fun left -> Le (left, right) }
-  | GT right = expr
-      { fun left -> Gt (left, right) }
-  | GE right = expr
-      { fun left -> Ge (left, right) }
-  |
-      { fun left -> bexpr_of_expr left }
-
-atom_bexpr:
-  | LPAREN value = bexpr RPAREN
-      { value }
-  | left = nonparen_expr tail = bexpr_tail
-      { tail left }
+  | value = cexpr
+      { as_bexpr value }
 
 expr:
-  | value = add_expr
-      { value }
+  | value = cexpr
+      { as_expr value }
 
-add_expr:
-  | value = mul_expr
+(* Precedence follows C, loosest first: `?:`, `||`, `&&`, `==`/`!=`, the
+   relational operators, `+`/`-`, `*`/`/`/`%`, then the unary operators. *)
+cexpr:
+  | value = or_cexpr
       { value }
-  | left = add_expr PLUS right = mul_expr
-      { Add (left, right) }
-  | left = add_expr MINUS right = mul_expr
-      { Sub (left, right) }
+  | cond = or_cexpr QUESTION then_branch = cexpr COLON else_branch = cexpr
+      { Value (Conditional (as_bexpr cond, as_expr then_branch, as_expr else_branch)) }
 
-mul_expr:
-  | value = unary_expr
+or_cexpr:
+  | value = and_cexpr
       { value }
-  | left = mul_expr STAR right = unary_expr
-      { Mul (left, right) }
-  | left = mul_expr SLASH right = unary_expr
-      { Div (left, right) }
-  | left = mul_expr PERCENT right = unary_expr
-      { Mod (left, right) }
+  | left = or_cexpr OR right = and_cexpr
+      { Cond (Or (as_bexpr left, as_bexpr right)) }
 
-unary_expr:
-  | value = postfix_expr
+and_cexpr:
+  | value = eq_cexpr
       { value }
-  | MINUS value = unary_expr
-      { negate_expr value }
+  | left = and_cexpr AND right = eq_cexpr
+      { Cond (And (as_bexpr left, as_bexpr right)) }
+
+eq_cexpr:
+  | value = rel_cexpr
+      { value }
+  | left = eq_cexpr EQEQ right = rel_cexpr
+      { cmp_cexpr (fun l r -> Eq (l, r)) left right }
+  | left = eq_cexpr NEQ right = rel_cexpr
+      { cmp_cexpr (fun l r -> Neq (l, r)) left right }
+
+rel_cexpr:
+  | value = add_cexpr
+      { value }
+  | left = rel_cexpr LT right = add_cexpr
+      { cmp_cexpr (fun l r -> Lt (l, r)) left right }
+  | left = rel_cexpr LE right = add_cexpr
+      { cmp_cexpr (fun l r -> Le (l, r)) left right }
+  | left = rel_cexpr GT right = add_cexpr
+      { cmp_cexpr (fun l r -> Gt (l, r)) left right }
+  | left = rel_cexpr GE right = add_cexpr
+      { cmp_cexpr (fun l r -> Ge (l, r)) left right }
+
+add_cexpr:
+  | value = mul_cexpr
+      { value }
+  | left = add_cexpr PLUS right = mul_cexpr
+      { arith_cexpr (fun l r -> Add (l, r)) left right }
+  | left = add_cexpr MINUS right = mul_cexpr
+      { arith_cexpr (fun l r -> Sub (l, r)) left right }
+
+mul_cexpr:
+  | value = unary_cexpr
+      { value }
+  | left = mul_cexpr STAR right = unary_cexpr
+      { arith_cexpr (fun l r -> Mul (l, r)) left right }
+  | left = mul_cexpr SLASH right = unary_cexpr
+      { arith_cexpr (fun l r -> Div (l, r)) left right }
+  | left = mul_cexpr PERCENT right = unary_cexpr
+      { arith_cexpr (fun l r -> Mod (l, r)) left right }
+
+unary_cexpr:
+  | value = postfix_cexpr
+      { value }
+  | MINUS value = unary_cexpr
+      { Value (negate_expr (as_expr value)) }
+  | NOT value = unary_cexpr
+      { Cond (Not (as_bexpr value)) }
   | AMP value = postfix_expr
-      { AddrOf value }
-  | STAR value = unary_expr
-      { Deref value }
-
-nonparen_expr:
-  | value = nonparen_add_expr
-      { value }
-
-nonparen_add_expr:
-  | value = nonparen_mul_expr
-      { value }
-  | left = nonparen_add_expr PLUS right = mul_expr
-      { Add (left, right) }
-  | left = nonparen_add_expr MINUS right = mul_expr
-      { Sub (left, right) }
-
-nonparen_mul_expr:
-  | value = nonparen_unary_expr
-      { value }
-  | left = nonparen_mul_expr STAR right = unary_expr
-      { Mul (left, right) }
-  | left = nonparen_mul_expr SLASH right = unary_expr
-      { Div (left, right) }
-  | left = nonparen_mul_expr PERCENT right = unary_expr
-      { Mod (left, right) }
-
-nonparen_unary_expr:
-  | value = nonparen_postfix_expr
-      { value }
-  | MINUS value = unary_expr
-      { negate_expr value }
-  | AMP value = postfix_expr
-      { AddrOf value }
-  | STAR value = unary_expr
-      { Deref value }
-
-nonparen_postfix_expr:
-  | value = nonparen_primary_expr
-      { value }
-  | base = nonparen_postfix_expr LBRACKET index = expr RBRACKET
-      { Index (base, index) }
-  | base = nonparen_postfix_expr DOT method_name = IDENT LPAREN args = separated_list(COMMA, expr) RPAREN
-      { FuncCall (method_dot_call_name method_name, base :: args) }
-  | base = nonparen_postfix_expr ARROW method_name = IDENT LPAREN args = separated_list(COMMA, expr) RPAREN
-      { FuncCall (method_arrow_call_name method_name, base :: args) }
-  | base = nonparen_postfix_expr DOT field = IDENT
-      { Field (base, field) }
-  | base = nonparen_postfix_expr ARROW field = IDENT
-      { Field (Deref base, field) }
+      { Value (AddrOf value) }
+  | STAR value = unary_cexpr
+      { Value (Deref (as_expr value)) }
 
 postfix_expr:
-  | value = primary_expr
+  | value = postfix_cexpr
+      { as_expr value }
+
+postfix_cexpr:
+  | value = primary_cexpr
       { value }
   | base = postfix_expr LBRACKET index = expr RBRACKET
-      { Index (base, index) }
+      { Value (Index (base, index)) }
   | base = postfix_expr DOT method_name = IDENT LPAREN args = separated_list(COMMA, expr) RPAREN
-      { FuncCall (method_dot_call_name method_name, base :: args) }
+      { Value (FuncCall (method_dot_call_name method_name, base :: args)) }
   | base = postfix_expr ARROW method_name = IDENT LPAREN args = separated_list(COMMA, expr) RPAREN
-      { FuncCall (method_arrow_call_name method_name, base :: args) }
+      { Value (FuncCall (method_arrow_call_name method_name, base :: args)) }
   | base = postfix_expr DOT field = IDENT
-      { Field (base, field) }
+      { Value (Field (base, field)) }
   | base = postfix_expr ARROW field = IDENT
-      { Field (Deref base, field) }
+      { Value (Field (Deref base, field)) }
 
-primary_expr:
+primary_cexpr:
   | n = INT_LIT
-      { Int n }
+      { Value (Int n) }
   | value = FLOAT_LIT
-      { FloatLit value }
+      { Value (FloatLit value) }
   | value = DOUBLE_LIT
-      { DoubleLit value }
+      { Value (DoubleLit value) }
   | value = CHAR_LIT
-      { CharLit value }
+      { Value (CharLit value) }
   | TRUE_KW
-      { BoolLit true }
+      { Value (BoolLit true) }
   | FALSE_KW
-      { BoolLit false }
+      { Value (BoolLit false) }
   | name = qualified_ident LPAREN args = separated_list(COMMA, expr) RPAREN
-      { FuncCall (name, args) }
+      { Value (FuncCall (name, args)) }
   | name = qualified_ident
-      { Var name }
-  | LPAREN value = expr RPAREN
+      { Value (Var name) }
+  | LPAREN value = cexpr RPAREN
       { value }
-
-nonparen_primary_expr:
-  | n = INT_LIT
-      { Int n }
-  | value = FLOAT_LIT
-      { FloatLit value }
-  | value = DOUBLE_LIT
-      { DoubleLit value }
-  | value = CHAR_LIT
-      { CharLit value }
-  | TRUE_KW
-      { BoolLit true }
-  | FALSE_KW
-      { BoolLit false }
-  | name = qualified_ident LPAREN args = separated_list(COMMA, expr) RPAREN
-      { FuncCall (name, args) }
-  | name = qualified_ident
-      { Var name }
 
 (* ======================================================================= *)
 (* Evolve-block grammar.                                                     *)
