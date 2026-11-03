@@ -11,6 +11,11 @@ let find_main (program : program) =
   List.find_exn program.functions ~f:(fun (fn : function_def) ->
       String.equal fn.name "main")
 
+(* main is an ordinary function, so tests about helpers skip it. *)
+let helper_functions (program : program) =
+  List.filter program.functions ~f:(fun (fn : function_def) ->
+      not (String.equal fn.name "main"))
+
 let gen_var = G.of_list ["x"; "y"; "z"; "w"; "t"]
 
 let rec gen_expr size =
@@ -208,7 +213,7 @@ let assert_local_contract_roundtrip_and_instrumentation () =
   match parse_program source with
   | Error e -> failwith ("Local contract parse failed: " ^ e)
   | Ok program ->
-      (match program.functions with
+      (match helper_functions program with
       | [ { contract = Some _; _ } ] -> ()
       | _ -> failwith "Expected a contracted local helper function");
       (match parse_program (program_to_c program) with
@@ -219,7 +224,7 @@ let assert_local_contract_roundtrip_and_instrumentation () =
       (match Instrument.instrument_program program with
       | Error e -> failwith ("Local contract instrumentation failed: " ^ e)
       | Ok instrumented ->
-          (match instrumented.functions with
+          (match helper_functions instrumented with
           | [ { body =
                   Seq [ Assume (Ge (Var "y", Int 0))
                       ; Assert (_, Ge (Var "y", Int 0))
@@ -283,7 +288,7 @@ let assert_named_contract_roundtrip_and_verification () =
   match parse_program source with
   | Error e -> failwith ("Named-contract parse failed: " ^ e)
   | Ok program ->
-      (match program.functions with
+      (match helper_functions program with
       | [ helper; unrelated ] ->
           (match helper.contract, unrelated.contract with
           | Some helper_contract, Some unrelated_contract ->
@@ -423,7 +428,7 @@ let assert_multiple_contract_guarded_cases_verify () =
   match parse_program source with
   | Error e -> failwith ("Multiple-contract parse failed: " ^ e)
   | Ok program ->
-      (match program.functions with
+      (match helper_functions program with
       | [ fn ] ->
           (match fn.contract with
           | Some contract ->
@@ -516,7 +521,7 @@ let assert_ghost_contract_roundtrip_and_verification () =
   match parse_program source with
   | Error e -> failwith ("Ghost-contract parse failed: " ^ e)
   | Ok program ->
-      (match program.functions with
+      (match helper_functions program with
       | [ fn ] ->
           (match fn.contract with
           | Some contract ->
