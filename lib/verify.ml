@@ -1002,7 +1002,7 @@ let rec apps_in_stmt env acc = function
   | Skip | Break | Continue -> acc
   | Block stmts ->
       List.fold_left (apps_in_stmt env) acc stmts
-  | LocalDecl (_, init) ->
+  | LocalDecl (_, init, _) ->
       (match init with
       | None -> acc
       | Some expr -> apps_in_expr env acc expr)

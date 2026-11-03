@@ -147,6 +147,7 @@ let ( let* ) result f =
 type resolved_local_binding = {
   resolved_name : string;
   resolved_type : c_type;
+  resolved_mutability : mutability;
 }
 
 type scope = (string * resolved_local_binding) list
@@ -228,11 +229,34 @@ let add_quantified_bindings scopes bindings =
             (binding.quant_name, {
                resolved_name = binding.quant_name;
                resolved_type = binding.quant_type;
+               resolved_mutability = Mutable;
              }) :: current_scope)
           current_scope
           bindings
       in
       current_scope :: rest
+
+(* The variable an lvalue writes into, if it is not reached through a
+   pointer: `s.f[i]` writes into `s`. *)
+let rec lvalue_root = function
+  | Var name -> Some name
+  | Index (base, _) | Field (base, _) -> lvalue_root base
+  | _ -> None
+
+let const_root scopes lvalue =
+  match lvalue_root lvalue with
+  | Some name ->
+      (match binding_in_scopes scopes name with
+      | Some { resolved_mutability = Const; _ } -> Some name
+      | Some _ | None -> None)
+  | None -> None
+
+let check_writable scopes function_name lvalue =
+  match const_root scopes lvalue with
+  | Some name ->
+      Error
+        (Printf.sprintf "cannot assign to `const` variable `%s` in `%s`" name function_name)
+  | None -> Ok ()
 
 let rec resolve_expr scopes = function
   | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ as expr -> expr
@@ -240,7 +264,12 @@ let rec resolve_expr scopes = function
       (match binding_in_scopes scopes name with
       | Some binding -> Var binding.resolved_name
       | None -> Var name)
-  | AddrOf expr -> AddrOf (resolve_expr scopes expr)
+  | AddrOf expr ->
+      (* A pointer to it would discard the `const`, which C rejects. *)
+      (match const_root scopes expr with
+      | Some name ->
+          failwith (Printf.sprintf "cannot take the address of `const` variable `%s`" name)
+      | None -> AddrOf (resolve_expr scopes expr))
   | Index (base, index) ->
       Index (resolve_expr scopes base, resolve_expr scopes index)
   | Deref expr -> Deref (resolve_expr scopes expr)
@@ -301,7 +330,7 @@ let rec resolve_stmt scopes state stmt =
         resolve_stmt_list ([] :: scopes) state stmts
       in
       Ok (seq_of_list stmts, state, scopes)
-  | LocalDecl (local, init) ->
+  | LocalDecl (local, init, mutability) ->
       if Option.is_some (binding_in_current_scope scopes local.global_name) then
         Error
           (Printf.sprintf
@@ -318,7 +347,7 @@ let rec resolve_stmt scopes state stmt =
               fresh_local_name state local.global_name
         in
         let binding =
-          { resolved_name; resolved_type = local.global_type }
+          { resolved_name; resolved_type = local.global_type; resolved_mutability = mutability }
         in
         let scopes = add_binding scopes local.global_name binding in
         let local =
@@ -341,6 +370,7 @@ let rec resolve_stmt scopes state stmt =
   | ExprStmt expr ->
       Ok (ExprStmt (resolve_expr scopes expr), state, scopes)
   | Assign (name, expr) ->
+      let* () = check_writable scopes state.function_name (Var name) in
       Ok
         ( Assign (resolve_assign_target scopes name, resolve_expr scopes expr)
         , state
@@ -348,6 +378,7 @@ let rec resolve_stmt scopes state stmt =
   | Store (ptr, value) ->
       Ok (Store (resolve_expr scopes ptr, resolve_expr scopes value), state, scopes)
   | ArrayAssign (base, index, value) ->
+      let* () = check_writable scopes state.function_name base in
       Ok
         ( ArrayAssign
             ( resolve_expr scopes base
@@ -356,6 +387,7 @@ let rec resolve_stmt scopes state stmt =
         , state
         , scopes )
   | FieldAssign (base, field, value) ->
+      let* () = check_writable scopes state.function_name base in
       Ok
         ( FieldAssign
             (resolve_expr scopes base, field, resolve_expr scopes value)
@@ -402,7 +434,13 @@ let initial_scope_for_function (fn : function_def) =
     match param.param_name with
     | None -> None
     | Some name ->
-        Some (name, { resolved_name = name; resolved_type = param.param_type })
+        Some
+          ( name,
+            {
+              resolved_name = name;
+              resolved_type = param.param_type;
+              resolved_mutability = param.param_mutability;
+            } )
   in
   List.filter_map scope_from_param fn.params
 

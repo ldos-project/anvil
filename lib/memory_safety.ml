@@ -169,7 +169,7 @@ let rec count_malloc_stmt = function
   | Skip | Break | Continue -> 0
   | Block stmts ->
       List.fold_left (fun acc stmt -> acc + count_malloc_stmt stmt) 0 stmts
-  | LocalDecl (_, init) ->
+  | LocalDecl (_, init, _) ->
       (match init with
       | None -> 0
       | Some expr -> count_malloc_expr expr)
@@ -220,7 +220,7 @@ and uses_memory_stmt = function
   | Skip | Break | Continue -> false
   | Block stmts ->
       List.exists uses_memory_stmt stmts
-  | LocalDecl (_, init) ->
+  | LocalDecl (_, init, _) ->
       (match init with
       | None -> false
       | Some expr -> uses_memory_expr expr)
@@ -1059,8 +1059,8 @@ let lower_function_params (params : param list) =
     | TPointer _, None ->
         failwith "pointer parameters must be named after class desugaring"
     | TPointer _, Some name ->
-        [ { param_type = TInt; param_name = Some (ptr_block_name name) }
-        ; { param_type = TInt; param_name = Some (ptr_offset_name name) }
+        [ { param_type = TInt; param_name = Some (ptr_block_name name); param_mutability = Mutable }
+        ; { param_type = TInt; param_name = Some (ptr_offset_name name); param_mutability = Mutable }
         ]
     | (TReference _ | TConstReference _), _ ->
         failwith "reference parameters should be lowered before memory lowering"

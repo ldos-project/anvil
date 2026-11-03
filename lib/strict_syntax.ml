@@ -145,7 +145,7 @@ and validate_stmt fn_name stmt =
   | Block stmts
   | Seq stmts ->
       validate_list (validate_stmt fn_name) stmts
-  | LocalDecl (local, init) ->
+  | LocalDecl (local, init, _) ->
       let* () =
         validate_type
           ~context:
@@ -266,8 +266,8 @@ and calls_in_stmt acc stmt =
   match stmt with
   | Skip | Break | Continue -> acc
   | Block stmts | Seq stmts -> List.fold_left calls_in_stmt acc stmts
-  | LocalDecl (_, None) | Return None -> acc
-  | LocalDecl (_, Some expr)
+  | LocalDecl (_, None, _) | Return None -> acc
+  | LocalDecl (_, Some expr, _)
   | ExprStmt expr
   | Assign (_, expr)
   | Free expr

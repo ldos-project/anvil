@@ -88,8 +88,8 @@ let make_function ?contract ~name ~return_type ~params body =
 let make_global global_type global_name =
   { global_type; global_name }
 
-let make_local_decl local_type local_name init =
-  LocalDecl (make_global local_type local_name, init)
+let make_local_decl ?(mutability = Mutable) local_type local_name init =
+  LocalDecl (make_global local_type local_name, init, mutability)
 
 let record_field field_type field_name =
   { field_type; field_name }
@@ -105,6 +105,7 @@ let assignment_stmt lhs rhs =
   | Var name -> Assign (name, rhs)
   | Index (base, index) -> ArrayAssign (base, index, rhs)
   | Field (base, field) -> FieldAssign (base, field, rhs)
+  | Deref ptr -> Store (ptr, rhs)
   | _ ->
       fail "unsupported assignment target `%s`" (expr_to_c lhs)
 
@@ -153,12 +154,50 @@ let arith_cexpr mk left right = Value (mk (as_expr left) (as_expr right))
 let stmt_of_if_without_else cond then_branch =
   match cond, then_branch with
   (* `if (!P) { abort(); }` is surface syntax for `assert(P)`. *)
-  | Not premise, Block [ Assert (Source_assert, False) ] ->
+  | Not premise, (Block [ Assert (Source_assert, False) ] | Assert (Source_assert, False)) ->
       Assert (Source_assert, premise)
   (* Everything else, incl. `if (!P) return v;`, is a real branch: lower to
      `If` so the return is checked against the @Guarantee, not assumed away. *)
   | _ ->
       If (cond, then_branch, Skip)
+
+(* The body of an `if`, `while` or `for`. As in C, a declaration on its own
+   is not a statement there: it would have no scope to live in. *)
+let body_stmt = function
+  | LocalDecl ({ global_name; _ }, _, _) ->
+      fail
+        "the declaration of `%s` cannot be the body of `if`, `while` or `for`; \
+         wrap it in braces"
+        global_name
+  | stmt -> stmt
+
+(* `for (init; cond; step) body` is `{ init; while (cond) { body; step } }`.
+   The core language has no `continue`, so running `step` after `body` is
+   exact, and the block keeps a declared counter scoped to the loop. *)
+let for_loop init cond step body =
+  let cond = Option.value cond ~default:True in
+  let body =
+    match step with
+    | None -> body
+    | Some step -> Seq [ body; step ]
+  in
+  let init =
+    match init with
+    | Skip -> []
+    | init -> [ init ]
+  in
+  Block (init @ [ While (None, cond, body) ])
+
+let make_param ?(mutability = Mutable) param_type name =
+  { param_type; param_name = Some name; param_mutability = mutability }
+
+let const_scalar_type ~what name base stars =
+  if stars > 0 then
+    fail
+      "%s `%s` points to const data, which is unsupported; only non-pointer \
+       `const` declarations are"
+      what name;
+  base
 
 let raw_qualified_name parts =
   String.concat raw_namespace_separator parts
@@ -171,7 +210,10 @@ let make_method_function ~class_name ~name ~return_type ~params body =
     ~name:(class_method_name class_name name)
     ~return_type
     ~params:
-      ({ param_type = TPointer (TRecord class_name); param_name = Some method_this_name }
+      ({ param_type = TPointer (TRecord class_name)
+       ; param_name = Some method_this_name
+       ; param_mutability = Mutable
+       }
        :: params)
     body
 
@@ -313,7 +355,7 @@ let loop_literal_limit = 1 lsl 30
 let loop_max_trip = 4096
 
 let for_induction_var = function
-  | LocalDecl ({ global_name; _ }, Some (Int value)) -> Some (global_name, value)
+  | LocalDecl ({ global_name; _ }, Some (Int value), _) -> Some (global_name, value)
   | Assign (name, Int value) -> Some (name, value)
   | _ -> None
 
@@ -330,7 +372,7 @@ let for_trip_count op ~init ~bound =
 let rec stmt_assigns_var name stmt =
   match stmt with
   | Assign (target, _) -> String.equal target name
-  | LocalDecl ({ global_name; _ }, _) -> String.equal global_name name
+  | LocalDecl ({ global_name; _ }, _, _) -> String.equal global_name name
   | Block stmts | Seq stmts -> List.exists (stmt_assigns_var name) stmts
   | If (_, then_branch, else_branch) ->
       stmt_assigns_var name then_branch || stmt_assigns_var name else_branch
@@ -476,6 +518,9 @@ let build_program items =
 %token ASSIGN PLUSEQ MINUSEQ EQEQ NEQ LT LE GT GE NOT AND OR IMPLIES
 %token EOF
 
+(* An `else` binds to the nearest `if`, as in C. *)
+%nonassoc IF_NO_ELSE
+%nonassoc ELSE_KW
 %right IMPLIES
 %left OR
 %left AND
@@ -890,13 +935,19 @@ param_tail:
 
 named_param:
   | base = nonvoid_type stars = pointer_stars name = IDENT
-      { { param_type = pointer_type base stars; param_name = Some name } }
+      { make_param (pointer_type base stars) name }
+  | CONST_KW base = nonvoid_type stars = pointer_stars name = IDENT
+      {
+        make_param ~mutability:Const
+          (const_scalar_type ~what:"parameter" name base stars)
+          name
+      }
   | base = nonvoid_type stars = pointer_stars AMP name = IDENT
-      { { param_type = TReference (pointer_type base stars); param_name = Some name } }
+      { make_param (TReference (pointer_type base stars)) name }
   | CONST_KW base = nonvoid_type stars = pointer_stars AMP name = IDENT
-      { { param_type = TConstReference (pointer_type base stars); param_name = Some name } }
+      { make_param (TConstReference (pointer_type base stars)) name }
   | VOID_KW STAR stars = pointer_stars name = IDENT
-      { { param_type = pointer_type TVoid (stars + 1); param_name = Some name } }
+      { make_param (pointer_type TVoid (stars + 1)) name }
 
 stmt_list:
   | { [] }
@@ -926,6 +977,17 @@ local_decl_tail:
           make_local_decl (array_type base size) name None
       }
 
+const_local_decl_tail:
+  | ASSIGN init = expr SEMI
+      {
+        fun base stars name ->
+          make_local_decl ~mutability:Const
+            (const_scalar_type ~what:"local" name base stars)
+            name (Some init)
+      }
+  | SEMI
+      { fun _base _stars name -> fail "`const` local `%s` must be initialized" name }
+
 local_void_decl_tail:
   | SEMI
       {
@@ -945,32 +1007,67 @@ stmt:
       { body }
   | base = nonvoid_type stars = pointer_stars name = IDENT tail = local_decl_tail
       { tail base stars name }
+  | CONST_KW base = nonvoid_type stars = pointer_stars name = IDENT tail = const_local_decl_tail
+      { tail base stars name }
   | VOID_KW STAR stars = pointer_stars name = IDENT tail = local_void_decl_tail
       { tail stars name }
-  | lhs = postfix_expr ASSIGN rhs = expr SEMI
-      { assignment_stmt lhs rhs }
-  | lhs = postfix_expr PLUSEQ rhs = expr SEMI
-      { compound_assignment_stmt (fun left right -> Add (left, right)) lhs rhs }
-  | lhs = postfix_expr MINUSEQ rhs = expr SEMI
-      { compound_assignment_stmt (fun left right -> Sub (left, right)) lhs rhs }
-  | STAR lhs = expr ASSIGN rhs = expr SEMI
-      { Store (lhs, rhs) }
-  | STAR lhs = expr PLUSEQ rhs = expr SEMI
-      { compound_store_stmt (fun left right -> Add (left, right)) lhs rhs }
-  | STAR lhs = expr MINUSEQ rhs = expr SEMI
-      { compound_store_stmt (fun left right -> Sub (left, right)) lhs rhs }
-  | call = postfix_expr SEMI
-      { expr_stmt call }
+  | stmt = simple_stmt SEMI
+      { stmt }
   | RETURN_KW value = option(expr) SEMI
       { Return value }
   | FREE_KW LPAREN ptr = expr RPAREN SEMI
       { Free ptr }
-  | IF_KW LPAREN cond = bexpr RPAREN then_branch = block ELSE_KW else_branch = block
+  | IF_KW LPAREN cond = bexpr RPAREN then_branch = body_stmt ELSE_KW else_branch = body_stmt
       { If (cond, then_branch, else_branch) }
-  | IF_KW LPAREN cond = bexpr RPAREN then_branch = block
+  | IF_KW LPAREN cond = bexpr RPAREN then_branch = body_stmt %prec IF_NO_ELSE
       { stmt_of_if_without_else cond then_branch }
-  | WHILE_KW LPAREN cond = bexpr RPAREN body = block
+  | WHILE_KW LPAREN cond = bexpr RPAREN body = body_stmt
       { While (None, cond, body) }
+  | FOR_KW LPAREN init = for_init SEMI cond = option(bexpr) SEMI step = option(simple_stmt) RPAREN
+    body = body_stmt
+      { for_loop init cond step body }
+
+body_stmt:
+  | stmt = stmt
+      { body_stmt stmt }
+
+(* Statements that can also appear in a `for` header, without the `;`. *)
+simple_stmt:
+  | lhs = postfix_expr ASSIGN rhs = expr
+      { assignment_stmt lhs rhs }
+  | lhs = postfix_expr PLUSEQ rhs = expr
+      { compound_assignment_stmt (fun left right -> Add (left, right)) lhs rhs }
+  | lhs = postfix_expr MINUSEQ rhs = expr
+      { compound_assignment_stmt (fun left right -> Sub (left, right)) lhs rhs }
+  | lhs = postfix_expr STAREQ rhs = expr
+      { compound_assignment_stmt (fun left right -> Mul (left, right)) lhs rhs }
+  | lhs = postfix_expr SLASHEQ rhs = expr
+      { compound_assignment_stmt (fun left right -> Div (left, right)) lhs rhs }
+  | lhs = postfix_expr INCR
+  | INCR lhs = postfix_expr
+      { compound_assignment_stmt (fun left right -> Add (left, right)) lhs (Int 1) }
+  | lhs = postfix_expr DECR
+  | DECR lhs = postfix_expr
+      { compound_assignment_stmt (fun left right -> Sub (left, right)) lhs (Int 1) }
+  | STAR lhs = expr ASSIGN rhs = expr
+      { Store (lhs, rhs) }
+  | STAR lhs = expr PLUSEQ rhs = expr
+      { compound_store_stmt (fun left right -> Add (left, right)) lhs rhs }
+  | STAR lhs = expr MINUSEQ rhs = expr
+      { compound_store_stmt (fun left right -> Sub (left, right)) lhs rhs }
+  | STAR lhs = expr STAREQ rhs = expr
+      { compound_store_stmt (fun left right -> Mul (left, right)) lhs rhs }
+  | STAR lhs = expr SLASHEQ rhs = expr
+      { compound_store_stmt (fun left right -> Div (left, right)) lhs rhs }
+  | call = postfix_expr
+      { expr_stmt call }
+
+for_init:
+  | { Skip }
+  | stmt = simple_stmt
+      { stmt }
+  | base = nonvoid_type stars = pointer_stars name = IDENT ASSIGN init = expr
+      { make_local_decl (pointer_type base stars) name (Some init) }
 
 bexpr:
   | value = cexpr
@@ -1160,9 +1257,9 @@ evolve_param_tail:
 
 evolve_param:
   | base = evolve_value_type name = IDENT
-      { { param_type = base; param_name = Some name } }
+      { { param_type = base; param_name = Some name; param_mutability = Mutable } }
   | CONST_KW base = evolve_value_type name = IDENT
-      { { param_type = base; param_name = Some name } }
+      { { param_type = base; param_name = Some name; param_mutability = Mutable } }
 
 evolve_ret_type:
   | base = evolve_value_type
