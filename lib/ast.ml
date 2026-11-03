@@ -80,6 +80,9 @@ type expr =
   | Index of expr * expr
   | Deref of expr
   | Field of expr * string
+  (* C's `c ? a : b`. Only `b`'s or `a`'s evaluation happens, so passes that
+     emit side conditions for an operand must guard them with `c`. *)
+  | Conditional of bexpr * expr * expr
   | Add of expr * expr
   | Sub of expr * expr
   | Mul of expr * expr
@@ -87,7 +90,7 @@ type expr =
   | Mod of expr * expr
   | FuncCall of func_name * expr list
 
-type bexpr =
+and bexpr =
   | True
   | False
   | Forall of quantified_var list * bexpr
@@ -105,6 +108,10 @@ type stmt =
   | Skip
   | Block of stmt list
   | LocalDecl of global_def * expr option
+  (* A call evaluated for its effect, e.g. `log_event(x);`. The parser only
+     builds these from calls; `Call_effects` rejects any whose callee can
+     write state the caller sees, since verification models calls as pure. *)
+  | ExprStmt of expr
   | Assign of var * expr
   | Store of expr * expr
   | ArrayAssign of expr * expr * expr
@@ -519,6 +526,8 @@ let escape_char_code = function
   | n ->
       Printf.sprintf "'\\x%02x'" n
 
+let expr_prec_conditional = 5
+
 let expr_prec_add = 10
 
 let expr_prec_mul = 20
@@ -530,6 +539,7 @@ let expr_prec_postfix = 40
 let expr_prec_atom = 50
 
 let expr_precedence = function
+  | Conditional _ -> expr_prec_conditional
   | Add _ | Sub _ -> expr_prec_add
   | Mul _ | Div _ | Mod _ -> expr_prec_mul
   | AddrOf _ | Deref _ -> expr_prec_unary
@@ -538,6 +548,9 @@ let expr_precedence = function
 
 let parenthesize_if needed text =
   if needed then "(" ^ text ^ ")" else text
+
+let quantified_var_to_c quantified =
+  type_with_name_to_c quantified.quant_type quantified.quant_name
 
 let rec expr_to_c_with_prec min_prec expr =
   let rendered =
@@ -561,6 +574,14 @@ let rec expr_to_c_with_prec min_prec expr =
         expr_to_c_with_prec expr_prec_postfix base ^ "->" ^ field
     | Field (base, field) ->
         expr_to_c_with_prec expr_prec_postfix base ^ "." ^ field
+    | Conditional (cond, then_branch, else_branch) ->
+        (* Right-associative like C: a nested conditional in the else branch
+           prints bare, one in the then branch gets parentheses. *)
+        bexpr_to_c cond
+        ^ " ? "
+        ^ expr_to_c_with_prec (expr_prec_conditional + 1) then_branch
+        ^ " : "
+        ^ expr_to_c_with_prec expr_prec_conditional else_branch
     | Add (left, right) ->
         expr_to_c_with_prec expr_prec_add left
         ^ " + "
@@ -586,19 +607,18 @@ let rec expr_to_c_with_prec min_prec expr =
   in
   parenthesize_if (expr_precedence expr < min_prec) rendered
 
-let expr_to_c expr =
+and expr_to_c expr =
   expr_to_c_with_prec 0 expr
 
-let postfix_receiver_to_c expr =
-  expr_to_c_with_prec expr_prec_postfix expr
-
-let quantified_var_to_c quantified =
-  type_with_name_to_c quantified.quant_type quantified.quant_name
+(* Comparison operands bind tighter than `?:`, so a conditional operand needs
+   parentheses: `(c ? a : b) == y`, not `c ? a : b == y`. *)
+and operand_to_c expr =
+  expr_to_c_with_prec (expr_prec_conditional + 1) expr
 
 (* Prints [b] without its outermost parentheses, for positions that already
    supply them, like `if (...)`. Clang's -Wparentheses-equality rejects
    `if ((x == 0))` under -Werror. *)
-let rec bexpr_to_c_bare = function
+and bexpr_to_c_bare = function
   | True -> "1"
   | False -> "0"
   | Forall (bindings, body) ->
@@ -606,12 +626,12 @@ let rec bexpr_to_c_bare = function
       ^ String.concat ", " (List.map quantified_var_to_c bindings)
       ^ "). "
       ^ bexpr_to_c body
-  | Eq (a, b) -> expr_to_c a ^ " == " ^ expr_to_c b
-  | Neq (a, b) -> expr_to_c a ^ " != " ^ expr_to_c b
-  | Lt (a, b) -> expr_to_c a ^ " < " ^ expr_to_c b
-  | Le (a, b) -> expr_to_c a ^ " <= " ^ expr_to_c b
-  | Gt (a, b) -> expr_to_c a ^ " > " ^ expr_to_c b
-  | Ge (a, b) -> expr_to_c a ^ " >= " ^ expr_to_c b
+  | Eq (a, b) -> operand_to_c a ^ " == " ^ operand_to_c b
+  | Neq (a, b) -> operand_to_c a ^ " != " ^ operand_to_c b
+  | Lt (a, b) -> operand_to_c a ^ " < " ^ operand_to_c b
+  | Le (a, b) -> operand_to_c a ^ " <= " ^ operand_to_c b
+  | Gt (a, b) -> operand_to_c a ^ " > " ^ operand_to_c b
+  | Ge (a, b) -> operand_to_c a ^ " >= " ^ operand_to_c b
   | Not p -> "!" ^ bexpr_to_c p
   | And (p, q) -> bexpr_to_c p ^ " && " ^ bexpr_to_c q
   | Or (p, q) -> bexpr_to_c p ^ " || " ^ bexpr_to_c q
@@ -621,6 +641,9 @@ and bexpr_to_c b =
   | True | False | Forall _ -> bexpr_to_c_bare b
   | _ -> "(" ^ bexpr_to_c_bare b ^ ")"
 
+let postfix_receiver_to_c expr =
+  expr_to_c_with_prec expr_prec_postfix expr
+
 let rec bexpr_to_annotation = function
   | True -> "1"
   | False -> "0"
@@ -629,12 +652,12 @@ let rec bexpr_to_annotation = function
       ^ String.concat ", " (List.map quantified_var_to_c bindings)
       ^ "). "
       ^ bexpr_to_annotation body
-  | Eq (a, b) -> "(" ^ expr_to_c a ^ " == " ^ expr_to_c b ^ ")"
-  | Neq (a, b) -> "(" ^ expr_to_c a ^ " != " ^ expr_to_c b ^ ")"
-  | Lt (a, b) -> "(" ^ expr_to_c a ^ " < " ^ expr_to_c b ^ ")"
-  | Le (a, b) -> "(" ^ expr_to_c a ^ " <= " ^ expr_to_c b ^ ")"
-  | Gt (a, b) -> "(" ^ expr_to_c a ^ " > " ^ expr_to_c b ^ ")"
-  | Ge (a, b) -> "(" ^ expr_to_c a ^ " >= " ^ expr_to_c b ^ ")"
+  | Eq (a, b) -> "(" ^ operand_to_c a ^ " == " ^ operand_to_c b ^ ")"
+  | Neq (a, b) -> "(" ^ operand_to_c a ^ " != " ^ operand_to_c b ^ ")"
+  | Lt (a, b) -> "(" ^ operand_to_c a ^ " < " ^ operand_to_c b ^ ")"
+  | Le (a, b) -> "(" ^ operand_to_c a ^ " <= " ^ operand_to_c b ^ ")"
+  | Gt (a, b) -> "(" ^ operand_to_c a ^ " > " ^ operand_to_c b ^ ")"
+  | Ge (a, b) -> "(" ^ operand_to_c a ^ " >= " ^ operand_to_c b ^ ")"
   | Not p -> "(!" ^ bexpr_to_annotation p ^ ")"
   | And (p, q) -> "(" ^ bexpr_to_annotation p ^ " && " ^ bexpr_to_annotation q ^ ")"
   | Or (Not premise, conclusion) ->
@@ -847,6 +870,8 @@ let rec stmt_to_c ~indent_level ~return_type = function
   | Assert (_, c) ->
       indent indent_level ^ "if (!" ^ bexpr_to_c c
       ^ ") { abort(); } /* assert */\n"
+  | ExprStmt expr ->
+      indent indent_level ^ expr_to_c expr ^ ";\n"
   | Free ptr ->
       indent indent_level ^ "free(" ^ expr_to_c ptr ^ ");\n"
   | Return None -> indent indent_level ^ "return;\n"
@@ -861,6 +886,8 @@ let rec vars_in_expr = function
       vars_in_expr base @ vars_in_expr index
   | Deref inner -> vars_in_expr inner
   | Field (base, _) -> vars_in_expr base
+  | Conditional (cond, then_branch, else_branch) ->
+      vars_in_bexpr cond @ vars_in_expr then_branch @ vars_in_expr else_branch
   | Add (left, right)
   | Sub (left, right)
   | Mul (left, right)
@@ -870,7 +897,7 @@ let rec vars_in_expr = function
   | FuncCall (_, args) ->
       List.concat_map vars_in_expr args
 
-let rec vars_in_bexpr = function
+and vars_in_bexpr = function
   | True | False -> []
   | Forall (bindings, body) ->
       let bound_names = List.map (fun binding -> binding.quant_name) bindings in
@@ -898,6 +925,8 @@ let rec vars_in_stmt = function
       (match init with
       | None -> []
       | Some expr -> vars_in_expr expr)
+  | ExprStmt expr ->
+      vars_in_expr expr
   | Assign (name, expr) ->
       name :: vars_in_expr expr
   | Store (ptr, value) ->
@@ -977,6 +1006,10 @@ let helper_prototypes p =
         helpers_in_expr (helpers_in_expr acc base) index
     | Deref inner -> helpers_in_expr acc inner
     | Field (base, _) -> helpers_in_expr acc base
+    | Conditional (cond, then_branch, else_branch) ->
+        helpers_in_expr
+          (helpers_in_expr (helpers_in_bexpr acc cond) then_branch)
+          else_branch
     | Add (left, right)
     | Sub (left, right)
     | Mul (left, right)
@@ -993,8 +1026,7 @@ let helper_prototypes p =
             acc
         in
         List.fold_left helpers_in_expr acc args
-  in
-  let rec helpers_in_bexpr acc = function
+  and helpers_in_bexpr acc = function
     | True | False -> acc
     | Forall (_, body) -> helpers_in_bexpr acc body
     | Eq (left, right)
@@ -1017,6 +1049,7 @@ let helper_prototypes p =
         (match init with
         | None -> acc
         | Some expr -> helpers_in_expr acc expr)
+    | ExprStmt expr -> helpers_in_expr acc expr
     | Assign (_, expr) -> helpers_in_expr acc expr
     | Store (ptr, value) -> helpers_in_expr (helpers_in_expr acc ptr) value
     | ArrayAssign (base, index, value) ->

@@ -85,6 +85,10 @@ let rec validate_expr fn_name expr =
         fn_name
   | Field (base, _) ->
       validate_expr fn_name base
+  | Conditional (cond, then_branch, else_branch) ->
+      let* () = validate_bexpr fn_name cond in
+      let* () = validate_expr fn_name then_branch in
+      validate_expr fn_name else_branch
   | Add (left, right)
   | Sub (left, right)
   | Mul (left, right)
@@ -156,6 +160,7 @@ and validate_stmt fn_name stmt =
             fn_name
       | Some expr ->
           validate_expr fn_name expr)
+  | ExprStmt expr
   | Assign (_, expr) ->
       validate_expr fn_name expr
   | Store _ ->
@@ -231,6 +236,9 @@ let rec calls_in_expr acc expr =
   match expr with
   | Int _ | FloatLit _ | DoubleLit _ | CharLit _ | BoolLit _ | Var _ -> acc
   | AddrOf inner | Deref inner | Field (inner, _) -> calls_in_expr acc inner
+  | Conditional (cond, then_branch, else_branch) ->
+      calls_in_expr (calls_in_expr (calls_in_bexpr acc cond) then_branch)
+        else_branch
   | Index (left, right)
   | Add (left, right)
   | Sub (left, right)
@@ -259,8 +267,11 @@ and calls_in_stmt acc stmt =
   | Skip | Break | Continue -> acc
   | Block stmts | Seq stmts -> List.fold_left calls_in_stmt acc stmts
   | LocalDecl (_, None) | Return None -> acc
-  | LocalDecl (_, Some expr) | Assign (_, expr) | Free expr | Return (Some expr)
-    ->
+  | LocalDecl (_, Some expr)
+  | ExprStmt expr
+  | Assign (_, expr)
+  | Free expr
+  | Return (Some expr) ->
       calls_in_expr acc expr
   | Store (left, right) | FieldAssign (left, _, right) ->
       calls_in_expr (calls_in_expr acc left) right
@@ -292,8 +303,8 @@ let validate_loop_control (program : program) =
         let* () = walk ~in_loop then_branch in
         walk ~in_loop else_branch
     | While (_, _, body) -> walk ~in_loop:true body
-    | Skip | LocalDecl _ | Assign _ | Store _ | ArrayAssign _ | FieldAssign _
-    | Assume _ | Assert _ | Free _ | Return _ ->
+    | Skip | LocalDecl _ | ExprStmt _ | Assign _ | Store _ | ArrayAssign _
+    | FieldAssign _ | Assume _ | Assert _ | Free _ | Return _ ->
         Ok ()
   in
   validate_list
