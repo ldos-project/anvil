@@ -21,36 +21,43 @@ let read_input = function
         (fun () -> read_all in_channel)
 
 let usage out_channel exit_code =
-  output_string out_channel "Usage: anvil [-h|--help] [--strict] [--verify] [FILE]\n";
+  output_string out_channel "Usage: anvil [-h|--help] [--strict] [--verify] [--gate] [FILE]\n";
   output_string out_channel "Default mode pretty-prints the instrumented C program.\n";
   output_string out_channel "With --verify, checks the program with Z3.\n";
   output_string out_channel "With --strict, rejects pointer/array/reference syntax and uninitialized variables.\n";
+  output_string out_channel "With --gate, parses a Vulcan evolve block (listeners + score_fn) and runs the\n";
+  output_string out_channel "  strict memory-free safety check on it. Prints `Safe.` or a rejection reason.\n";
   output_string out_channel "Reads from FILE if provided, otherwise from stdin.\n";
   exit exit_code
 
 let parse_args argv =
-  let rec loop strict_mode verify_mode input_path = function
-    | [] -> `Run (strict_mode, verify_mode, input_path)
+  let rec loop strict_mode verify_mode gate_mode input_path = function
+    | [] -> `Run (strict_mode, verify_mode, gate_mode, input_path)
     | ("-h" | "--help") :: _ -> `Help
     | "--strict" :: rest ->
         if strict_mode then
           `Usage_error "duplicate --strict flag"
         else
-          loop true verify_mode input_path rest
+          loop true verify_mode gate_mode input_path rest
     | "--verify" :: rest ->
         if verify_mode then
           `Usage_error "duplicate --verify flag"
         else
-          loop strict_mode true input_path rest
+          loop strict_mode true gate_mode input_path rest
+    | "--gate" :: rest ->
+        if gate_mode then
+          `Usage_error "duplicate --gate flag"
+        else
+          loop strict_mode verify_mode true input_path rest
     | path :: rest ->
         (match input_path with
-        | None -> loop strict_mode verify_mode (Some path) rest
+        | None -> loop strict_mode verify_mode gate_mode (Some path) rest
         | Some _ -> `Usage_error "expected at most one input file")
   in
-  loop false false None argv
+  loop false false false None argv
 
 let () =
-  let strict_mode, verify_mode, input_path =
+  let strict_mode, verify_mode, gate_mode, input_path =
     match parse_args (List.tl (Array.to_list Sys.argv)) with
     | `Run args -> args
     | `Help -> usage stdout 0
@@ -66,6 +73,13 @@ let () =
       | Some path -> Filename.dirname path
     in
     let source_name = Option.value input_path ~default:"<stdin>" in
+    if gate_mode then
+      (match Ast_parser.gate_evolve_block ~source_name source with
+      | Ok () -> print_endline "Safe."
+      | Error message ->
+          prerr_endline ("Unsafe: " ^ message);
+          exit 1)
+    else
     match Ast_parser.parse_program ~strict:strict_mode ~base_dir ~source_name source with
     | Ok program ->
         if verify_mode then

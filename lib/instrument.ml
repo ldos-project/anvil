@@ -1062,6 +1062,8 @@ and instrument_stmt
       | Some current ->
           let* stmt = append_safety_assert current [ Skip ] in
           Ok (stmt, state))
+  | Break | Continue ->
+      fail "`break`/`continue` reached contract instrumentation"
   | Block _ | LocalDecl _ ->
       Error "unresolved local syntax reached contract instrumentation"
   | Assign (name, expr) ->
