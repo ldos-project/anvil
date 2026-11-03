@@ -595,7 +595,10 @@ let postfix_receiver_to_c expr =
 let quantified_var_to_c quantified =
   type_with_name_to_c quantified.quant_type quantified.quant_name
 
-let rec bexpr_to_c = function
+(* Prints [b] without its outermost parentheses, for positions that already
+   supply them, like `if (...)`. Clang's -Wparentheses-equality rejects
+   `if ((x == 0))` under -Werror. *)
+let rec bexpr_to_c_bare = function
   | True -> "1"
   | False -> "0"
   | Forall (bindings, body) ->
@@ -603,15 +606,20 @@ let rec bexpr_to_c = function
       ^ String.concat ", " (List.map quantified_var_to_c bindings)
       ^ "). "
       ^ bexpr_to_c body
-  | Eq (a, b) -> "(" ^ expr_to_c a ^ " == " ^ expr_to_c b ^ ")"
-  | Neq (a, b) -> "(" ^ expr_to_c a ^ " != " ^ expr_to_c b ^ ")"
-  | Lt (a, b) -> "(" ^ expr_to_c a ^ " < " ^ expr_to_c b ^ ")"
-  | Le (a, b) -> "(" ^ expr_to_c a ^ " <= " ^ expr_to_c b ^ ")"
-  | Gt (a, b) -> "(" ^ expr_to_c a ^ " > " ^ expr_to_c b ^ ")"
-  | Ge (a, b) -> "(" ^ expr_to_c a ^ " >= " ^ expr_to_c b ^ ")"
-  | Not p -> "(!" ^ bexpr_to_c p ^ ")"
-  | And (p, q) -> "(" ^ bexpr_to_c p ^ " && " ^ bexpr_to_c q ^ ")"
-  | Or (p, q) -> "(" ^ bexpr_to_c p ^ " || " ^ bexpr_to_c q ^ ")"
+  | Eq (a, b) -> expr_to_c a ^ " == " ^ expr_to_c b
+  | Neq (a, b) -> expr_to_c a ^ " != " ^ expr_to_c b
+  | Lt (a, b) -> expr_to_c a ^ " < " ^ expr_to_c b
+  | Le (a, b) -> expr_to_c a ^ " <= " ^ expr_to_c b
+  | Gt (a, b) -> expr_to_c a ^ " > " ^ expr_to_c b
+  | Ge (a, b) -> expr_to_c a ^ " >= " ^ expr_to_c b
+  | Not p -> "!" ^ bexpr_to_c p
+  | And (p, q) -> bexpr_to_c p ^ " && " ^ bexpr_to_c q
+  | Or (p, q) -> bexpr_to_c p ^ " || " ^ bexpr_to_c q
+
+and bexpr_to_c b =
+  match b with
+  | True | False | Forall _ -> bexpr_to_c_bare b
+  | _ -> "(" ^ bexpr_to_c_bare b ^ ")"
 
 let rec bexpr_to_annotation = function
   | True -> "1"
@@ -810,7 +818,7 @@ let rec stmt_to_c ~indent_level ~return_type = function
       String.concat ""
         (List.map (stmt_to_c ~indent_level ~return_type) ss)
   | If (c, t, e) ->
-      let cond = bexpr_to_c c in
+      let cond = bexpr_to_c_bare c in
       let then_branch =
         stmt_to_c ~indent_level:(indent_level + 1) ~return_type t
       in
@@ -823,7 +831,7 @@ let rec stmt_to_c ~indent_level ~return_type = function
       ^ else_branch
       ^ indent indent_level ^ "}\n"
   | While (invariant, c, b) ->
-      let cond = bexpr_to_c c in
+      let cond = bexpr_to_c_bare c in
       let body = stmt_to_c ~indent_level:(indent_level + 1) ~return_type b in
       loop_invariant_to_c ~indent_level invariant
       ^ indent indent_level ^ "while (" ^ cond ^ ") {\n"
@@ -833,7 +841,7 @@ let rec stmt_to_c ~indent_level ~return_type = function
       let wait_cond = negate_bexpr c in
       let body = stmt_to_c ~indent_level:(indent_level + 1) ~return_type Skip in
       loop_invariant_to_c ~indent_level (Some wait_cond)
-      ^ indent indent_level ^ "while (" ^ bexpr_to_c wait_cond ^ ") {\n"
+      ^ indent indent_level ^ "while (" ^ bexpr_to_c_bare wait_cond ^ ") {\n"
       ^ body
       ^ indent indent_level ^ "} /* assume */\n"
   | Assert (_, c) ->

@@ -1,3 +1,12 @@
 (test
  (name test_anvil)
- (libraries anvil core base_quickcheck))
+ (libraries anvil core base_quickcheck)
+ ; The tests open fixtures by repo-relative paths like "test/e2e_cases/x.c",
+ ; so declare them and run from the build root, where those paths resolve.
+ (deps
+  (source_tree e2e_cases)
+  (source_tree ../examples))
+ (action
+  (chdir
+   %{workspace_root}
+   (run %{test}))))
