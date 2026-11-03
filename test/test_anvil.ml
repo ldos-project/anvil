@@ -2267,6 +2267,127 @@ let assert_memory_read_in_conditional_branch_rejected () =
     ^ "  return 0;\n"
     ^ "}\n")
 
+let expect_parse_error label ~substring source =
+  match parse_program source with
+  | Ok _ -> failwith (label ^ ": expected a parse error")
+  | Error e ->
+      if not (String.is_substring e ~substring) then
+        failwith (label ^ ": error is missing `" ^ substring ^ "`: " ^ e)
+
+let in_function body = "int f(int x, int y) {\n" ^ body ^ "  return x;\n}\n"
+
+(* Each piece of sugar must parse to exactly the core program it abbreviates. *)
+let assert_sugar_desugars_to_core () =
+  let same label sugar core =
+    match parse_program (in_function sugar), parse_program (in_function core) with
+    | Ok sugar_program, Ok core_program ->
+        if not (equal_program sugar_program core_program) then
+          failwith
+            (label ^ ": sugar and core differ:\n" ^ program_to_c sugar_program
+            ^ "\nvs\n" ^ program_to_c core_program)
+    | Error e, _ | _, Error e -> failwith (label ^ ": parse failed: " ^ e)
+  in
+  same "for"
+    "  for (int i = 0; i < y; i++) x += i;\n"
+    "  { int i = 0; while (i < y) { x += i; i = i + 1; } }\n";
+  same "for without header parts"
+    "  for (;;) x = 1;\n"
+    "  while (1) { x = 1; }\n";
+  same "increments and compound assignment"
+    "  x++; ++x; y--; --y; x *= 2; y /= 3;\n"
+    "  x = x + 1; x = x + 1; y = y - 1; y = y - 1; x = x * 2; y = y / 3;\n";
+  same "brace-less if/else and while"
+    "  if (x > 0) y = 1; else if (x < 0) y = 2; else y = 3;\n  while (y > 0) y--;\n"
+    "  if (x > 0) { y = 1; } else { if (x < 0) { y = 2; } else { y = 3; } }\n  while (y > 0) { y = y - 1; }\n";
+  same "dangling else binds to the nearest if"
+    "  if (x > 0) if (y > 0) x = 1; else x = 2;\n"
+    "  if (x > 0) { if (y > 0) { x = 1; } else { x = 2; } }\n";
+  same "brace-less abort is an assertion"
+    "  if (!(x >= 0)) abort();\n"
+    "  if (!(x >= 0)) { abort(); }\n";
+  same "assignment through a parenthesized dereference"
+    "  int *p = &x;\n  (*p)++;\n"
+    "  int *p = &x;\n  *p = *p + 1;\n"
+
+let sum_below_source guarantee =
+  "/* @Require n >= 0\n"
+  ^ " * @Guarantee " ^ guarantee ^ " */\n"
+  ^ "int sum_below(int n) {\n"
+  ^ "  int total = 0;\n"
+  ^ "  /* @Invariant 0 <= i && i <= n && total == i * (i - 1) / 2 */\n"
+  ^ "  for (int i = 0; i < n; i++)\n"
+  ^ "    total += i;\n"
+  ^ "  return total;\n"
+  ^ "}\n"
+
+let assert_for_loop_invariant_verification () =
+  expect_verified "sum_below" (sum_below_source "result == n * (n - 1) / 2");
+  match expect_counterexample "sum_below wrong" (sum_below_source "result == n * (n + 1) / 2") with
+  | Some _ -> ()
+  | None -> failwith "Expected a located counterexample for sum_below"
+
+(* Each `for` scopes its counter, so two loops can both declare `i`. *)
+let assert_for_loop_counter_is_scoped () =
+  expect_verified "two loops over i"
+    ("/* @Require n >= 0\n"
+    ^ " * @Guarantee result == 2 * n */\n"
+    ^ "int count_twice(int n) {\n"
+    ^ "  int total = 0;\n"
+    ^ "  /* @Invariant 0 <= i && i <= n && total == i */\n"
+    ^ "  for (int i = 0; i < n; i++) total++;\n"
+    ^ "  /* @Invariant 0 <= i && i <= n && total == n + i */\n"
+    ^ "  for (int i = 0; i < n; i++) total++;\n"
+    ^ "  return total;\n"
+    ^ "}\n")
+
+let assert_dangling_else_verifies_as_c () =
+  expect_verified "dangling else"
+    ("/* @Guarantee a <= 0 ==> result == 2 */\n"
+    ^ "int f(int a, int b) {\n"
+    ^ "  int r = 2;\n"
+    ^ "  if (a > 0)\n"
+    ^ "    if (b > 0)\n"
+    ^ "      r = 1;\n"
+    ^ "    else\n"
+    ^ "      r = 3;\n"
+    ^ "  return r;\n"
+    ^ "}\n")
+
+let assert_const_declarations () =
+  expect_verified "const param and local"
+    ("/* @Guarantee result == 2 * x */\n"
+    ^ "int twice(const int x) {\n"
+    ^ "  const int y = x * 2;\n"
+    ^ "  return y;\n"
+    ^ "}\n");
+  (match parse_program "int twice(const int x) {\n  return x;\n}\n" with
+  | Error e -> failwith ("const param parse failed: " ^ e)
+  | Ok program ->
+      if not (String.is_substring (program_to_c program) ~substring:"int twice(const int x)") then
+        failwith "Expected `const` to be printed on the parameter");
+  let rejected label body ~substring =
+    expect_parse_error label ~substring
+      ("struct S { int a; };\nint *p;\nint f(const int c) {\n  const int k = 1;\n  const struct S s = s;\n"
+      ^ body ^ "  return k;\n}\n")
+  in
+  rejected "assign" "  k = 2;\n" ~substring:"cannot assign to `const` variable `k`";
+  rejected "increment" "  k++;\n" ~substring:"cannot assign to `const` variable `k`";
+  rejected "compound" "  k *= 2;\n" ~substring:"cannot assign to `const` variable `k`";
+  rejected "param" "  c = 2;\n" ~substring:"cannot assign to `const` variable `c`";
+  rejected "field" "  s.a = 2;\n" ~substring:"cannot assign to `const` variable `s`";
+  rejected "address" "  p = &k;\n" ~substring:"cannot take the address of `const` variable `k`";
+  expect_parse_error "uninitialized" ~substring:"`const` local `k` must be initialized"
+    "int f(void) {\n  const int k;\n  return 0;\n}\n";
+  expect_parse_error "pointer-to-const local" ~substring:"points to const data"
+    "int f(int *q) {\n  const int *p = q;\n  return 0;\n}\n";
+  expect_parse_error "pointer-to-const param" ~substring:"pointers to `const` data are unsupported"
+    "int f(const int *p) {\n  return 0;\n}\n"
+
+let assert_declaration_body_rejected () =
+  expect_parse_error "declaration as if body"
+    ~substring:"the declaration of `z` cannot be the body"
+    "int f(int c) {\n  if (c) int z = 1;\n  return 0;\n}\n"
+
 let () =
   assert_header_import_roundtrip ();
   assert_contract_instrumentation ();
@@ -2326,6 +2447,12 @@ let () =
   assert_effectful_statement_calls_rejected ();
   assert_non_call_expression_statement_rejected ();
   assert_memory_read_in_conditional_branch_rejected ();
+  assert_sugar_desugars_to_core ();
+  assert_for_loop_invariant_verification ();
+  assert_for_loop_counter_is_scoped ();
+  assert_dangling_else_verifies_as_c ();
+  assert_const_declarations ();
+  assert_declaration_body_rejected ();
   Quickcheck.test
     ~trials:300
     ~sexp_of:(fun _ -> Sexp.Atom "program")

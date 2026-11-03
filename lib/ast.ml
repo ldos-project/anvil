@@ -30,9 +30,16 @@ type global_def = {
   global_name : var;
 }
 
+(* `const` on a non-pointer local or by-value parameter. Name resolution
+   rejects writes to a `Const` name; later passes ignore it. *)
+type mutability =
+  | Mutable
+  | Const
+
 type param = {
   param_type : c_type;
   param_name : string option;
+  param_mutability : mutability;
 }
 
 type quantified_var = {
@@ -107,7 +114,7 @@ and bexpr =
 type stmt =
   | Skip
   | Block of stmt list
-  | LocalDecl of global_def * expr option
+  | LocalDecl of global_def * expr option * mutability
   (* A call evaluated for its effect, e.g. `log_event(x);`. The parser only
      builds these from calls; `Call_effects` rejects any whose callee can
      write state the caller sees, since verification models calls as pure. *)
@@ -668,9 +675,14 @@ let rec bexpr_to_annotation = function
 let indent n = String.make (n * 2) ' '
 
 let param_to_c param =
+  let const_prefix =
+    match param.param_mutability with
+    | Const -> "const "
+    | Mutable -> ""
+  in
   match param.param_name with
-  | None -> c_type_to_c param.param_type
-  | Some name -> type_with_name_to_c param.param_type name
+  | None -> const_prefix ^ c_type_to_c param.param_type
+  | Some name -> const_prefix ^ type_with_name_to_c param.param_type name
 
 let params_to_c params =
   match params with
@@ -793,9 +805,10 @@ let rec stmt_to_c ~indent_level ~return_type = function
       ^ String.concat ""
           (List.map (stmt_to_c ~indent_level:(indent_level + 1) ~return_type) stmts)
       ^ indent indent_level ^ "}\n"
-  | LocalDecl (local, init) ->
+  | LocalDecl (local, init, mutability) ->
       let decl =
         indent indent_level
+        ^ (match mutability with Const -> "const " | Mutable -> "")
         ^ type_with_name_to_c local.global_type local.global_name
       in
       (match init with
@@ -921,7 +934,7 @@ let rec vars_in_stmt = function
   | Skip | Break | Continue -> []
   | Block stmts | Seq stmts ->
       List.concat_map vars_in_stmt stmts
-  | LocalDecl (_, init) ->
+  | LocalDecl (_, init, _) ->
       (match init with
       | None -> []
       | Some expr -> vars_in_expr expr)
@@ -1045,7 +1058,7 @@ let helper_prototypes p =
     | Skip | Break | Continue -> acc
     | Block stmts ->
         List.fold_left helpers_in_stmt acc stmts
-    | LocalDecl (_, init) ->
+    | LocalDecl (_, init, _) ->
         (match init with
         | None -> acc
         | Some expr -> helpers_in_expr acc expr)

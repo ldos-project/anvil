@@ -70,7 +70,8 @@ let load ~source_path source =
   let at_line_start = ref true in
   let only_spaces_on_line = ref true in
   let length = String.length source in
-  let push_while () =
+  (* A `for` lowers to a `while`, so both take the pending @Invariant. *)
+  let push_loop () =
     invariants_rev := !pending :: !invariants_rev;
     pending := None
   in
@@ -79,7 +80,7 @@ let load ~source_path source =
     | None -> ()
     | Some invariant ->
         fail
-          "@Invariant at line %d in %s is not attached to a while; saw `%s` instead"
+          "@Invariant at line %d in %s is not attached to a loop; saw `%s` instead"
           invariant.line_number
           source_path
           identifier
@@ -109,7 +110,7 @@ let load ~source_path source =
       | None -> List.rev !invariants_rev
       | Some invariant ->
           fail
-            "@Invariant at line %d in %s is not attached to a while"
+            "@Invariant at line %d in %s is not attached to a loop"
             invariant.line_number
             source_path)
     end else
@@ -140,8 +141,8 @@ let load ~source_path source =
           | 'a' .. 'z' | 'A' .. 'Z' | '_' ->
               let j = parse_identifier (i + 1) in
               let ident = String.sub source i (j - i) in
-              if String.equal ident "while" then
-                push_while ()
+              if String.equal ident "while" || String.equal ident "for" then
+                push_loop ()
               else
                 ensure_not_pending ident;
               at_line_start := false;

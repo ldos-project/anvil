@@ -114,8 +114,10 @@ let parse_c_type text =
   | false, 0 -> base
   | false, 1 -> TReference base
   | true, 1 -> TConstReference base
+  (* A top-level `const` does not change the type; see [parse_param]. *)
+  | true, 0 when star_count = 0 -> base
   | true, 0 ->
-      fail "only const references are supported in header contracts, got `%s`" text
+      fail "pointers to `const` data are unsupported, got `%s`" text
   | _ ->
       fail "unsupported C type `%s`" text
 
@@ -137,13 +139,28 @@ let split_last_identifier text =
     let prefix = String.sub trimmed 0 (!first + 1) |> String.trim in
     Some (prefix, name)
 
+let top_level_mutability type_text =
+  let compact = compact_no_space type_text in
+  if starts_with ~prefix:"const" compact
+     && not (String.contains compact '*' || String.contains compact '&')
+  then Const
+  else Mutable
+
 let parse_param text =
   let trimmed = String.trim text in
   match split_last_identifier trimmed with
   | Some (type_part, name) when type_part <> "" ->
-      { param_type = parse_c_type type_part; param_name = Some name }
+      {
+        param_type = parse_c_type type_part;
+        param_name = Some name;
+        param_mutability = top_level_mutability type_part;
+      }
   | _ ->
-      { param_type = parse_c_type trimmed; param_name = None }
+      {
+        param_type = parse_c_type trimmed;
+        param_name = None;
+        param_mutability = top_level_mutability trimmed;
+      }
 
 type pending_contract = {
   target_name : string option;
