@@ -46,7 +46,6 @@ rule read = parse
   | "true"              { TRUE_KW }
   | "false"             { FALSE_KW }
   | "forall"            { FORALL_KW }
-  | "main"              { MAIN_KW }
   | "void"              { VOID_KW }
   | "if"                { IF_KW }
   | "else"              { ELSE_KW }
